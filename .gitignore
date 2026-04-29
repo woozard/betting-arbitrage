@@ -1,0 +1,33 @@
+.venv
+build
+dist
+*.log
+.idea
+__pycache__
+.vscode/
+
+wakatime-cli.exe
+.wakatime.cfg
+
+betwar_data.html
+paradise.json
+
+# Virtual environment
+venv/
+
+# Environments
+.env
+.env.*
+!.env.sample
+
+# Logs
+/logs/*
+!/logs/.gitkeep
+
+# Screenshots
+/screenshots/*
+!/screenshots/.gitkeep
+
+# Data
+/data/*
+!/data/.gitkeep
