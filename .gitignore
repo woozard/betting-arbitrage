@@ -31,3 +31,4 @@ venv/
 # Data
 /data/*
 !/data/.gitkeep
+aws/
