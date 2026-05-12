@@ -13,21 +13,20 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains 
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException
 import undetected_chromedriver as uc
 
-from utils.config import PROXY1 ,PROXY2, TELEGRAM
+from utils.config import PROXY1, PROXY2, TELEGRAM
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import currency_to_float, determine_wager_on_spread, send_telegram_alert, send_monitoring_alert, send_testing_alert, epoch_to_mysql_datetime, parse_odds
-from utils.timing import time_it
+from utils.helpers import currency_to_float, determine_wager_on_spread, send_telegram_alert, send_monitoring_alert, \
+    send_testing_alert, epoch_to_mysql_datetime, parse_odds
 from utils.helpers import detect_odds_type, decimal_to_american, american_to_decimal, odds_equal
-from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
-class Web5Controller:
 
+class Web5Controller:
     def __init__(self, account, site):
 
         # Credentials
@@ -45,74 +44,93 @@ class Web5Controller:
         # Cache
         self.cache = ArbitrageCache()
 
-        # URLs
+        # Set URLs for various API endpoints
         self.website = site['website']
         self.base_url = site['url']
         self.login_url = f"{self.base_url}/en"
         self.dashboard_url = f"{self.base_url}/en/sports/soccer"
+        self.pending_wagers_url = f"{self.base_url}/en/account/my-bets-full"
         self.basketball_url = f"{self.base_url}/en/sports/basketball"
+        self.basketball_api_url = f"{self.base_url}/sports-service/sv/compact/favourite-events?_g=0&btg=1&c=&cl=100&d=&ec=&ev=&g=QQ%3D%3D&hle=false&l=100&lg=487&lv=&me=0&mk=3&more=false&o=1&ot=0&pa=0&pimo=&pn=-1&sp=4&tm=0&v=0&wm=&locale=en_US&_=1765914560489&withCredentials=true"
 
-        # Playwright (no proxy, strong stealth)
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
+        # Proxy settings
+        proxy_host = PROXY1['host']
+        proxy_port = PROXY1['port']
+        proxy_url = f"http://{proxy_host}:{proxy_port}"
+
+        # proxy_host = PROXY2['host']
+        # proxy_port = PROXY2['port']
+        # proxy_url = f"http://{proxy_host}:{proxy_port}"
+
+        # proxy_host = PROXY2['host']
+        # proxy_port = PROXY2['port']
+        # proxy_username = PROXY2['username']
+        # proxy_password = f"{PROXY2['password']}_country-us_city-newyorkcity"
+        # proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
+
+        # Initialize Chrome WebDriver with proxy options
+        options = webdriver.ChromeOptions()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument(f'--proxy-server={proxy_url}')
+
+        # Add these additional arguments to appear more like a real browser
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+
+        self.driver = webdriver.Chrome(options=options)
+        self.wait = WebDriverWait(self.driver, 30)  # Increased timeout duration
+
+        # Initialize Chrome WebDriver with proxy options
+        # options = uc.ChromeOptions()
+        # options.headless = True  # Runs the browser in headless mode for deployment
+        # options.add_argument(f'--proxy-server={proxy_url}')
+        # self.driver = uc.Chrome(version_main=126, use_subprocess=False, options=options)
+        # self.wait = WebDriverWait(self.driver, 30)  # Increased timeout duration
+
     # --------------------------------------------------------
     # Login
     # --------------------------------------------------------
-    # Improved login with debug HTML dump + longer waits + undetected-chromedriver
-    # def __login(self):
-    #     try:
-    #         self.logger.info(f"account_id: {self.account_id}")
-    #         self.logger.info(f"label: {self.label}")
-    #
-    #         self.logger.info("Opening Login Page")
-    #         self.driver.get(self.login_url)
-    #         time.sleep(8)
-    #
-    #         # Save debug HTML
-    #         with open(f"debug_login_probet42_{int(time.time())}.html", "w", encoding="utf-8") as f:
-    #             f.write(self.driver.page_source)
-    #         self.logger.info("💾 Saved debug_login_probet42_*.html — inspect for current form fields!")
-    #
-    #         self.wait.until(EC.presence_of_element_located((By.NAME, "loginId")))
-    #         username_input = self.driver.find_element(By.NAME, 'loginId')
-    #         password_input = self.driver.find_element(By.NAME, 'pass')
-    #
-    #         username_input.send_keys(self.account_id)
-    #         password_input.send_keys(self.password)
-    #         self.logger.info("Filled Login Form")
-    #
-    #         password_input.send_keys(Keys.RETURN)
-    #         time.sleep(5)
-    #
-    #         self.wait.until(EC.url_contains(self.dashboard_url))
-    #         self.logger.info("Login Passed")
-    #     except Exception as e:
-    #         self.logger.error(f"Login Failed - Reason: {e}")
-    #         with open(f"debug_login_probet42_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
-    #             f.write(self.driver.page_source)
-    #         raise Exception(f"Login Failed - Reason: {e}") from e
-
-    async def __login(self):
+    def __login(self):
         try:
+
             self.logger.info(f"account_id: {self.account_id}")
             self.logger.info(f"label: {self.label}")
 
-            self.logger.info("Opening Login Page with Playwright")
-            await self.page.goto(self.login_url, wait_until="networkidle", timeout=60000)
+            # Step 1: Go to the sign-in page
+            self.driver.get(self.login_url)
+            time.sleep(5)  # Allow time for the page to load
+            self.logger.info("Opened Login Page")
+            self.logger.info(f"Current URL: {self.driver.current_url}")
 
-            # Save debug HTML
-            with open(f"debug_login_probet42_playwright_{int(time.time())}.html", "w", encoding="utf-8") as f:
-                f.write(await self.page.content())
-            self.logger.info("💾 Saved debug_login_probet42_playwright_*.html")
+            # Print the login page HTML content
+            # print("Login Page HTML Content:")
+            # print(driver.page_source)  # Print the HTML of the login page
 
-            await self.page.wait_for_timeout(5000)
-            self.logger.info("Playwright page loaded successfully")
+            # Step 2: Find and fill the username and password fields
+            self.wait.until(
+                EC.presence_of_element_located((By.NAME, "loginId"))
+            )
+            username_input = self.driver.find_element(By.NAME, 'loginId')
+            password_input = self.driver.find_element(By.NAME, 'pass')
 
+            username_input.send_keys(self.account_id)  # Enter username
+            password_input.send_keys(self.password)  # Enter password
+            self.logger.info("Filled Login Form")
+
+            # Step 3: Submit the form by pressing ENTER
+            password_input.send_keys(Keys.RETURN)
+            time.sleep(3)  # Allow time for the page to process the login
+            self.logger.info("Submitted Login Form")
+
+            # Redirect to dashboard page (if login redirects automatically, this may not be needed)
+            self.wait.until(EC.url_contains(self.dashboard_url))
+            self.logger.info("Login Passed")
         except Exception as e:
-            self.logger.error(f"Playwright Login Failed - Reason: {e}")
-            raise
+            self.logger.error(f"Login Failed - Reason: {e}")
+            raise Exception(f"Login Failed - Reason: {e}") from e
 
     def __proxy_location(self):
         try:
@@ -131,7 +149,7 @@ class Web5Controller:
                 f"ISP: {ip_data.get('org')}"
             )
 
-            
+
 
         except Exception as e:
             self.logger.warning(f"Unable to detect proxy location: {e}")
@@ -139,11 +157,11 @@ class Web5Controller:
 
     def __get_text_with_separator(self, cell):
         return "|".join(text.strip() for text in cell.stripped_strings)
-    
+
     def __format_row_data(self, row):
         # Split the "Detail" column into parts and handle cases where it might be incomplete
         detail_parts = row.get('detail', '').split('|')
-        
+
         # Check for expected parts in "Detail" and assign only if available
         row['book_ticket_id'] = detail_parts[0] if len(detail_parts) > 0 else None
         row['sport'] = detail_parts[1] if len(detail_parts) > 1 else None
@@ -152,7 +170,7 @@ class Web5Controller:
         # Split the "Selection" column into parts and handle cases where it might be incomplete
         selection_parts = row.get('selection', '').split('|')
         print(selection_parts)
-        
+
         row['wager_on'] = selection_parts[0] if len(selection_parts) > 0 else None
         # Validate and set the spread only if it matches the pattern
         if len(selection_parts) > 1 and re.match(r'^[+-]?\d+(\.\d+)?$', selection_parts[1].strip()):
@@ -180,18 +198,17 @@ class Web5Controller:
             row['team_1'] = None
             row['team_2'] = None
 
-
         # Clean the "Odds" column by removing "|A" if present
         row['odds'] = row.get('odds', '').split('|')[0]
-        
+
         # Extract only the Risk amount from "Stake (USD)" column
         stake_parts = row.get('stake', '').split('|')
         row['risk'] = stake_parts[1] if len(stake_parts) > 1 else None
-        
+
         # Remove the original 'Detail' column as it's split into separate columns
         # if 'Detail' in row:
         #     del row['Detail']
-        
+
         return row
 
     # --------------------------------------------------------
@@ -199,29 +216,29 @@ class Web5Controller:
     # --------------------------------------------------------
     def pending_wagers(self):
         self.logger.info(f"==================== Pending Wagers (START) ====================")
-       
+
         try:
 
             self.__login()
-            
+
             # Step 4: Redirect to the open bets page
             self.driver.get(self.pending_wagers_url)
             self.logger.info("Opened Pending Bets Page")
             self.logger.info(f"Current URL: {self.driver.current_url}")
-            
+
             # Wait until the table loads on the page
             self.wait.until(
                 EC.presence_of_element_located((By.CLASS_NAME, "info-div-table"))
             )
 
             time.sleep(10)  # Allow time for the page to load rows in table
-            
+
             # Step 5: Get the page source and parse it with BeautifulSoup
             soup = BeautifulSoup(self.driver.page_source, "html.parser")
-            
+
             # Find the table
             table = soup.find("table", {"class": "info-div-table"})
-            
+
             # Check if the table exists
             if table is None:
                 self.logger.info("Table with class 'info-div-table' not found.")
@@ -245,7 +262,7 @@ class Web5Controller:
                     self.logger.info(f"========== Row ==========")
                     self.logger.info(row)
                     self.logger.info(f"========== Row ==========")
-                    
+
                     # Retrieve the values for the current row
                     game_info = row.get('selection', 'N/A')
                     sport = row.get('sport', 'N/A')
@@ -271,18 +288,24 @@ class Web5Controller:
 
                     # Exception 01 - Skip saving and sending alerts
                     if self.account_id == "PWF2804090" and risk < 1000:
-                        self.logger.info(f"Skipping alert for account_id: {self.account_id} as risk ({risk}) is less than 1000")
+                        self.logger.info(
+                            f"Skipping alert for account_id: {self.account_id} as risk ({risk}) is less than 1000")
                         continue
 
                     # Exception 02 - Skip saving and sending alerts
                     if self.account_id == "PWF2804094" and 'LIVE' in game_info:
-                        self.logger.info(f"Skipping alert for account_id: {self.account_id} as  game_info contains LIVE")
+                        self.logger.info(
+                            f"Skipping alert for account_id: {self.account_id} as  game_info contains LIVE")
                         continue
 
                     # Determine the value of wager_on using spread
                     spread, wager_on = determine_wager_on_spread(spread, wager_on)
-                    
-                    is_send_alert = self.storage.save_telegram_alert(book_ticket_id,self.account_id,self.website,self.account_id,"alert",str(book_ticket_id),wager_on,team_1,team_2,bet_type,odds,spread,"no",wager_on,risk,win,status,sport,date_time,created_at,updated_at)
+
+                    is_send_alert = self.storage.save_telegram_alert(book_ticket_id, self.account_id, self.website,
+                                                                     self.account_id, "alert", str(book_ticket_id),
+                                                                     wager_on, team_1, team_2, bet_type, odds, spread,
+                                                                     "no", wager_on, risk, win, status, sport,
+                                                                     date_time, created_at, updated_at)
                     # is_send_alert = True
                     if is_send_alert:
                         alert = (
@@ -305,7 +328,7 @@ class Web5Controller:
                         self.logger.info(alert)
                         self.logger.info(f"========== Alert ==========")
                         asyncio.run(send_telegram_alert(alert))
-           
+
             self.logger.info(f"==================== Pending Wagers (END) ====================")
         except Exception as e:
             self.logger.error(f"Exception: {e}")
@@ -321,10 +344,10 @@ class Web5Controller:
         if (!window.oddsObserverInstalled) {
             window.oddsObserverInstalled = true;
             window.oddsBuffer = [];
-            
+
             // Fix: Use class selector with dot (.) for class names
             const target = document.querySelector('.odds-container-nolive');
-            
+
             if (!target) {
                 console.log("Observer: target not found");
                 return;
@@ -345,7 +368,7 @@ class Web5Controller:
         }
         """
         self.driver.execute_script(script)
-            
+
     def __check_signed_out_popup(self):
         try:
             return self.driver.execute_script("""
@@ -359,9 +382,7 @@ class Web5Controller:
     # --------------------------------------------------------
     # Fetch Odds
     # --------------------------------------------------------
-    @time_it
     def fetch_odds(self):
-        start = time.perf_counter()
 
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
@@ -436,7 +457,7 @@ class Web5Controller:
                         self.logger.info("DOM Updates - Waiting")
                         time.sleep(1)
                         continue
-                    
+
                     self.logger.info(f"DOM Updates - Detected - {len(updates)}")
 
                 try:
@@ -472,12 +493,11 @@ class Web5Controller:
                     if not leagues:
                         raise ValueError("No leagues found under sport")
 
-
                     # Iterate leagues (NBA, etc.)
                     for league_block in leagues:
                         try:
-                            league = league_block[1]          # NBA
-                            matches_data = league_block[2]    # Matches list
+                            league = league_block[1]  # NBA
+                            matches_data = league_block[2]  # Matches list
                             break
                         except (IndexError, TypeError):
                             continue
@@ -575,7 +595,6 @@ class Web5Controller:
                         # Save Odds in DB
                         saved_odds = self.storage.save_odds(odd_row)
                         if saved_odds:
-                            
                             # Send Telegram Alert
                             alert = (
                                 f"===== Odds =====\n"
@@ -620,29 +639,29 @@ class Web5Controller:
                 pass
 
             self.logger.info("==================== Fetching Odds (END) ====================")
-    
+
     # --------------------------------------------------------
     # Execute Bet
     # --------------------------------------------------------
     def __execute_bet(
-        self,
-        game_id: str,
-        team_name: str,
-        moneyline_odd: str,
-        stake: float = 1.0
+            self,
+            game_id: str,
+            team_name: str,
+            moneyline_odd: str,
+            stake: float = 1.0
     ):
         """
         Place a MONEYLINE bet by selecting the odds from NBA page and placing in bet slip
         """
 
         self.logger.info("========== Execute Bet (START) ==========")
-        
+
         try:
 
             self.logger.info(
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
             )
-            
+
             # -----------------------------------
             # PRINT ALL TABLE IDS INSIDE ODDS CONTAINER
             # -----------------------------------
@@ -717,7 +736,8 @@ class Web5Controller:
                                 decimal_odds = american_to_decimal(american_odds)
                             else:
                                 decimal_odds = odd_value
-                                american_odds = decimal_to_american(decimal_odds)  # safer, previously called american_to_decimal incorrectly
+                                american_odds = decimal_to_american(
+                                    decimal_odds)  # safer, previously called american_to_decimal incorrectly
 
                             self.logger.info(
                                 f"Moneyline | American Odds: {american_odds} | Decimal Odds: {decimal_odds} | id: {odd.get_attribute('id')}"
@@ -738,7 +758,7 @@ class Web5Controller:
 
                 except Exception:
                     continue
-            
+
             if not moneyline_element:
                 raise Exception(f"Moneyline odds {moneyline_odd} for team {team_name} not found in game {game_id}")
 
@@ -746,20 +766,20 @@ class Web5Controller:
             # CLICK ON MONEYLINE ODDS
             # -----------------------------------
             self.driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});", 
+                "arguments[0].scrollIntoView({block:'center', behavior:'smooth'});",
                 moneyline_element
             )
             time.sleep(1)
-            
+
             # Click using JavaScript to avoid interception
             self.driver.execute_script("arguments[0].click();", moneyline_element)
             self.logger.info("Clicked on moneyline odds")
-            
+
             # -----------------------------------
             # WAIT FOR BETSLIP TO APPEAR
             # -----------------------------------
             time.sleep(2)
-            
+
             # Check if bet slip appears
             try:
                 betslip_container = self.wait.until(
@@ -781,7 +801,7 @@ class Web5Controller:
             # VERIFY BET SLIP CONTENT
             # -----------------------------------
             time.sleep(1)
-            
+
             # Check if our selection appears in bet slip
             try:
                 bet_slip_team = self.wait.until(
@@ -789,7 +809,7 @@ class Web5Controller:
                         (By.CSS_SELECTOR, ".bet-event span.team1, .selection")
                     )
                 ).text.strip()
-                
+
                 if team_name.lower() not in bet_slip_team.lower():
                     self.logger.warning(f"Betslip team mismatch: Expected {team_name}, found {bet_slip_team}")
                     # Continue anyway as it might be a formatting difference
@@ -806,18 +826,18 @@ class Web5Controller:
                         (By.CSS_SELECTOR, "input[name='base'][class*='stake'], input.stake.base")
                     )
                 )
-                
+
                 # Clear and enter stake
                 base_input.clear()
                 base_input.send_keys(str(stake))
                 self.logger.info(f"Entered stake in base field: {stake}")
-                
+
                 # Trigger change event if needed
                 self.driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", base_input)
-                
+
             except Exception as e:
                 self.logger.warning(f"Could not find base input: {e}")
-                
+
                 # Try risk input as fallback
                 try:
                     risk_input = self.wait.until(
@@ -825,11 +845,11 @@ class Web5Controller:
                             (By.CSS_SELECTOR, "input[name='risk'], input.risk")
                         )
                     )
-                    
+
                     risk_input.clear()
                     risk_input.send_keys(str(stake))
                     self.logger.info(f"Entered stake in risk field: {stake}")
-                    
+
                 except Exception as e2:
                     self.logger.error(f"Could not find any stake input: {e2}")
                     raise Exception("No stake input field found")
@@ -838,12 +858,12 @@ class Web5Controller:
             # CHECK FOR ERRORS
             # -----------------------------------
             time.sleep(1)
-            
+
             # Check for error messages
             error_elements = self.driver.find_elements(
                 By.CSS_SELECTOR, ".error-message, .ERROR, .BetItemError, .attention.ERROR"
             )
-            
+
             for error in error_elements:
                 error_text = error.text.strip()
                 if error_text and "unavailable" not in error_text.lower():
@@ -857,7 +877,7 @@ class Web5Controller:
                 better_odds_checkbox = self.driver.find_element(
                     By.CSS_SELECTOR, "input#betterOddsCheckbox, input[name='betterOdds']"
                 )
-                
+
                 if better_odds_checkbox.is_displayed() and not better_odds_checkbox.is_selected():
                     self.driver.execute_script("arguments[0].click();", better_odds_checkbox)
                     self.logger.info("Checked 'Accept Better Odds'")
@@ -896,7 +916,7 @@ class Web5Controller:
                     raise Exception(
                         f"Stake {stake} exceeds maximum bet {max_bet}"
                     )
-                
+
                 # Set the stake directly via JS
                 # self.driver.execute_script("""
                 # arguments[0].value = arguments[1];
@@ -917,30 +937,30 @@ class Web5Controller:
                     (By.CSS_SELECTOR, ".place-bet-btn, button[class*='place-bet']")
                 )
             )
-            
+
             btn_classes = place_bet_btn.get_attribute("class")
             is_disabled = "disabled" in btn_classes or place_bet_btn.get_attribute("disabled")
-            
+
             if is_disabled:
                 # Check why it's disabled
                 disabled_reason = "Button disabled"
-                
+
                 # Check for error messages
                 error_msg = self.driver.find_elements(By.CSS_SELECTOR, ".error-message")
                 if error_msg:
                     disabled_reason = error_msg[0].text.strip()
-                
+
                 raise Exception(f"Cannot place bet - {disabled_reason}")
-            
+
             # -----------------------------------
             # CLICK PLACE BET BUTTON
             # -----------------------------------
             self.driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", 
+                "arguments[0].scrollIntoView({block:'center'});",
                 place_bet_btn
             )
             time.sleep(0.5)
-            
+
             self.driver.execute_script("arguments[0].click();", place_bet_btn)
             self.logger.info("Clicked 'Place Bet' button")
 
@@ -996,24 +1016,23 @@ class Web5Controller:
             return False, stake
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
-    
 
     # --------------------------------------------------------
     # Place Bet
     # --------------------------------------------------------
     def place_bet(
-        self,
-        game_id: str,
-        team_name: str,
-        moneyline_odd: str,
-        stake: float = 1.0
+            self,
+            game_id: str,
+            team_name: str,
+            moneyline_odd: str,
+            stake: float = 1.0
     ):
         # Logger & Storage
         self.logger = Logger.get_logger(f"{self.bookmaker}-bet")
         self.storage = Storage(self.logger)
 
         self.logger.info("==================== Place Bet (START) ====================")
-        
+
         # Step 1: Login
         self.__login()
 
@@ -1023,16 +1042,16 @@ class Web5Controller:
         time.sleep(2)  # Wait for initial load
 
         # Step 3: Place Bet
-        self.__execute_bet(game_id, team_name, moneyline_odd, stake)  
-        
+        self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+
         self.logger.info("==================== Place Bet (END) ====================")
 
     # --------------------------------------------------------
     # Betting
     # --------------------------------------------------------
     def betting(
-        self,
-        stake: float = 1.0
+            self,
+            stake: float = 1.0
     ):
         # Logger & Storage
         self.logger = Logger.get_logger(f"{self.bookmaker}-betting")
@@ -1080,7 +1099,7 @@ class Web5Controller:
                 if not arbs:
                     self.logger.info("Waiting for Arbitrage")
                     continue
-                
+
                 self.logger.info(f"Arbitrage: {len(arbs)}")
 
                 for arb in arbs:
@@ -1095,7 +1114,7 @@ class Web5Controller:
                     self.logger.info(
                         f"Arbitrage | Match: {team_1} vs {team_2}"
                     )
-                    
+
                     if arb.get("team_1_bookmaker") == self.bookmaker:
                         team_no = 1
                         game_id = arb.get("team_1_game_id")
@@ -1180,7 +1199,7 @@ class Web5Controller:
 
         except Exception as e:
             self.logger.error(f"Bet Place Failed: {e}", exc_info=True)
-            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM['arbitrage_monitoring']))       
+            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM['arbitrage_monitoring']))
             return None
         finally:
             try:
