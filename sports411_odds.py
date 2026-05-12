@@ -7,8 +7,8 @@ db = __get_db1_session__()
 
 def main():
     account = Accounts(
-        account = 'user1',
-        password = '***********',
+        account = '8715',
+        password = 'eqr0mjx-MXY*rcn1ana',
         label = 'Reader'
     )
 

@@ -8,12 +8,12 @@ jobs:
   - name: sports411_odds
     script: sports411_odds.py
     interval_seconds: 30
-  - name: probet42_betting
-    script: probet42_betting.py
-    interval_seconds: 30
-  - name: sports411_betting
-    script: sports411_betting.py
-    interval_seconds: 30
+#  - name: probet42_betting
+#    script: probet42_betting.py
+#    interval_seconds: 30
+#  - name: sports411_betting
+#    script: sports411_betting.py
+#    interval_seconds: 30
 
   - name: pinnacle
     script: pinnacle.py

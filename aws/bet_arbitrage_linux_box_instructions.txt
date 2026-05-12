@@ -1,0 +1,37 @@
+What You Already Have (Confirmed from Screenshots)
+
+Instance ID: i-096f723b61ec05e7 (tagged "pinn-arb")
+Public IPv4: 35.94.30.89
+Public DNS: ec2-35-94-30-89.us-west-2.compute.amazonaws.com
+Key pair: pinn-arb.pem (this was assigned at launch)
+AMI / OS: Ubuntu 22.04-based (Ubuntu_22.04-x86_64-SQL_2022_Standard-2025.08.28)
+Instance state: Running (launched recently — Sat May 02 2026)
+Username: Almost certainly ubuntu (standard default for official Ubuntu AMIs on AWS)
+
+
+Exact Steps to Connect (SSH Tunnel)
+On your local machine (Mac/Linux/Windows with WSL or Git Bash recommended):
+
+Locate / place the private key file
+Make sure pinn-arb.pem is in your current working directory (or provide the full path).
+Set correct permissions (critical — AWS will reject it otherwise):Bashchmod 400 pinn-arb.pem
+
+
+Connect with SSH (copy-paste this):Bash ssh -i "pinn-arb.pem" ubuntu@ec2-35-94-30-89.us-west-2.compute.amazonaws.com
+Or using the IP (equivalent):Bashssh -i "pinn-arb.pem" ubuntu@35.94.30.89
+
+Temporary token: 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
+
+
+# 1. Create a proper SSH key directory inside WSL
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+# 2. Copy the key into Linux (this is the important step)
+cp "/mnt/c/Users/alexk/betting-arbitrage/aws/pinn-arb.pem" ~/.ssh/pinn-arb.pem
+
+# 3. Lock it down properly
+chmod 600 ~/.ssh/pinn-arb.pem
+
+# 4. Connect using the new clean key
+ssh -i ~/.ssh/pinn-arb.pem ubuntu@100.53.30.72

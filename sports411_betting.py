@@ -12,8 +12,8 @@ def main():
 
     bookmaker = SPORTS411['bookmaker']
     account = Accounts(
-        account = 'user2',
-        password = '***********',
+        account = '8715',
+        password = 'eqr0mjx-MXY*rcn1ana',
         label = 'Bettor'
     )
 

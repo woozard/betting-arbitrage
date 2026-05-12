@@ -3,9 +3,14 @@ import time
 import subprocess
 import yaml
 from datetime import datetime
+from pathlib import Path
 
-BASE_PATH = "/var/www/scrapers"
+# === IMPROVED: Dynamic BASE_PATH ===
+# This automatically sets the path relative to scheduler.py itself
+BASE_PATH = str(Path(__file__).parent.resolve())
 PYTHON_BIN = f"{BASE_PATH}/venv/bin/python3"
+
+print(f"BASE_PATH resolved to: {BASE_PATH}")  # helpful debug line
 
 def load_jobs():
     with open(f"{BASE_PATH}/jobs.yml", "r") as f:

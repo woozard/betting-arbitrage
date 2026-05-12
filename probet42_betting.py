@@ -12,7 +12,7 @@ def main():
 
     bookmaker = PROBET42['bookmaker']
     account = Accounts(
-        account = 'user2',
+        account = 'PWF2820009',
         password = '***********',
         label = 'Bettor'
     )
