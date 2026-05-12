@@ -27,14 +27,15 @@ from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
 class Web5Controller:
+
     def __init__(self, account, site):
 
-         # Credentials
+        # Credentials
         self.account_id = account.account
         self.password = account.password
         self.label = account.label if account.label is not None else "N/A"
-        
-        # Bookmaker 
+
+        # Bookmaker
         self.bookmaker = site['bookmaker']
 
         # Logger & Storage
@@ -43,90 +44,75 @@ class Web5Controller:
 
         # Cache
         self.cache = ArbitrageCache()
-        
-        # Set URLs for various API endpoints
+
+        # URLs
         self.website = site['website']
         self.base_url = site['url']
         self.login_url = f"{self.base_url}/en"
         self.dashboard_url = f"{self.base_url}/en/sports/soccer"
-        self.pending_wagers_url = f"{self.base_url}/en/account/my-bets-full"
         self.basketball_url = f"{self.base_url}/en/sports/basketball"
-        self.basketball_api_url = f"{self.base_url}/sports-service/sv/compact/favourite-events?_g=0&btg=1&c=&cl=100&d=&ec=&ev=&g=QQ%3D%3D&hle=false&l=100&lg=487&lv=&me=0&mk=3&more=false&o=1&ot=0&pa=0&pimo=&pn=-1&sp=4&tm=0&v=0&wm=&locale=en_US&_=1765914560489&withCredentials=true"
 
-        # Proxy settings
-        proxy_host = PROXY1['host']
-        proxy_port = PROXY1['port']
-        proxy_url = f"http://{proxy_host}:{proxy_port}"
-
-        # proxy_host = PROXY2['host']
-        # proxy_port = PROXY2['port']
-        # proxy_url = f"http://{proxy_host}:{proxy_port}"
-
-        # proxy_host = PROXY2['host']
-        # proxy_port = PROXY2['port']
-        # proxy_username = PROXY2['username']
-        # proxy_password = f"{PROXY2['password']}_country-us_city-newyorkcity"
-        # proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
-        
-        # Initialize Chrome WebDriver with proxy options
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument(f'--proxy-server={proxy_url}')
-
-        # Add these additional arguments to appear more like a real browser
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
-        
-        self.driver = webdriver.Chrome(options=options)
-        self.wait = WebDriverWait(self.driver, 30)  # Increased timeout duration
-
-        # Initialize Chrome WebDriver with proxy options
-        # options = uc.ChromeOptions()
-        # options.headless = True  # Runs the browser in headless mode for deployment
-        # options.add_argument(f'--proxy-server={proxy_url}')
-        # self.driver = uc.Chrome(version_main=126, use_subprocess=False, options=options)
-        # self.wait = WebDriverWait(self.driver, 30)  # Increased timeout duration
-
+        # Playwright (no proxy, strong stealth)
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
     # --------------------------------------------------------
     # Login
     # --------------------------------------------------------
     # Improved login with debug HTML dump + longer waits + undetected-chromedriver
-    def __login(self):
+    # def __login(self):
+    #     try:
+    #         self.logger.info(f"account_id: {self.account_id}")
+    #         self.logger.info(f"label: {self.label}")
+    #
+    #         self.logger.info("Opening Login Page")
+    #         self.driver.get(self.login_url)
+    #         time.sleep(8)
+    #
+    #         # Save debug HTML
+    #         with open(f"debug_login_probet42_{int(time.time())}.html", "w", encoding="utf-8") as f:
+    #             f.write(self.driver.page_source)
+    #         self.logger.info("💾 Saved debug_login_probet42_*.html — inspect for current form fields!")
+    #
+    #         self.wait.until(EC.presence_of_element_located((By.NAME, "loginId")))
+    #         username_input = self.driver.find_element(By.NAME, 'loginId')
+    #         password_input = self.driver.find_element(By.NAME, 'pass')
+    #
+    #         username_input.send_keys(self.account_id)
+    #         password_input.send_keys(self.password)
+    #         self.logger.info("Filled Login Form")
+    #
+    #         password_input.send_keys(Keys.RETURN)
+    #         time.sleep(5)
+    #
+    #         self.wait.until(EC.url_contains(self.dashboard_url))
+    #         self.logger.info("Login Passed")
+    #     except Exception as e:
+    #         self.logger.error(f"Login Failed - Reason: {e}")
+    #         with open(f"debug_login_probet42_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
+    #             f.write(self.driver.page_source)
+    #         raise Exception(f"Login Failed - Reason: {e}") from e
+
+    async def __login(self):
         try:
             self.logger.info(f"account_id: {self.account_id}")
             self.logger.info(f"label: {self.label}")
 
-            self.logger.info("Opening Login Page")
-            self.driver.get(self.login_url)
-            time.sleep(8)  # Give page time to fully load
+            self.logger.info("Opening Login Page with Playwright")
+            await self.page.goto(self.login_url, wait_until="networkidle", timeout=60000)
 
-            # DEBUG: Save full page source so we can see current form fields
-            with open(f"debug_login_probet42_{int(time.time())}.html", "w", encoding="utf-8") as f:
-                f.write(self.driver.page_source)
-            self.logger.info("💾 Saved debug_login_probet42_*.html — inspect for current form fields!")
+            # Save debug HTML
+            with open(f"debug_login_probet42_playwright_{int(time.time())}.html", "w", encoding="utf-8") as f:
+                f.write(await self.page.content())
+            self.logger.info("💾 Saved debug_login_probet42_playwright_*.html")
 
-            self.wait.until(
-                EC.presence_of_element_located((By.NAME, "loginId"))
-            )
-            username_input = self.driver.find_element(By.NAME, 'loginId')
-            password_input = self.driver.find_element(By.NAME, 'pass')
+            await self.page.wait_for_timeout(5000)
+            self.logger.info("Playwright page loaded successfully")
 
-            username_input.send_keys(self.account_id)
-            password_input.send_keys(self.password)
-            self.logger.info("Filled Login Form")
-
-            password_input.send_keys(Keys.RETURN)
-            time.sleep(5)
-
-            self.wait.until(EC.url_contains(self.dashboard_url))
-            self.logger.info("Login Passed")
         except Exception as e:
-            self.logger.error(f"Login Failed - Reason: {e}")
-            with open(f"debug_login_probet42_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
-                f.write(self.driver.page_source)
-            raise Exception(f"Login Failed - Reason: {e}") from e
+            self.logger.error(f"Playwright Login Failed - Reason: {e}")
+            raise
 
     def __proxy_location(self):
         try:
@@ -373,9 +359,9 @@ class Web5Controller:
     # --------------------------------------------------------
     # Fetch Odds
     # --------------------------------------------------------
+    @time_it
     def fetch_odds(self):
         start = time.perf_counter()
-    @time_it
 
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)

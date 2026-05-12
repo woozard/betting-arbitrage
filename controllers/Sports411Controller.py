@@ -80,7 +80,6 @@ class Sports411Controller:
             self.driver.get(self.login_url)
             time.sleep(8)
 
-            # DEBUG: Save full page source
             with open(f"debug_login_sports411_{int(time.time())}.html", "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
             self.logger.info("💾 Saved debug_login_sports411_*.html — inspect for current form fields!")
@@ -98,13 +97,12 @@ class Sports411Controller:
             password_input.send_keys(self.password)
 
             login_btn = self.driver.find_element(
-                By.CSS_SELECTOR, "input[type='submit'].login"
+                By.CSS_SELECTOR, "input[type='\''submit'\'']\.login"
             )
             login_btn.click()
 
             self.wait.until(EC.url_contains("/en/sports/"))
             self.logger.info("Login Successful")
-
         except Exception as e:
             self.logger.error(f"Login Failed: {e}")
             with open(f"debug_login_sports411_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
@@ -145,9 +143,10 @@ class Sports411Controller:
     # --------------------------------------------------------
     # Fetch Odds
     # --------------------------------------------------------
+    @time_it
     def fetch_odds(self, refresh_interval=10):
         start = time.perf_counter()
-    @time_it
+
         """
         Continuously fetch NBA odds by refreshing the page every `refresh_interval` seconds.
         Login happens only once. The browser remains open.
