@@ -15,6 +15,7 @@ from utils.config import PROXY1, PROXY2, TELEGRAM
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert
+from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
 class Sports411Controller:
@@ -139,6 +140,8 @@ class Sports411Controller:
     # Fetch Odds
     # --------------------------------------------------------
     def fetch_odds(self, refresh_interval=10):
+        start = time.perf_counter()
+    @time_it
         """
         Continuously fetch NBA odds by refreshing the page every `refresh_interval` seconds.
         Login happens only once. The browser remains open.

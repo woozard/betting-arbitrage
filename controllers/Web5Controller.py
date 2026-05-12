@@ -21,7 +21,9 @@ from utils.config import PROXY1 ,PROXY2, TELEGRAM
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import currency_to_float, determine_wager_on_spread, send_telegram_alert, send_monitoring_alert, send_testing_alert, epoch_to_mysql_datetime, parse_odds
+from utils.timing import time_it
 from utils.helpers import detect_odds_type, decimal_to_american, american_to_decimal, odds_equal
+from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
 class Web5Controller:
@@ -376,6 +378,8 @@ class Web5Controller:
     # Fetch Odds
     # --------------------------------------------------------
     def fetch_odds(self):
+        start = time.perf_counter()
+    @time_it
 
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)

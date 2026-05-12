@@ -11,6 +11,7 @@ from database.models.Arbitrage import Arbitrage
 from utils.config import TELEGRAM
 from utils.logger import Logger
 from utils.helpers import send_telegram_alert, send_testing_alert, send_monitoring_alert
+from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
 
@@ -65,6 +66,8 @@ class ArbitrageController:
     # Scan Opportunities
     # --------------------------------------------------------
     def scan_opportunities(self):
+        start = time.perf_counter()
+    @time_it
 
         self.logger.info("========== Arbitrage - Scan Opportunities (START) ==========")
         try:
