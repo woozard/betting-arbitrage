@@ -92,46 +92,42 @@ class Web5Controller:
     # --------------------------------------------------------
     # Login
     # --------------------------------------------------------
+    # Improved login with debug HTML dump + longer waits + undetected-chromedriver
     def __login(self):
         try:
-            
             self.logger.info(f"account_id: {self.account_id}")
             self.logger.info(f"label: {self.label}")
 
-        
-            # Step 1: Go to the sign-in page
+            self.logger.info("Opening Login Page")
             self.driver.get(self.login_url)
-            time.sleep(5)  # Allow time for the page to load
-            self.logger.info("Opened Login Page")
-            self.logger.info(f"Current URL: {self.driver.current_url}")
+            time.sleep(8)  # Give page time to fully load
 
-            # Print the login page HTML content
-            # print("Login Page HTML Content:")
-            # print(driver.page_source)  # Print the HTML of the login page
-            
-            # Step 2: Find and fill the username and password fields
+            # DEBUG: Save full page source so we can see current form fields
+            with open(f"debug_login_probet42_{int(time.time())}.html", "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+            self.logger.info("💾 Saved debug_login_probet42_*.html — inspect for current form fields!")
+
             self.wait.until(
                 EC.presence_of_element_located((By.NAME, "loginId"))
             )
             username_input = self.driver.find_element(By.NAME, 'loginId')
             password_input = self.driver.find_element(By.NAME, 'pass')
 
-            username_input.send_keys(self.account_id)  # Enter username
-            password_input.send_keys(self.password)  # Enter password
+            username_input.send_keys(self.account_id)
+            password_input.send_keys(self.password)
             self.logger.info("Filled Login Form")
 
-            # Step 3: Submit the form by pressing ENTER
             password_input.send_keys(Keys.RETURN)
-            time.sleep(3)  # Allow time for the page to process the login
-            self.logger.info("Submitted Login Form")
-            
-            # Redirect to dashboard page (if login redirects automatically, this may not be needed)
+            time.sleep(5)
+
             self.wait.until(EC.url_contains(self.dashboard_url))
             self.logger.info("Login Passed")
         except Exception as e:
             self.logger.error(f"Login Failed - Reason: {e}")
+            with open(f"debug_login_probet42_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
             raise Exception(f"Login Failed - Reason: {e}") from e
-    
+
     def __proxy_location(self):
         try:
             self.driver.get("https://ipinfo.io/json")

@@ -70,15 +70,20 @@ class Sports411Controller:
     # --------------------------------------------------------
     # Login
     # --------------------------------------------------------
+    # Improved login with debug HTML dump + longer waits
     def __login(self):
         try:
-            
             self.logger.info(f"Account: {self.account_id}")
             self.logger.info(f"Label: {self.label}")
 
             self.logger.info("Opening Login Page")
             self.driver.get(self.login_url)
-            time.sleep(5)
+            time.sleep(8)
+
+            # DEBUG: Save full page source
+            with open(f"debug_login_sports411_{int(time.time())}.html", "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+            self.logger.info("💾 Saved debug_login_sports411_*.html — inspect for current form fields!")
 
             account_input = self.wait.until(
                 EC.presence_of_element_located((By.ID, "account"))
@@ -89,7 +94,6 @@ class Sports411Controller:
 
             account_input.clear()
             account_input.send_keys(self.account_id)
-
             password_input.clear()
             password_input.send_keys(self.password)
 
@@ -103,6 +107,8 @@ class Sports411Controller:
 
         except Exception as e:
             self.logger.error(f"Login Failed: {e}")
+            with open(f"debug_login_sports411_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
             raise
 
     def __inject_mutation_observer(self):
