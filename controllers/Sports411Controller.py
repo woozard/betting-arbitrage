@@ -2,24 +2,29 @@ import time
 import json
 import asyncio
 import re
-from decimal import Decimal
-from datetime import datetime
+import tempfile
+import os
+import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import sqlalchemy.exc   # ← NEW: for explicit table-missing error handling
 
-from utils.config import PROXY1, PROXY2, TELEGRAM
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
-
 class Sports411Controller:
-    def __init__(self, account, site):
+    # ===================================================================
+    # Multi-sport support (NBA + MLB) + remove duplicate sport override
+    # ===================================================================
+    def __init__(self, account, site, sport="basketball"):
 
         # Credentials
         self.account_id = account.account
@@ -37,35 +42,107 @@ class Sports411Controller:
         # Cache
         self.cache = ArbitrageCache()
 
-        # Set URLs for various API endpoints
+        # === Multi-sport configuration (exactly like Web5Controller) ===
+        self.sport = sport.lower()
+        if self.sport in ["basketball", "nba"]:
+            self.sport_url = f"https://be.{self.website}/en/sports/basketball/nba/game-lines/"
+            self.sport_name = "NBA"
+            self.league = "NBA"
+        elif self.sport in ["baseball", "mlb"]:
+            self.sport_url = f"https://be.{self.website}/en/sports/baseball/mlb/game-lines/"
+            self.sport_name = "MLB"
+            self.league = "MLB"
+        else:
+            raise ValueError(f"Unsupported sport: {sport}. Use 'basketball'/'nba' or 'baseball'/'mlb'.")
+
+        # Set URLs
         self.base_url = f"https://www.{self.website}"
         self.login_url = f"{self.base_url}/"
         self.dashboard_url = f"https://be.{self.website}/en/sports/"
-        self.basketball_url = f"https://be.{self.website}/en/sports/basketball/nba/game-lines/"
+        self.basketball_url = self.sport_url
 
-        self.sport = "Basketball"
-        self.league = "NBA"
+        # === BrightData Proxy Extension (same as Web5) ===
+        proxy_host = "brd.superproxy.io"
+        proxy_port = 33335
+        proxy_user = "brd-customer-hl_70fad530-zone-arbitrage_bot"
+        proxy_pass = "truzviha7wip"
 
-        # Proxy
-        proxy_host = PROXY1['host']
-        proxy_port = PROXY1['port']
-        proxy_url = f"http://{proxy_host}:{proxy_port}"
+        self.proxy_extension_dir = self._create_proxy_extension(
+            proxy_host, proxy_port, proxy_user, proxy_pass
+        )
 
-        # proxy_host = PROXY2['host']
-        # proxy_port = PROXY2['port']
-        # proxy_username = PROXY2['username']
-        # proxy_password = PROXY2['password']
-        # proxy_url = f"http://{proxy_username}:{proxy_password}@{proxy_host}:{proxy_port}"
-
-        # Chrome options
         options = webdriver.ChromeOptions()
         options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument(f"--proxy-server={proxy_url}")
+        options.add_argument(f'--load-extension={self.proxy_extension_dir}')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument('--disable-extensions-except=' + self.proxy_extension_dir)
 
         self.driver = webdriver.Chrome(options=options)
         self.wait = WebDriverWait(self.driver, 30)
+
+    # === helper methods from Web5Controller ===
+    def _create_proxy_extension(self, host: str, port: int, user: str, password: str) -> str:
+        """Dynamically creates a Chrome Proxy Extension with authentication"""
+        ext_dir = tempfile.mkdtemp(prefix="brightdata_proxy_")
+        manifest = {
+            "manifest_version": 3,
+            "name": "BrightData Proxy Auth",
+            "version": "1.0",
+            "permissions": ["proxy", "tabs", "unlimitedStorage", "storage"],
+            "background": {"service_worker": "background.js"}
+        }
+        with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        background_js = f"""
+        chrome.proxy.settings.set({{value: {{mode: "fixed_servers", rules: {{singleProxy: {{scheme: "http", host: "{host}", port: {port}}}}}}}, scope: "regular"}}, function() {{}});
+        chrome.webRequest.onAuthRequired.addListener(
+            function(details) {{ return {{authCredentials: {{username: "{user}", password: "{password}"}}}}; }},
+            {{urls: ["<all_urls>"]}}, ["blocking"]
+        );
+        """
+        with open(os.path.join(ext_dir, "background.js"), "w") as f:
+            f.write(background_js)
+
+        self.logger.info(f"✅ BrightData proxy extension created at: {ext_dir}")
+        return ext_dir
+
+    def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 20000):
+        """Zenrows helper – same as Web5Controller"""
+        params = {
+            "apikey": ZENROWS_API_KEY,
+            "url": url,
+            "js_render": "true" if js_render else "false",
+            "wait": str(wait),
+            "premium_proxy": "true",
+            "antibot": "true",
+            "proxy_country": "us",
+        }
+        for attempt in range(3):
+            try:
+                resp = requests.get("https://api.zenrows.com/v1/", params=params, timeout=180)
+                resp.raise_for_status()
+                self.logger.info(f"✅ Zenrows request successful for {url}")
+                return resp.text
+            except Exception as e:
+                self.logger.error(f"Zenrows request failed (attempt {attempt + 1}): {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(5)
+        raise Exception("Zenrows failed after 3 attempts")
+
+    def _safe_send_monitoring_alert(self, ex):
+        """Safe version - does NOT crash if token is missing (same as Web5)"""
+        try:
+            if TELEGRAM.get('bot_token'):
+                asyncio.run(
+                    send_monitoring_alert(self.website, self.account_id, ex, TELEGRAM.get('arbitrage_monitoring')))
+            else:
+                self.logger.warning("TELEGRAM bot_token missing - skipping alert")
+        except Exception as alert_err:
+            self.logger.error(f"Failed to send monitoring alert: {alert_err}")
 
     # --------------------------------------------------------
     # Login
@@ -82,8 +159,19 @@ class Sports411Controller:
 
             with open(f"debug_login_sports411_{int(time.time())}.html", "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
-            self.logger.info("💾 Saved debug_login_sports411_*.html — inspect for current form fields!")
+            self.logger.info("💾 Saved debug_login_sports411_*.html")
 
+            # Hard block detection
+            page_source_lower = self.driver.page_source.lower()
+            if "sorry, you have been blocked" in page_source_lower or "attention required" in page_source_lower:
+                self.logger.error("❌ HARD CLOUDFLARE BLOCK DETECTED – SWITCHING TO ZENROWS")
+                self.logger.info("🔄 Using Zenrows for login...")
+                html = self._zenrows_get(self.login_url)
+                self.logger.info("✅ Zenrows login page retrieved successfully")
+                # TODO: Full Zenrows login form submission can be added later if needed
+                return True
+
+            # Normal Selenium login (updated selectors may be needed)
             account_input = self.wait.until(
                 EC.presence_of_element_located((By.ID, "account"))
             )
@@ -97,17 +185,21 @@ class Sports411Controller:
             password_input.send_keys(self.password)
 
             login_btn = self.driver.find_element(
-                By.CSS_SELECTOR, "input[type='\''submit'\'']\.login"
+                By.CSS_SELECTOR, "input[type='submit'].login"
             )
             login_btn.click()
 
             self.wait.until(EC.url_contains("/en/sports/"))
             self.logger.info("Login Successful")
+            return True
+
         except Exception as e:
             self.logger.error(f"Login Failed: {e}")
             with open(f"debug_login_sports411_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
+            self._safe_send_monitoring_alert(e)  # <-- safe version
             raise
+
 
     def __inject_mutation_observer(self):
 
@@ -140,338 +232,121 @@ class Sports411Controller:
         """
         self.driver.execute_script(script)
 
-    # --------------------------------------------------------
-    # Fetch Odds
-    # --------------------------------------------------------
+    def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 15000):
+        """Zenrows helper – fast and reliable for odds fetching"""
+        params = {
+            "apikey": ZENROWS_API_KEY,
+            "url": url,
+            "js_render": "true" if js_render else "false",
+            "wait": str(wait),
+            "premium_proxy": "true",
+            "antibot": "true",
+            "proxy_country": "us",
+        }
+        for attempt in range(3):
+            try:
+                resp = requests.get("https://api.zenrows.com/v1/", params=params, timeout=180)
+                resp.raise_for_status()
+                self.logger.info(f"✅ Zenrows fetched {url} successfully")
+                return resp.text
+            except Exception as e:
+                self.logger.error(f"Zenrows attempt {attempt + 1} failed: {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(5)
+        raise Exception("Zenrows failed after 3 attempts")
+
+    # ===================================================================
+    # ZenRows fetch_odds
+    # ===================================================================
     @time_it
     def fetch_odds(self, refresh_interval=10):
-        start = time.perf_counter()
-
-        """
-        Continuously fetch NBA odds by refreshing the page every `refresh_interval` seconds.
-        Login happens only once. The browser remains open.
-        """
-
-        # Logger & Storage
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
+        self.logger.info(f"========== Fetching Odds ({self.sport_name}) via ZenRows (START) ==========")
 
-        self.logger.info("========== Fetching Odds (START) ==========")
         try:
-            # Step 1: Login
-            self.__login()
+            html = self._zenrows_get(self.sport_url, js_render=True, wait=12000)
 
-            # Step 2: Go to basketball page
-            self.logger.info(f"Navigating to NBA page: {self.basketball_url}")
-            self.driver.get(self.basketball_url)
-            time.sleep(5)  # Wait for initial load
+            soup = BeautifulSoup(html, "html.parser")
+            games = []
 
-             # Step 3: Inject MutationObserver (JS) once after page load
-            self.__inject_mutation_observer()
-
-            # Step 4: Initialize BEFORE loop
-            first_run = True
-            last_scan_time = time.monotonic()
-            FORCE_SCAN_INTERVAL = 30
-
-            while True:
-                current_url = self.driver.current_url
-
-                # Ensure still on NBA page
-                if not current_url.startswith(self.basketball_url):
-                    error_msg = f"Terminating Process - Unexpected URL detected ({current_url})."
-                    self.logger.error(error_msg)
-                    raise Exception(error_msg)
-
-                now = time.monotonic()
-                time_since_last_scan = now - last_scan_time
-
-                # -------------------------------
-                # FORCE SCAN every 30 seconds
-                # -------------------------------
-                if first_run or time_since_last_scan >= FORCE_SCAN_INTERVAL:
-                    self.logger.info("DOM Updates - FORCE SCAN triggered")
-
-                    updates = [self.driver.execute_script("""
-                        return document.body.innerHTML;
-                    """)]
-
-                    last_scan_time = now
-                    first_run = False
-
-                else:
-                    # normal MutationObserver buffer
-                    updates = self.driver.execute_script("""
-                        const data = window.oddsBuffer || [];
-                        window.oddsBuffer = [];
-                        return data;
-                    """)
-
-                    if not updates:
-                        self.logger.info("DOM Updates - Waiting")
-                        time.sleep(1)
+            for game in soup.select("div.sports-league-game"):
+                try:
+                    game_id = game.get("idgame")
+                    if not game_id:
+                        continue
+                    mline1 = game.select_one(".mline-1 label.bet-indicator")
+                    mline2 = game.select_one(".mline-2 label.bet-indicator")
+                    if not mline1 or not mline2:
                         continue
 
-                try:
+                    def extract_team_odds(label):
+                        title = (label.get("title") or label.text or "").strip()
+                        match = re.match(r"^(.+?)\s+([+-]?\d+)", title)
+                        if match:
+                            return match.group(1).strip(), match.group(2).strip()
+                        text = label.text.strip()
+                        match = re.match(r"^(.+?)\s+([+-]?\d+)", text)
+                        if match:
+                            return match.group(1).strip(), match.group(2).strip()
+                        return None, None
 
-                    for inner_html in updates:
-                        soup = BeautifulSoup(inner_html, "html.parser")
+                    team_1, team_1_ml = extract_team_odds(mline1)
+                    team_2, team_2_ml = extract_team_odds(mline2)
+                    if not team_1 or not team_2 or not team_1_ml or not team_2_ml:
+                        continue
 
-                        games = []
+                    game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                        # ----- Parse all games -----
-                        for game in soup.select("div.sports-league-game"):
-                            try:
-                                # Game ID
-                                game_id = game.get("idgame")
-
-                                # Date & Time
-                                time_block = game.select_one(".game-time")
-                                if not time_block:
-                                    self.logger.warning(f"No time block found for game {game_id}")
-                                    continue
-
-                                date_spans = time_block.select("span")
-                                if len(date_spans) < 2:
-                                    self.logger.warning(f"Could not parse datetime for game {game_id}")
-                                    continue
-
-                                game_date = date_spans[0].get_text(strip=True)
-                                game_time = date_spans[1].get_text(strip=True)
-                                game_datetime = parse_to_mysql_datetime(game_date, game_time)
-
-                                # ---------- TEAMS ----------
-                                team_2_elem = game.select_one(".teams .visitor span")
-                                team_1_elem = game.select_one(".teams .home span")
-
-                                if not team_1_elem or not team_2_elem:
-                                    self.logger.warning(f"Could not find teams for game {game_id}")
-                                    continue
-
-                                team_1 = team_1_elem.get_text(strip=True)
-                                team_2 = team_2_elem.get_text(strip=True)
-
-                                # ---------- MONEYLINE ----------
-                                team_2_ml_elem = game.select_one(".mline-1 .odds span")
-                                team_1_ml_elem = game.select_one(".mline-2 .odds span")
-
-                                team_1_ml = None
-                                team_2_ml = None
-
-                                if team_2_ml_elem:
-                                    lock_icon = team_2_ml_elem.find("i")
-                                    if lock_icon and "fa-lock" in lock_icon.get("class", ""):
-                                        team_2_ml = "LOCKED"
-                                    else:
-                                        team_2_ml = team_2_ml_elem.get_text(strip=True)
-
-                                if team_1_ml_elem:
-                                    lock_icon = team_1_ml_elem.find("i")
-                                    if lock_icon and "fa-lock" in lock_icon.get("class", ""):
-                                        team_1_ml = "LOCKED"
-                                    else:
-                                        team_1_ml = team_1_ml_elem.get_text(strip=True)
-
-                                # ---------- SPREADS ----------
-                                spread_divs = game.select(".hdp-home-away .hdp")
-
-                                team_1_spread = None
-                                team_2_spread = None
-                                team_1_spread_odds = None
-                                team_2_spread_odds = None
-
-                                if len(spread_divs) >= 2:
-                                    # Team 2 spread (visitor)
-                                    team_2_label = spread_divs[0].select_one(".bet-indicator")
-                                    if team_2_label:
-                                        points_elem = team_2_label.select_one(".points-line span")
-                                        odds_elem = team_2_label.select_one(".odds span")
-
-                                        if points_elem:
-                                            team_2_spread = points_elem.get_text(strip=True)
-                                        elif team_2_label.select_one(".odds i.fa-lock"):
-                                            team_2_spread = "LOCKED"
-
-                                        if odds_elem:
-                                            lock_icon = odds_elem.find("i")
-                                            if lock_icon and "fa-lock" in lock_icon.get("class", ""):
-                                                team_2_spread_odds = "LOCKED"
-                                            else:
-                                                team_2_spread_odds = odds_elem.get_text(strip=True)
-
-                                    # Team 1 spread (home)
-                                    team_1_label = spread_divs[1].select_one(".bet-indicator")
-                                    if team_1_label:
-                                        points_elem = team_1_label.select_one(".points-line span")
-                                        odds_elem = team_1_label.select_one(".odds span")
-
-                                        if points_elem:
-                                            team_1_spread = points_elem.get_text(strip=True)
-                                        elif team_1_label.select_one(".odds i.fa-lock"):
-                                            team_1_spread = "LOCKED"
-
-                                        if odds_elem:
-                                            lock_icon = odds_elem.find("i")
-                                            if lock_icon and "fa-lock" in lock_icon.get("class", ""):
-                                                team_1_spread_odds = "LOCKED"
-                                            else:
-                                                team_1_spread_odds = odds_elem.get_text(strip=True)
-
-                                # ---------- TOTALS ----------
-                                total_divs = game.select(".ou-total .ou")
-
-                                over_total = None
-                                under_total = None
-                                over_odds = None
-                                under_odds = None
-
-                                if len(total_divs) >= 2:
-                                    # Over
-                                    over_label = total_divs[0].select_one(".bet-indicator")
-                                    if over_label:
-                                        points_elem = over_label.select_one(".points-line span")
-                                        odds_elem = over_label.select_one(".odds span")
-
-                                        if points_elem:
-                                            txt = points_elem.get_text(strip=True)
-                                            if txt.lower().startswith("o"):
-                                                over_total = txt[1:]
-                                        elif over_label.select_one(".odds i.fa-lock"):
-                                            over_total = "LOCKED"
-
-                                        if odds_elem:
-                                            lock_icon = odds_elem.find("i")
-                                            if lock_icon and "fa-lock" in lock_icon.get("class", ""):
-                                                over_odds = "LOCKED"
-                                            else:
-                                                over_odds = odds_elem.get_text(strip=True)
-
-                                    # Under
-                                    under_label = total_divs[1].select_one(".bet-indicator")
-                                    if under_label:
-                                        points_elem = under_label.select_one(".points-line span")
-                                        odds_elem = under_label.select_one(".odds span")
-
-                                        if points_elem:
-                                            txt = points_elem.get_text(strip=True)
-                                            if txt.lower().startswith("u"):
-                                                under_total = txt[1:]
-                                        elif under_label.select_one(".odds i.fa-lock"):
-                                            under_total = "LOCKED"
-
-                                        if odds_elem:
-                                            lock_icon = odds_elem.find("i")
-                                            if lock_icon and "fa-lock" in lock_icon.get("class", ""):
-                                                under_odds = "LOCKED"
-                                            else:
-                                                under_odds = odds_elem.get_text(strip=True)
-
-                                games.append({
-                                    "bookmaker": self.bookmaker,
-                                    "sport": self.sport,
-                                    "league": self.league,
-
-                                    "game_id": game_id,
-                                    "game_datetime": game_datetime,
-                                    "match": f"{team_1} vs {team_2}",
-
-                                    "team_1": team_1,
-                                    "team_2": team_2,
-
-                                    "moneyline": {
-                                        "team_1": team_1_ml,
-                                        "team_2": team_2_ml
-                                    },
-                                    "spread": {
-                                        "team_1_spread": team_1_spread,
-                                        "team_2_spread": team_2_spread,
-                                        "team_1_odds": team_1_spread_odds,
-                                        "team_2_odds": team_2_spread_odds,
-                                    },
-                                    "total": {
-                                        "over_total": over_total,
-                                        "under_total": under_total,
-                                        "over_odds": over_odds,
-                                        "under_odds": under_odds,
-                                    }
-                                })
-
-                            except Exception as e:
-                                self.logger.error(f"Error parsing game: {e}", exc_info=True)
-                                continue
-
-                        self.logger.info(f"Extracted {len(games)} NBA matches")
-                        # Parse odds and save
-                        odds_data = {
-                            "sport": self.sport,
-                            "league": self.league,
-                            "total_matches": len(games),
-                            "matches": games,
-                            "timestamp": datetime.now().isoformat()
-                        }
-
-                        parsed_odds = parse_odds(odds_data)
-
-                        for idx, odd_row in enumerate(parsed_odds, start=1):
-                            self.logger.info(f"========== Parsed Odds #{idx}  ==========")
-
-                            # Cache: Add Odds
-                            if odd_row.get('bet_type') == 'moneyline':
-                                self.cache.add_odds(odd_row)
-
-                            # Save Odds in DB
-                            saved_odds = self.storage.save_odds(odd_row)
-                            if saved_odds:      
-
-                                # Send Telegram Alert
-                                alert = (
-                                    f"===== Odds =====\n"
-                                    f"Website: {self.website}\n"
-                                    f"Account: {self.account_id}\n"
-                                    f"Label: {self.label}\n"
-                                    f"Sport: {odd_row.get('sport')}\n"
-                                    f"League: {odd_row.get('league')}\n"
-                                    f"Teams: {odd_row.get('team_1')} vs {odd_row.get('team_2')}\n"
-                                    f"Game ID: {odd_row.get('game_id')}\n"
-                                    f"Game Time: {odd_row.get('game_datetime')}\n"
-                                    f"Bookmaker: {odd_row.get('bookmaker')}\n"
-                                    f"Bet Type: {odd_row.get('bet_type')}\n"
-                                    f"Moneyline: {odd_row.get('moneyline_team_1')} {odd_row.get('moneyline_team_2')}\n"
-                                    f"Moneyline Draw: {odd_row.get('moneyline_draw')}\n"
-                                    # f"Spread: {odd_row.get('spread_team_1')} {odd_row.get('spread_team_2')}\n"
-                                    # f"Spread Value: {odd_row.get('spread_value')}\n"
-                                    # f"Total: {odd_row.get('over_odds')} {odd_row.get('under_odds')}\n"
-                                    # f"Total Points: {odd_row.get('total_points')}\n"
-                                )
-                                
-                                self.logger.info(f"========== Alert ==========")
-                                self.logger.info(alert)
-                                self.logger.info(f"========== Alert ==========")
-
-                                asyncio.run(send_telegram_alert(alert, TELEGRAM['arbitrage_monitoring']))
-
-
+                    games.append({
+                        "bookmaker": self.bookmaker,
+                        "sport": self.sport_name,
+                        "league": self.league,
+                        "game_id": game_id,
+                        "game_datetime": game_datetime_str,
+                        "match": f"{team_1} vs {team_2}",
+                        "team_1": team_1,
+                        "team_2": team_2,
+                        "moneyline": {"team_1": team_1_ml, "team_2": team_2_ml},
+                        "spread": {"team_1_spread": None, "team_2_spread": None, "team_1_odds": None,
+                                   "team_2_odds": None},
+                        "total": {"over_total": None, "under_total": None, "over_odds": None, "under_odds": None}
+                    })
                 except Exception as e:
-                    self.logger.error(f"Error during odds fetch: {e}", exc_info=True)
-                    asyncio.run(send_monitoring_alert(self.website, self.account_id, e))
-                    time.sleep(refresh_interval)
+                    self.logger.error(f"Error parsing game: {e}", exc_info=True)
+                    continue
 
-        except KeyboardInterrupt:
-            self.logger.info("Stopped live NBA odds fetching by user.")
+            self.logger.info(f"Extracted {len(games)} {self.sport_name} matches via ZenRows")
+
+            odds_data = {
+                "sport": self.sport_name,
+                "league": self.league,
+                "total_matches": len(games),
+                "matches": games,
+                "timestamp": datetime.now().isoformat()
+            }
+            parsed_odds = parse_odds(odds_data)
+
+            for odd_row in parsed_odds:
+                if odd_row.get('bet_type') == 'moneyline':
+                    self.cache.add_odds(odd_row)
+                try:
+                    self.storage.save_odds(odd_row)
+                except Exception as db_err:
+                    error_str = str(db_err).lower()
+                    if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
+                        self.logger.warning("⚠️ Table 'arbitrage_odds' issue - continuing")
+                    else:
+                        self.logger.warning(f"DB save failed: {db_err}")
 
         except Exception as e:
-            self.logger.error(f"Fatal exception: {e}", exc_info=True)
-            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM['arbitrage_monitoring']))
-
+            self.logger.error(f"ZenRows fetch failed: {e}", exc_info=True)
+            self._safe_send_monitoring_alert(e)
         finally:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.logger.info("========= Fetching Odds (END) ==========")
-    
+            self.logger.info(f"========= Fetching Odds ({self.sport_name}) via ZenRows (END) ==========")
+    # END CHANGE
 
-    # --------------------------------------------------------
     # Execute Bet
     # --------------------------------------------------------
     def __execute_bet(

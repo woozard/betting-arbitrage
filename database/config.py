@@ -2,7 +2,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from utils.config import DB1, DB2
-
+# These imports are REQUIRED for SQLAlchemy model registration (side-effect)
+# Do NOT remove even if IDE shows them as unused/greyed-out
+from database.models.AccountBalance import AccountBalance
+from database.models.Accounts import Accounts
+from database.models.Arbitrage import Arbitrage
+from database.models.ArbitrageBets import ArbitrageBets
+from database.models.ArbitrageOdds import ArbitrageOdds   # ← THIS WAS MISSING
+from database.models.DailyFigures import DailyFigures
+from database.models.Odds2 import Odds2
+from database.models.Trades import Trades
 Base = declarative_base()
 
 def __get_base__():
