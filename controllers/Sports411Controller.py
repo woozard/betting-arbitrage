@@ -263,11 +263,51 @@ class Sports411Controller:
     def fetch_odds(self, refresh_interval=10):
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
-        self.logger.info(f"========== Fetching Odds ({self.sport_name}) via ZenRows (START) ==========")
+        self.logger.info(f"========== Fetching Odds ({self.sport_name}) via Selenium (START) ==========")
 
         try:
-            html = self._zenrows_get(self.sport_url, js_render=True, wait=12000)
+            # Use the existing authenticated Selenium driver (with BrightData proxy)
+            self.__login()
 
+            self.logger.info(f"Navigating to {self.sport_url}")
+            self.driver.get(self.sport_url)
+
+            # Wait for the main schedule component
+            try:
+                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "app-american-schedule")))
+            except Exception:
+                self.logger.warning("Schedule component not found quickly.")
+
+            # Wait for the loading spinner to disappear (up to 25 seconds)
+            try:
+                spinner_locator = (By.CSS_SELECTOR, "div.component-loader, .fa-spinner-third")
+                WebDriverWait(self.driver, 25).until(
+                    EC.invisibility_of_element_located(spinner_locator)
+                )
+                self.logger.info("Loading spinner disappeared.")
+            except Exception:
+                self.logger.warning("Loading spinner did not disappear within 25s timeout.")
+
+            # Additional patient wait for actual game data to populate (up to ~20s)
+            self.logger.info("Waiting for game data to load into the DOM...")
+            game_content_found = False
+            for _ in range(20):
+                time.sleep(1)
+                page_text = self.driver.page_source
+                if re.search(r'\b[0-9]{3,4}\s+[A-Z][A-Za-z]', page_text):
+                    game_content_found = True
+                    break
+
+            if not game_content_found:
+                self.logger.warning("Game content may still be loading after waiting.")
+
+            # Save debug HTML after waiting attempts
+            debug_file = f"debug_sports411_{self.sport_name.lower()}_{int(time.time())}.html"
+            with open(debug_file, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+            self.logger.info(f"💾 Saved debug HTML: {debug_file}")
+
+            html = self.driver.page_source
             soup = BeautifulSoup(html, "html.parser")
             games = []
 
@@ -317,7 +357,14 @@ class Sports411Controller:
                     self.logger.error(f"Error parsing game: {e}", exc_info=True)
                     continue
 
-            self.logger.info(f"Extracted {len(games)} {self.sport_name} matches via ZenRows")
+            self.logger.info(f"Extracted {len(games)} {self.sport_name} matches via Selenium")
+
+            if len(games) == 0:
+                self.logger.warning(
+                    f"No games found for {self.sport_name}. "
+                    f"Inspect the debug file: {debug_file}. "
+                    "The site structure may have changed or additional waits/selectors are needed."
+                )
 
             odds_data = {
                 "sport": self.sport_name,
@@ -341,11 +388,10 @@ class Sports411Controller:
                         self.logger.warning(f"DB save failed: {db_err}")
 
         except Exception as e:
-            self.logger.error(f"ZenRows fetch failed: {e}", exc_info=True)
+            self.logger.error(f"Selenium fetch_odds failed: {e}", exc_info=True)
             self._safe_send_monitoring_alert(e)
         finally:
-            self.logger.info(f"========= Fetching Odds ({self.sport_name}) via ZenRows (END) ==========")
-    # END CHANGE
+            self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
 
     # Execute Bet
     # --------------------------------------------------------
@@ -706,7 +752,33 @@ class Sports411Controller:
             except Exception:
                 pass
             self.logger.info("==================== Betting (END) ====================")
-            
+
+
+# Quick self-test entrypoint (matches sports411_odds.py behavior)
+def main():
+    from database.models.Accounts import Accounts
+    from utils.config import SPORTS411
+
+    account = Accounts(
+        account = '8715',
+        password = 'eqr0mjx-MXY*rcn1ana',
+        label = 'Reader'
+    )
+
+    # === FETCH BOTH NBA AND MLB MONEYLINE ===
+    print("=== Fetching NBA Moneyline ===")
+    controller_nba = Sports411Controller(account, SPORTS411, sport="basketball")
+    controller_nba.fetch_odds()
+
+    print("\n=== Fetching MLB Moneyline ===")
+    controller_mlb = Sports411Controller(account, SPORTS411, sport="baseball")
+    controller_mlb.fetch_odds()
+
+    print("\n✅ Finished fetching NBA + MLB moneyline odds")
+
+
+if __name__ == "__main__":
+    main()
 
 
 
