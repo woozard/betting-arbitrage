@@ -109,30 +109,6 @@ class Sports411Controller:
         self.logger.info(f"✅ BrightData proxy extension created at: {ext_dir}")
         return ext_dir
 
-    def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 20000):
-        """Zenrows helper – same as Web5Controller"""
-        params = {
-            "apikey": ZENROWS_API_KEY,
-            "url": url,
-            "js_render": "true" if js_render else "false",
-            "wait": str(wait),
-            "premium_proxy": "true",
-            "antibot": "true",
-            "proxy_country": "us",
-        }
-        for attempt in range(3):
-            try:
-                resp = requests.get("https://api.zenrows.com/v1/", params=params, timeout=180)
-                resp.raise_for_status()
-                self.logger.info(f"✅ Zenrows request successful for {url}")
-                return resp.text
-            except Exception as e:
-                self.logger.error(f"Zenrows request failed (attempt {attempt + 1}): {e}")
-                if attempt == 2:
-                    raise
-                time.sleep(5)
-        raise Exception("Zenrows failed after 3 attempts")
-
     def _safe_send_monitoring_alert(self, ex):
         """Safe version - does NOT crash if token is missing (same as Web5)"""
         try:
@@ -231,6 +207,77 @@ class Sports411Controller:
         }
         """
         self.driver.execute_script(script)
+
+    # --------------------------------------------------------
+    # Game datetime extraction (critical for cross-book matching on game_datetime)
+    # --------------------------------------------------------
+    def _extract_game_datetime(self, game_soup):
+        """Best-effort extraction of scheduled game start time from the sports-league-game element.
+        Returns string in %Y-%m-%d %H:%M:%S using today's date + found time, or None.
+        """
+        candidates = []
+        # Try common time-related selectors that appear in betting schedule UIs
+        for selector in [
+            ".game-time", ".time", "time", ".match-time", ".game-start",
+            "[data-time]", "[class*='time']", "[class*='start']",
+            ".game-info", ".header", "span.time", ".game-header"
+        ]:
+            try:
+                els = game_soup.select(selector) or []
+                for el in els:
+                    t = ""
+                    try:
+                        t = (el.get_text(" ", strip=True) or "").strip()
+                    except Exception:
+                        pass
+                    if not t:
+                        t = (el.get("data-time") or el.get("title") or el.get("data-start") or "").strip()
+                    if t:
+                        candidates.append(t)
+            except Exception:
+                pass
+
+        # Also scan the full text of this game block (most reliable fallback)
+        try:
+            full_text = game_soup.get_text(" ", strip=True)
+            if full_text:
+                candidates.append(full_text)
+        except Exception:
+            pass
+
+        # Search for time patterns in order of preference (with am/pm first)
+        time_patterns = [
+            r'(\d{1,2}:\d{2}(?::\d{2})?\s*[APap][Mm])',  # 7:10 PM, 19:10 pm
+            r'(\d{1,2}:\d{2}(?::\d{2})?)',  # 19:10 or 7:10
+        ]
+        for cand in candidates:
+            for pat in time_patterns:
+                m = re.search(pat, cand)
+                if m:
+                    time_part = m.group(1)
+                    return self._combine_date_with_time(time_part)
+
+        return None
+
+    def _combine_date_with_time(self, time_str: str) -> str:
+        """ '7:10 PM' or '19:10' or '19:10:00' -> '2026-06-01 19:10:00' (today's date) """
+        try:
+            time_str = time_str.strip()
+            is_pm = bool(re.search(r'pm', time_str, re.I))
+            is_am = bool(re.search(r'am', time_str, re.I))
+            clean = re.sub(r'\s*[APap][Mm]', '', time_str).strip()
+            tparts = clean.split(':')
+            hour = int(tparts[0])
+            minute = int(tparts[1]) if len(tparts) > 1 else 0
+            if is_pm and hour != 12:
+                hour += 12
+            elif is_am and hour == 12:
+                hour = 0
+            today = datetime.now().date()
+            dt = datetime(today.year, today.month, today.day, hour, minute, 0)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 15000):
         """Zenrows helper – fast and reliable for odds fetching"""
@@ -337,7 +384,9 @@ class Sports411Controller:
                     if not team_1 or not team_2 or not team_1_ml or not team_2_ml:
                         continue
 
-                    game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    game_datetime_str = self._extract_game_datetime(game)
+                    if not game_datetime_str:
+                        game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     games.append({
                         "bookmaker": self.bookmaker,

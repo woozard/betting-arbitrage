@@ -304,56 +304,91 @@ def format_money(amount, symbol="$", decimals=2):
 # -----------------------------------
 # Date
 # -----------------------------------
-def parse_to_mysql_datetime(date_str, time_str):
+def parse_to_mysql_datetime(date_str, time_str=None):
     """
     Parse date and time strings to MySQL DATETIME format.
-    
+
+    Supports flexible calling:
+      - parse_to_mysql_datetime("12/16", "17:30")
+      - parse_to_mysql_datetime("12/16/2026 17:30")
+      - parse_to_mysql_datetime("2026-06-01 18:40:00")
+      - parse_to_mysql_datetime("06/01/2026 18:40")
+
     Args:
-        date_str: Date in format like "12/16", "1/5"
-        time_str: Time in format like "17:30", "7:30 PM"
+        date_str: Date part or combined "date time" string
+        time_str: Optional time part
     
     Returns:
         String in MySQL DATETIME format (YYYY-MM-DD HH:MM:SS) or None
     """
     try:
+        if time_str is None and date_str:
+            s = str(date_str).strip()
+            if ' ' in s:
+                # combined "MM/DD/YYYY HH:MM[:SS]" or "YYYY-MM-DD HH:MM[:SS]"
+                date_part, time_part = s.split(' ', 1)
+                date_str = date_part
+                time_str = time_part
+            else:
+                time_str = "00:00"
         current_year = datetime.now().year
         current_date = datetime.now()
         
         # Parse date
-        month, day = map(int, date_str.split('/'))
-        game_date = datetime(current_year, month, day)
-        
-        # Handle year rollover
-        if game_date.month == 1 and current_date.month == 12:
-            game_date = game_date.replace(year=current_year + 1)
-        elif game_date < current_date - timedelta(days=30):
-            game_date = game_date.replace(year=current_year + 1)
-        
-        # Parse time
-        time_str_lower = time_str.lower().strip()
+        # Parse date (support MM/DD, MM/DD/YYYY, YYYY-MM-DD)
+        year = None
+        month = day = None
+        ds = str(date_str).strip()
+        if '/' in ds:
+            dparts = [p for p in ds.split('/') if p]
+            if len(dparts) == 3:
+                month, day, yr = int(dparts[0]), int(dparts[1]), int(dparts[2])
+                if yr < 100:
+                    yr += 2000
+                year = yr
+            elif len(dparts) == 2:
+                month, day = int(dparts[0]), int(dparts[1])
+        elif '-' in ds:
+            dparts = [p for p in ds.split('-') if p]
+            if len(dparts) == 3:
+                year, month, day = int(dparts[0]), int(dparts[1]), int(dparts[2])
+
+        if month is None or day is None:
+            month, day = 1, 1
+
+        if year is None:
+            year = current_year
+            game_date = datetime(year, month, day)
+            # Handle year rollover for short dates
+            if game_date.month == 1 and current_date.month == 12:
+                game_date = game_date.replace(year=year + 1)
+            elif game_date < current_date - timedelta(days=30):
+                game_date = game_date.replace(year=year + 1)
+        else:
+            game_date = datetime(year, month, day)
+
+        # Parse time (handle "7:10", "19:10", "7:10 PM", "19:10:00")
+        time_str_lower = str(time_str).lower().strip()
         
         # Check for AM/PM format
         is_pm = 'pm' in time_str_lower
         is_am = 'am' in time_str_lower
         
         if is_pm or is_am:
-            # Remove AM/PM and extra spaces
             time_clean = time_str_lower.replace('am', '').replace('pm', '').strip()
-            hour, minute = map(int, time_clean.split(':'))
-            
-            # Convert to 24-hour format
+            tparts = time_clean.split(':')
+            hour = int(tparts[0])
+            minute = int(tparts[1]) if len(tparts) > 1 else 0
             if is_pm and hour != 12:
                 hour += 12
             elif is_am and hour == 12:
                 hour = 0
         else:
-            # Assume 24-hour format
-            hour, minute = map(int, time_str.split(':'))
-        
-        # Create final datetime
+            tparts = time_str_lower.split(':')
+            hour = int(tparts[0])
+            minute = int(tparts[1]) if len(tparts) > 1 else 0
         final_datetime = game_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        
-        # Format as MySQL DATETIME
+
         return final_datetime.strftime('%Y-%m-%d %H:%M:%S')
         
     except Exception as e:

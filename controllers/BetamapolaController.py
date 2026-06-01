@@ -241,7 +241,7 @@ class BetamapolaController:
             "sportType": "Baseball",
             "sportSubType": "MLB",
             "wagerType": "Straight Bet",
-            "hoursAdjustment": 48,
+            "hoursAdjustment": 0,
             "periodNumber": None,
             "gameNum": None,
             "parentGameNum": None,
@@ -307,18 +307,23 @@ class BetamapolaController:
             ttl_a1 = gl.get("TtlPtsAdj1")
             ttl_a2 = gl.get("TtlPtsAdj2")
 
-            # Convert API date format (MM/DD/YYYY HH:MM) to what parse_odds expects
-            try:
-                dt_obj = datetime.strptime(game_dt, "%m/%d/%Y %H:%M")
-                formatted_game_datetime = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                formatted_game_datetime = game_dt
+            # Always normalize to %Y-%m-%d %H:%M:%S so parse_odds + cross-book group-by on game_datetime succeed
+            normalized_dt = parse_to_mysql_datetime(game_dt) or game_dt
+            if not isinstance(normalized_dt, str) or not normalized_dt[4:5] == "-":
+                # last resort ensure format for strptime in parse_odds
+                try:
+                    if isinstance(game_dt, str) and len(game_dt) >= 10:
+                        normalized_dt = game_dt
+                    else:
+                        normalized_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    normalized_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             game = {
                 "bookmaker": self.bookmaker,
                 "sport": self.sport_name,
                 "league": self.league,
                 "game_id": game_id,
-                "game_datetime": formatted_game_datetime,
+                "game_datetime": normalized_dt,
                 "match": f"{team1} vs {team2}",
                 "team_1": team1,
                 "team_2": team2,

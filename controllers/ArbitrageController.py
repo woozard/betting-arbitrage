@@ -71,7 +71,7 @@ class ArbitrageController:
         rows = (
             self.db.query(ArbitrageOdds)
             .filter(ArbitrageOdds.bet_type == "moneyline")
-            .filter(ArbitrageOdds.updated_at >= cutoff)
+            .filter(ArbitrageOdds.created_at >= cutoff)
             .all()
         )
         results = []
@@ -106,7 +106,10 @@ class ArbitrageController:
 
             matches = {}
             for o in all_odds:
-                key = (o["team_1"], o["team_2"])
+                # Include date portion so that (if ever) same team names on different days don't cross
+                dt = o.get("game_datetime") or ""
+                date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
+                key = (o["team_1"], o["team_2"], date_key)
                 matches.setdefault(key, []).append(o)
 
             arb_found = 0
@@ -191,7 +194,7 @@ class ArbitrageController:
             self.db.flush()
 
             self.logger.info(
-                f"DB - Arbitrage Not Saved - "
+                f"DB - Arbitrage Saved - "
                 f"{t1['bookmaker']} vs {t2['bookmaker']} - "
                 f"{o1['team_1']} vs {o1['team_2']}" 
             )
