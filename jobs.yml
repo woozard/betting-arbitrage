@@ -2,22 +2,23 @@ jobs:
   - name: arbitrage
     script: arbitrage.py
     interval_seconds: 30
-  - name: probet42_odds
-    script: probet42_odds.py
-    interval_seconds: 30
+
   - name: sports411_odds
     script: sports411_odds.py
     interval_seconds: 30
-#  - name: probet42_betting
-#    script: probet42_betting.py
-#    interval_seconds: 30
-#  - name: sports411_betting
-#    script: sports411_betting.py
-#    interval_seconds: 30
 
-  - name: pinnacle
-    script: pinnacle.py
-    interval_seconds: 60
+  - name: betamapola_odds
+    script: betamapola_odds.py
+    interval_seconds: 30
+
+  # Betting jobs (uncomment when ready)
+  # - name: sports411_betting
+  #   script: sports411_betting.py
+  #   interval_seconds: 30
+
+  # - name: betamapola_betting
+  #   script: betamapola_betting.py
+  #   interval_seconds: 30
 
 
 

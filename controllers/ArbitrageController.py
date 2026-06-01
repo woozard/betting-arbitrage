@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from database.config import __get_db1_session__
 from database.models.Arbitrage import Arbitrage
+from database.models.ArbitrageOdds import ArbitrageOdds
 from utils.config import TELEGRAM
 from utils.logger import Logger
 from utils.helpers import send_telegram_alert, send_testing_alert, send_monitoring_alert
@@ -62,6 +63,33 @@ class ArbitrageController:
         finally:
             self.logger.info("========== Arbitrage (END) ==========")
 
+    # DB-backed odds fetch (as assumed by design)
+    # --------------------------------------------------------
+    def get_recent_moneyline_odds_from_db(self, minutes: int = 60):
+        """Pull recent moneyline odds from DB (populated by controllers like Sports411 and Betamapola)."""
+        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+        rows = (
+            self.db.query(ArbitrageOdds)
+            .filter(ArbitrageOdds.bet_type == "moneyline")
+            .filter(ArbitrageOdds.updated_at >= cutoff)
+            .all()
+        )
+        results = []
+        for r in rows:
+            results.append({
+                "bookmaker": r.bookmaker,
+                "bet_type": r.bet_type,
+                "game_id": r.game_id,
+                "team_1": r.team_1,
+                "team_2": r.team_2,
+                "moneyline_team_1": float(r.moneyline_team_1) if r.moneyline_team_1 is not None else None,
+                "moneyline_team_2": float(r.moneyline_team_2) if r.moneyline_team_2 is not None else None,
+                "sport": r.sport,
+                "league": r.league,
+                "game_datetime": r.game_datetime.isoformat() if r.game_datetime else None,
+            })
+        return results
+
     # --------------------------------------------------------
     # Scan Opportunities
     # --------------------------------------------------------
@@ -71,7 +99,8 @@ class ArbitrageController:
 
         self.logger.info("========== Arbitrage - Scan Opportunities (START) ==========")
         try:
-            all_odds = self.cache.get_odds(bet_type="moneyline")
+            # Pull from DB (not Redis cache) so we compare odds persisted by different controllers
+            all_odds = self.get_recent_moneyline_odds_from_db(minutes=60)
             if not all_odds:
                 return
 
