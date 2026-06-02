@@ -2,20 +2,24 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from utils.config import DB1, DB2
-# These imports are REQUIRED for SQLAlchemy model registration (side-effect)
-# Do NOT remove even if IDE shows them as unused/greyed-out
-from database.models.AccountBalance import AccountBalance
-from database.models.Accounts import Accounts
-from database.models.Arbitrage import Arbitrage
-from database.models.ArbitrageBets import ArbitrageBets
-from database.models.ArbitrageOdds import ArbitrageOdds   # ← THIS WAS MISSING
-from database.models.DailyFigures import DailyFigures
-from database.models.Odds2 import Odds2
-from database.models.Trades import Trades
+
 Base = declarative_base()
 
 def __get_base__():
     return Base
+
+# These imports are REQUIRED for SQLAlchemy model registration (side-effect)
+# Do NOT remove even if IDE shows them as unused/greyed-out
+# (Importing after Base ensures all model classes register on the shared metadata
+#  so create_all will create every table, including 'arbitrage'.)
+from database.models.AccountBalance import AccountBalance
+from database.models.Accounts import Accounts
+from database.models.Arbitrage import Arbitrage
+from database.models.ArbitrageBets import ArbitrageBets
+from database.models.ArbitrageOdds import ArbitrageOdds
+from database.models.DailyFigures import DailyFigures
+from database.models.Odds2 import Odds2
+from database.models.Trades import Trades
 
 # ---------- DB1 ----------
 DB1_URL = (
@@ -26,8 +30,18 @@ DB1_URL = (
 engine1 = create_engine(DB1_URL)
 Session1 = sessionmaker(bind=engine1)
 session1 = Session1()
+print("=== DEBUG from database/config.py ===")
+registered = sorted(Base.metadata.tables.keys())
+print("Registered tables in metadata at create_all time:", registered)
+print("'arbitrage' registered?", "arbitrage" in registered)
+try:
+    Base.metadata.create_all(bind=engine1)
+    print("create_all completed without exception.")
+except Exception as exc:
+    print("create_all RAISED:", repr(exc))
+    raise
 
-Base.metadata.create_all(bind=engine1)
+print("=== END DEBUG ===")
 
 def __get_db1_session__():
     return session1
