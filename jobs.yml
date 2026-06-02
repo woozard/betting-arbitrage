@@ -11,14 +11,10 @@ jobs:
     script: betamapola_odds.py
     interval_seconds: 30
 
-  # Betting jobs (uncomment when ready)
-  # - name: sports411_betting
-  #   script: sports411_betting.py
-  #   interval_seconds: 30
+  - name: sports411_betting
+    script: sports411_betting.py
+    interval_seconds: 30
 
-  # - name: betamapola_betting
-  #   script: betamapola_betting.py
-  #   interval_seconds: 30
-
-
-
+  - name: betamapola_betting
+    script: betamapola_betting.py
+    interval_seconds: 30
