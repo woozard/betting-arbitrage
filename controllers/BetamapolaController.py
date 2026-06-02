@@ -58,6 +58,11 @@ class BetamapolaController:
             self.sport_name = "MLB"
             self.league = "MLB"
 
+        # Timezone for game times returned by this book's API / page.
+        # All game_datetimes are normalized to UTC via pytz for consistent matching
+        # across bookmakers that may display times in ET vs PT etc.
+        self.game_tz = 'US/Eastern'
+
         # Set URLs (SPA after login)
         self.base_url = f"https://www.{self.website}"
         self.login_url = f"https://{self.website}"
@@ -308,16 +313,19 @@ class BetamapolaController:
             ttl_a2 = gl.get("TtlPtsAdj2")
 
             # Always normalize to %Y-%m-%d %H:%M:%S so parse_odds + cross-book group-by on game_datetime succeed
-            normalized_dt = parse_to_mysql_datetime(game_dt) or game_dt
+            # Pass game_tz so times from API (in book-specific TZ) are converted to UTC for cross-book matching
+            normalized_dt = parse_to_mysql_datetime(game_dt, tz_name=self.game_tz) or game_dt
             if not isinstance(normalized_dt, str) or not normalized_dt[4:5] == "-":
                 # last resort ensure format for strptime in parse_odds
                 try:
                     if isinstance(game_dt, str) and len(game_dt) >= 10:
-                        normalized_dt = game_dt
+                        # still normalize the raw date str using tz
+                        normalized_dt = parse_to_mysql_datetime(game_dt, tz_name=self.game_tz)
                     else:
-                        normalized_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        normalized_dt = parse_to_mysql_datetime(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tz_name=self.game_tz)
                 except Exception:
-                    normalized_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    normalized_dt = parse_to_mysql_datetime(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tz_name=self.game_tz)
+
             game = {
                 "bookmaker": self.bookmaker,
                 "sport": self.sport_name,
@@ -387,7 +395,7 @@ class BetamapolaController:
             # Expand the Baseball section (contains MLB games)
             try:
                 baseball_link = self.driver.find_element(
-                    By.CSS_SELECTOR,
+                    By.CSS_SELECTOR, 
                     "a#img_Baseball, a[data-target='#sp_Baseball'], a.sportIcon"
                 )
                 self.driver.execute_script("arguments[0].click();", baseball_link)
@@ -482,7 +490,7 @@ class BetamapolaController:
                 interesting = [r for r in network_requests if any(k in r["url"].lower() for k in ["game", "schedule", "odds", "line", "mlb", "sport", "api"])]
                 if interesting:
                     self.logger.info(f"Network requests captured during load: {len(interesting)} interesting")
-                    for req in interesting[:15]:
+                    for req in interesting[:15]:  # limit output
                         self.logger.info(f"  {req['status']} | {req['url'][:180]}")
                 else:
                     self.logger.info("No obviously relevant network requests found during the load window.")

@@ -5,6 +5,7 @@ import random
 import configparser
 from datetime import datetime, timedelta
 from decimal import Decimal
+import pytz
 import asyncio
 from telegram import Update, Bot
 import tracemalloc
@@ -304,7 +305,7 @@ def format_money(amount, symbol="$", decimals=2):
 # -----------------------------------
 # Date
 # -----------------------------------
-def parse_to_mysql_datetime(date_str, time_str=None):
+def parse_to_mysql_datetime(date_str, time_str=None, tz_name=None):
     """
     Parse date and time strings to MySQL DATETIME format.
 
@@ -314,12 +315,17 @@ def parse_to_mysql_datetime(date_str, time_str=None):
       - parse_to_mysql_datetime("2026-06-01 18:40:00")
       - parse_to_mysql_datetime("06/01/2026 18:40")
 
+    If tz_name is provided (e.g. 'US/Eastern'), the parsed datetime is treated as
+    local time in that timezone, then converted to UTC before returning the string.
+    This ensures consistent game_datetime across bookmakers with different TZ displays.
+
     Args:
         date_str: Date part or combined "date time" string
         time_str: Optional time part
-    
+        tz_name: Optional pytz timezone name for the source time (e.g. 'US/Eastern', 'US/Pacific')
+
     Returns:
-        String in MySQL DATETIME format (YYYY-MM-DD HH:MM:SS) or None
+        String in MySQL DATETIME format (YYYY-MM-DD HH:MM:SS) in UTC if tz_name given, else naive as parsed.
     """
     try:
         if time_str is None and date_str:
@@ -331,10 +337,15 @@ def parse_to_mysql_datetime(date_str, time_str=None):
                 time_str = time_part
             else:
                 time_str = "00:00"
-        current_year = datetime.now().year
-        current_date = datetime.now()
-        
-        # Parse date
+
+        if tz_name:
+            tz = pytz.timezone(tz_name)
+            now = datetime.now(tz)
+        else:
+            now = datetime.now()
+        current_year = now.year
+        current_date = now
+
         # Parse date (support MM/DD, MM/DD/YYYY, YYYY-MM-DD)
         year = None
         month = day = None
@@ -369,11 +380,9 @@ def parse_to_mysql_datetime(date_str, time_str=None):
 
         # Parse time (handle "7:10", "19:10", "7:10 PM", "19:10:00")
         time_str_lower = str(time_str).lower().strip()
-        
-        # Check for AM/PM format
         is_pm = 'pm' in time_str_lower
         is_am = 'am' in time_str_lower
-        
+
         if is_pm or is_am:
             time_clean = time_str_lower.replace('am', '').replace('pm', '').strip()
             tparts = time_clean.split(':')
@@ -387,10 +396,16 @@ def parse_to_mysql_datetime(date_str, time_str=None):
             tparts = time_str_lower.split(':')
             hour = int(tparts[0])
             minute = int(tparts[1]) if len(tparts) > 1 else 0
+
         final_datetime = game_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
+        if tz_name:
+            tz = pytz.timezone(tz_name)
+            dt_local = tz.localize(final_datetime)
+            final_datetime = dt_local.astimezone(pytz.UTC).replace(tzinfo=None)
+
         return final_datetime.strftime('%Y-%m-%d %H:%M:%S')
-        
+
     except Exception as e:
         print(f"Error converting to MySQL datetime: {date_str} {time_str} - {e}")
         return None

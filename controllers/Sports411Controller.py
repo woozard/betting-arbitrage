@@ -6,7 +6,8 @@ import tempfile
 import os
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -54,6 +55,11 @@ class Sports411Controller:
             self.league = "MLB"
         else:
             raise ValueError(f"Unsupported sport: {sport}. Use 'basketball'/'nba' or 'baseball'/'mlb'.")
+
+        # Timezone for game times returned by this book's page.
+        # All game_datetimes are normalized to UTC via pytz for consistent matching
+        # across bookmakers that may display times in ET vs PT etc.
+        self.game_tz = 'US/Pacific'
 
         # Set URLs
         self.base_url = f"https://www.{self.website}"
@@ -108,6 +114,30 @@ class Sports411Controller:
 
         self.logger.info(f"✅ BrightData proxy extension created at: {ext_dir}")
         return ext_dir
+
+    def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 20000):
+        """Zenrows helper – same as Web5Controller"""
+        params = {
+            "apikey": ZENROWS_API_KEY,
+            "url": url,
+            "js_render": "true" if js_render else "false",
+            "wait": str(wait),
+            "premium_proxy": "true",
+            "antibot": "true",
+            "proxy_country": "us",
+        }
+        for attempt in range(3):
+            try:
+                resp = requests.get("https://api.zenrows.com/v1/", params=params, timeout=180)
+                resp.raise_for_status()
+                self.logger.info(f"✅ Zenrows request successful for {url}")
+                return resp.text
+            except Exception as e:
+                self.logger.error(f"Zenrows request failed (attempt {attempt + 1}): {e}")
+                if attempt == 2:
+                    raise
+                time.sleep(5)
+        raise Exception("Zenrows failed after 3 attempts")
 
     def _safe_send_monitoring_alert(self, ex):
         """Safe version - does NOT crash if token is missing (same as Web5)"""
@@ -248,7 +278,7 @@ class Sports411Controller:
         # Search for time patterns in order of preference (with am/pm first)
         time_patterns = [
             r'(\d{1,2}:\d{2}(?::\d{2})?\s*[APap][Mm])',  # 7:10 PM, 19:10 pm
-            r'(\d{1,2}:\d{2}(?::\d{2})?)',  # 19:10 or 7:10
+            r'(\d{1,2}:\d{2}(?::\d{2})?)',                # 19:10 or 7:10
         ]
         for cand in candidates:
             for pat in time_patterns:
@@ -260,7 +290,12 @@ class Sports411Controller:
         return None
 
     def _combine_date_with_time(self, time_str: str) -> str:
-        """ '7:10 PM' or '19:10' or '19:10:00' -> '2026-06-01 19:10:00' (today's date) """
+        """ '7:10 PM' or '19:10' or '19:10:00' -> '2026-06-01 19:10:00' (today's date)
+        The resulting string is passed through parse_to_mysql_datetime with this book's
+        game_tz so that it gets localized and converted to UTC. This ensures game_datetime
+        strings are consistent for cross-book matching regardless of what TZ each bookmaker
+        uses to display times.
+        """
         try:
             time_str = time_str.strip()
             is_pm = bool(re.search(r'pm', time_str, re.I))
@@ -273,11 +308,16 @@ class Sports411Controller:
                 hour += 12
             elif is_am and hour == 12:
                 hour = 0
-            today = datetime.now().date()
+            tz = pytz.timezone(self.game_tz)
+            today = datetime.now(tz).date()
             dt = datetime(today.year, today.month, today.day, hour, minute, 0)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
+            local_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            # Normalize using this book's TZ (set in __init__) to UTC
+            return parse_to_mysql_datetime(local_str, tz_name=self.game_tz)
         except Exception:
-            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # fallback: normalize server now() as if in game tz (rare case)
+            local_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return parse_to_mysql_datetime(local_str, tz_name=self.game_tz)
 
     def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 15000):
         """Zenrows helper – fast and reliable for odds fetching"""
@@ -333,7 +373,7 @@ class Sports411Controller:
                 )
                 self.logger.info("Loading spinner disappeared.")
             except Exception:
-                self.logger.warning("Loading spinner did not disappear within 25s timeout.")
+                self.logger.warning("Spinner did not disappear within 25s timeout.")
 
             # Additional patient wait for actual game data to populate (up to ~20s)
             self.logger.info("Waiting for game data to load into the DOM...")
@@ -341,6 +381,7 @@ class Sports411Controller:
             for _ in range(20):
                 time.sleep(1)
                 page_text = self.driver.page_source
+                # Look for rotation numbers + team names (very common pattern in this book)
                 if re.search(r'\b[0-9]{3,4}\s+[A-Z][A-Za-z]', page_text):
                     game_content_found = True
                     break
@@ -441,6 +482,7 @@ class Sports411Controller:
             self._safe_send_monitoring_alert(e)
         finally:
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
+    # END CHANGE
 
     # Execute Bet
     # --------------------------------------------------------
