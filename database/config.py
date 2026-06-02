@@ -8,6 +8,19 @@ Base = declarative_base()
 def __get_base__():
     return Base
 
+# These imports are REQUIRED for SQLAlchemy model registration (side-effect)
+# Do NOT remove even if IDE shows them as unused/greyed-out
+# (Importing after Base ensures all model classes register on the shared metadata
+#  so create_all will create every table, including 'arbitrage'.)
+from database.models.AccountBalance import AccountBalance
+from database.models.Accounts import Accounts
+from database.models.Arbitrage import Arbitrage
+from database.models.ArbitrageBets import ArbitrageBets
+from database.models.ArbitrageOdds import ArbitrageOdds
+from database.models.DailyFigures import DailyFigures
+from database.models.Odds2 import Odds2
+from database.models.Trades import Trades
+
 # ---------- DB1 ----------
 DB1_URL = (
     f"mysql+mysqlconnector://{DB1['username']}:{DB1['password']}"

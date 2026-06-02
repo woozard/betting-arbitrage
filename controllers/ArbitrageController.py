@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from database.config import __get_db1_session__
 from database.models.Arbitrage import Arbitrage
+from database.models.ArbitrageOdds import ArbitrageOdds
 from utils.config import TELEGRAM
 from utils.logger import Logger
 from utils.helpers import send_telegram_alert, send_testing_alert, send_monitoring_alert
@@ -62,56 +63,143 @@ class ArbitrageController:
         finally:
             self.logger.info("========== Arbitrage (END) ==========")
 
+    # DB-backed odds fetch (as assumed by design)
+    # --------------------------------------------------------
+    def get_recent_moneyline_odds_from_db(self, minutes: int = 60):
+        """Pull recent moneyline odds from DB (populated by controllers like Sports411 and Betamapola).
+
+        Returns only the *latest* row per bookmaker per (team_1, team_2) to avoid
+        comparing stale historical snapshots against each other.
+        """
+        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+        rows = (
+            self.db.query(ArbitrageOdds)
+            .filter(ArbitrageOdds.bet_type == "moneyline")
+            .filter(ArbitrageOdds.created_at >= cutoff)
+            .all()
+        )
+
+        # Build list with created_at for deduping
+        results = []
+        for r in rows:
+            results.append({
+                "bookmaker": r.bookmaker,
+                "bet_type": r.bet_type,
+                "game_id": r.game_id,
+                "team_1": r.team_1,
+                "team_2": r.team_2,
+                "moneyline_team_1": float(r.moneyline_team_1) if r.moneyline_team_1 is not None else None,
+                "moneyline_team_2": float(r.moneyline_team_2) if r.moneyline_team_2 is not None else None,
+                "sport": r.sport,
+                "league": r.league,
+                "game_datetime": r.game_datetime.isoformat() if r.game_datetime else None,
+                "created_at": r.created_at,
+            })
+
+        # Deduplicate: keep only the most recent odds per bookmaker + matchup
+        latest = {}
+        for o in results:
+            key = (o["bookmaker"], o["team_1"], o["team_2"])
+            if key not in latest or o["created_at"] > latest[key]["created_at"]:
+                latest[key] = o
+
+        # Remove the internal created_at before returning
+        for o in latest.values():
+            o.pop("created_at", None)
+
+        return list(latest.values())
+
     # --------------------------------------------------------
     # Scan Opportunities
     # --------------------------------------------------------
-    def scan_opportunities(self):
-        start = time.perf_counter()
     @time_it
-
+    def scan_opportunities(self):
         self.logger.info("========== Arbitrage - Scan Opportunities (START) ==========")
         try:
-            all_odds = self.cache.get_odds(bet_type="moneyline")
-            if not all_odds:
-                return
+            # Pull from DB (not Redis cache) so we compare odds persisted by different controllers
+            all_odds = self.get_recent_moneyline_odds_from_db(minutes=60)
 
             matches = {}
-            for o in all_odds:
-                key = (o["team_1"], o["team_2"])
-                matches.setdefault(key, []).append(o)
-
             arb_found = 0
 
-            for (team_1, team_2), odds_group in matches.items():
-                for i in range(len(odds_group)):
-                    for j in range(i + 1, len(odds_group)):
-                        o1 = odds_group[i]
-                        o2 = odds_group[j]
+            if all_odds:
+                for o in all_odds:
+                    # Include date portion so that (if ever) same team names on different days don't cross
+                    dt = o.get("game_datetime") or ""
+                    date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
+                    key = (o["team_1"], o["team_2"], date_key)
+                    matches.setdefault(key, []).append(o)
 
-                        if o1["bookmaker"] == o2["bookmaker"]:
-                            continue
+                best_arb = None
+                best_match = None
+                for (team_1, team_2, date_key), odds_group in matches.items():
+                    for i in range(len(odds_group)):
+                        for j in range(i + 1, len(odds_group)):
+                            o1 = odds_group[i]
+                            o2 = odds_group[j]
 
-                        # Case 1
-                        arb_total = self.__calc_arb_total(
-                            o1["moneyline_team_1"], o2["moneyline_team_2"]
-                        )
-                        if arb_total and arb_total < 1:
-                            arb_found += 1
-                            self.__insert_arbitrage(o1, o2, "o1", "o2", arb_total)
+                            if o1["bookmaker"] == o2["bookmaker"]:
+                                continue
 
-                        # Case 2
-                        arb_total = self.__calc_arb_total(
-                            o2["moneyline_team_1"], o1["moneyline_team_2"]
-                        )
-                        if arb_total and arb_total < 1:
-                            arb_found += 1
-                            self.__insert_arbitrage(o1, o2, "o2", "o1", arb_total)
+                            # Case 1: bet team_1 on o1's book, team_2 on o2's book
+                            arb_total = self.__calc_arb_total(
+                                o1["moneyline_team_1"], o2["moneyline_team_2"]
+                            )
+                            if arb_total:
+                                if best_arb is None or arb_total < best_arb:
+                                    best_arb = arb_total
+                                    best_match = {
+                                        "team_1": o1["team_1"],
+                                        "team_2": o1["team_2"],
+                                        "book_1": o1["bookmaker"],
+                                        "odds_1": o1["moneyline_team_1"],
+                                        "book_2": o2["bookmaker"],
+                                        "odds_2": o2["moneyline_team_2"],
+                                    }
+                                if arb_total < 1:
+                                    arb_found += 1
+                                    self.__insert_arbitrage(o1, o2, "o1", "o2", arb_total)
 
-            self.logger.info(
-                f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
-            )
+                            # Case 2: bet team_1 on o2's book, team_2 on o1's book
+                            arb_total = self.__calc_arb_total(
+                                o2["moneyline_team_1"], o1["moneyline_team_2"]
+                            )
+                            if arb_total:
+                                if best_arb is None or arb_total < best_arb:
+                                    best_arb = arb_total
+                                    best_match = {
+                                        "team_1": o1["team_1"],
+                                        "team_2": o1["team_2"],
+                                        "book_1": o2["bookmaker"],
+                                        "odds_1": o2["moneyline_team_1"],
+                                        "book_2": o1["bookmaker"],
+                                        "odds_2": o1["moneyline_team_2"],
+                                    }
+                                if arb_total < 1:
+                                    arb_found += 1
+                                    self.__insert_arbitrage(o1, o2, "o2", "o1", arb_total)
 
-            self.db.commit()
+                msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
+                if arb_found == 0 and best_arb is not None:
+                    msg += f" (closest total prob: {float(best_arb):.4f})"
+                self.logger.info(msg)
+
+                # Log details for close (but not yet arb) opportunities so we can see the actual lines
+                CLOSE_THRESHOLD = 1.03
+                if best_arb is not None and best_arb < CLOSE_THRESHOLD and best_match is not None:
+                    self.logger.info("========== Close Arb Opportunity (START) ==========")
+                    self.logger.info(
+                        f"Match: {best_match['team_1']} vs {best_match['team_2']} | Total Prob: {float(best_arb):.4f}"
+                    )
+                    self.logger.info(f"  {best_match['book_1']}: {best_match['odds_1']}")
+                    self.logger.info(f"  {best_match['book_2']}: {best_match['odds_2']}")
+                    self.logger.info("========== Close Arb Opportunity (END) ==========")
+
+                self.db.commit()
+            else:
+                self.logger.info(
+                    f"Odds: 0 - Matches: 0 - Arbs: 0"
+                )
 
         except Exception as e:
             self.db.rollback()
@@ -162,7 +250,7 @@ class ArbitrageController:
             self.db.flush()
 
             self.logger.info(
-                f"DB - Arbitrage Not Saved - "
+                f"DB - Arbitrage Saved - "
                 f"{t1['bookmaker']} vs {t2['bookmaker']} - "
                 f"{o1['team_1']} vs {o1['team_2']}" 
             )
