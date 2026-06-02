@@ -12,12 +12,13 @@ class Logger:
         logger.setLevel(logging.DEBUG)
 
         # Create a directory for the logs if it doesn't exist
-        if not os.path.exists('logs'):
-            os.makedirs('logs')
+        log_dir = LOG_DIR or 'logs'
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
 
         # Get today's date for the filename postfix
         today_date = datetime.now().strftime('%Y-%m-%d')
-        filename = f'{LOG_DIR}/{class_name}-{today_date}.log'
+        filename = f'{log_dir}/{class_name}-{today_date}.log'
 
         # Create a timed rotating file handler that creates a new log file daily
         file_handler = TimedRotatingFileHandler(

@@ -30,18 +30,8 @@ DB1_URL = (
 engine1 = create_engine(DB1_URL)
 Session1 = sessionmaker(bind=engine1)
 session1 = Session1()
-print("=== DEBUG from database/config.py ===")
-registered = sorted(Base.metadata.tables.keys())
-print("Registered tables in metadata at create_all time:", registered)
-print("'arbitrage' registered?", "arbitrage" in registered)
-try:
-    Base.metadata.create_all(bind=engine1)
-    print("create_all completed without exception.")
-except Exception as exc:
-    print("create_all RAISED:", repr(exc))
-    raise
 
-print("=== END DEBUG ===")
+Base.metadata.create_all(bind=engine1)
 
 def __get_db1_session__():
     return session1
