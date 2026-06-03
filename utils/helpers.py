@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import pytz
 import asyncio
-from telegram import Update, Bot
 import tracemalloc
 from utils.config import TELEGRAM
 
@@ -201,48 +200,72 @@ def format_website(url):
 
 async def send_telegram_alert(alert, chat_id = None) -> None:
     tracemalloc.start()
-    token = TELEGRAM['bot_token']
-    chat_id = chat_id or TELEGRAM['chat_id']
-    bot = Bot(token=token)
-    await bot.send_message(
-        chat_id=chat_id, text=alert
-    )
+    try:
+        from telegram import Bot
+        token = TELEGRAM.get('bot_token')
+        if not token:
+            print("Telegram alerts disabled (no bot_token) - skipping")
+            return
+        chat_id = chat_id or TELEGRAM.get('chat_id')
+        if not chat_id:
+            print("No chat_id for telegram alert - skipping")
+            return
+        bot = Bot(token=token)
+        await bot.send_message(chat_id=chat_id, text=alert)
+    except Exception as e:
+        print(f"Telegram alert failed (non-fatal): {e}")
 
 async def send_monitoring_alert(website, account, ex, chat_id = None) -> None:
     tracemalloc.start()
-    token = TELEGRAM['bot_token']
-    chat_id = chat_id or TELEGRAM['monitoring']
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        from telegram import Bot
+        token = TELEGRAM.get('bot_token')
+        if not token:
+            print("Telegram monitoring disabled (no bot_token) - skipping alert for error")
+            return
+        chat_id = chat_id or TELEGRAM.get('monitoring')
+        if not chat_id:
+            print("No monitoring chat_id - skipping telegram error alert")
+            return
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    exception_msg = f"{str(ex)}"
-    tb_list = traceback.format_exception(type(ex), ex, ex.__traceback__, limit=3)
-    trace = "".join(tb_list)
-    
-    if len(exception_msg) + len(trace) > 3600:
-        exception_msg = exception_msg[:1800]
-        trace = trace[:1800] + "... [truncated]"
+        exception_msg = f"{str(ex)}"
+        tb_list = traceback.format_exception(type(ex), ex, ex.__traceback__, limit=3)
+        trace = "".join(tb_list)
+        
+        if len(exception_msg) + len(trace) > 3600:
+            exception_msg = exception_msg[:1800]
+            trace = trace[:1800] + "... [truncated]"
 
-    alert = (
-        f"Website: {website}\n"
-        f"Account: {account}\n" 
-        f"Timestamp: {timestamp}\n"
-        f"Exception: {exception_msg}\n"
-        f"Traceback:\n{trace}"
-    )
-    bot = Bot(token=token)
-    await bot.send_message(
-        chat_id=chat_id, text=alert
-    )
+        alert = (
+            f"Website: {website}\n"
+            f"Account: {account}\n" 
+            f"Timestamp: {timestamp}\n"
+            f"Exception: {exception_msg}\n"
+            f"Traceback:\n{trace}"
+        )
+        bot = Bot(token=token)
+        await bot.send_message(chat_id=chat_id, text=alert)
+    except Exception as e:
+        print(f"Telegram monitoring alert failed (non-fatal): {e}")
 
 
 async def send_testing_alert(alert, chat_id = None) -> None:
     tracemalloc.start()
-    token = TELEGRAM['bot_token']
-    chat_id = chat_id or TELEGRAM['testing']
-    bot = Bot(token=token)
-    await bot.send_message(
-        chat_id=chat_id, text=alert
-    )
+    try:
+        from telegram import Bot
+        token = TELEGRAM.get('bot_token')
+        if not token:
+            print("Telegram testing disabled (no bot_token) - skipping")
+            return
+        chat_id = chat_id or TELEGRAM.get('testing')
+        if not chat_id:
+            print("No testing chat_id - skipping")
+            return
+        bot = Bot(token=token)
+        await bot.send_message(chat_id=chat_id, text=alert)
+    except Exception as e:
+        print(f"Telegram testing alert failed (non-fatal): {e}")
 
 # -----------------------------------
 # Numbers

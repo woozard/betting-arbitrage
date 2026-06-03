@@ -78,35 +78,94 @@ class Sports411Controller:
         )
 
         options = webdriver.ChromeOptions()
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--disable-accelerated-2d-canvas")
+        options.add_argument("--no-zygote")
+        options.add_argument("--single-process")  # Can help in some container/service envs, remove if issues
         options.add_argument(f'--load-extension={self.proxy_extension_dir}')
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--disable-extensions-except=' + self.proxy_extension_dir)
+        options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+        )
 
-        self.driver = webdriver.Chrome(options=options)
+        # Use a unique user data dir to avoid profile conflicts in service restarts
+        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+        options.add_argument(f'--user-data-dir={self.user_data_dir}')
+
+        # Retry driver creation - Chrome can be flaky under systemd/service on servers
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.driver = webdriver.Chrome(options=options)
+                break
+            except Exception as e:
+                self.logger.warning(f"Chrome driver start attempt {attempt+1}/{max_retries} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(5)
+
         self.wait = WebDriverWait(self.driver, 30)
 
     # === helper methods from Web5Controller ===
     def _create_proxy_extension(self, host: str, port: int, user: str, password: str) -> str:
-        """Dynamically creates a Chrome Proxy Extension with authentication"""
+        """Dynamically creates a Chrome Proxy Extension with authentication (MV2 for compatibility)"""
         ext_dir = tempfile.mkdtemp(prefix="brightdata_proxy_")
         manifest = {
-            "manifest_version": 3,
+            "manifest_version": 2,
             "name": "BrightData Proxy Auth",
             "version": "1.0",
-            "permissions": ["proxy", "tabs", "unlimitedStorage", "storage"],
-            "background": {"service_worker": "background.js"}
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            }
         }
         with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)
 
         background_js = f"""
-        chrome.proxy.settings.set({{value: {{mode: "fixed_servers", rules: {{singleProxy: {{scheme: "http", host: "{host}", port: {port}}}}}}}, scope: "regular"}}, function() {{}});
+        chrome.proxy.settings.set({{
+            value: {{
+                mode: "fixed_servers",
+                rules: {{
+                    singleProxy: {{
+                        scheme: "http",
+                        host: "{host}",
+                        port: {port}
+                    }}
+                }}
+            }},
+            scope: "regular"
+        }}, function() {{}});
+
         chrome.webRequest.onAuthRequired.addListener(
-            function(details) {{ return {{authCredentials: {{username: "{user}", password: "{password}"}}}}; }},
-            {{urls: ["<all_urls>"]}}, ["blocking"]
+            function(details) {{
+                return {{
+                    authCredentials: {{
+                        username: "{user}",
+                        password: "{password}"
+                    }}
+                }};
+            }},
+            {{urls: ["<all_urls>"]}},
+            ["blocking"]
         );
         """
         with open(os.path.join(ext_dir, "background.js"), "w") as f:

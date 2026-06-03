@@ -80,38 +80,85 @@ class BetamapolaController:
         )
 
         options = webdriver.ChromeOptions()
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--disable-accelerated-2d-canvas")
+        options.add_argument("--no-zygote")
         options.add_argument(f'--load-extension={self.proxy_extension_dir}')
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--disable-extensions-except=' + self.proxy_extension_dir)
+        options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+        )
 
         # Enable performance logging so we can capture network requests (XHR/Fetch)
         options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+
+        # Use a unique user data dir to avoid profile conflicts in service restarts
+        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+        options.add_argument(f'--user-data-dir={self.user_data_dir}')
 
         self.driver = webdriver.Chrome(options=options)
         self.wait = WebDriverWait(self.driver, 30)
 
     # === helper methods from Sports411Controller / Web5Controller ===
     def _create_proxy_extension(self, host: str, port: int, user: str, password: str) -> str:
-        """Dynamically creates a Chrome Proxy Extension with authentication"""
+        """Dynamically creates a Chrome Proxy Extension with authentication (MV2 for compatibility)"""
         ext_dir = tempfile.mkdtemp(prefix="brightdata_proxy_")
         manifest = {
-            "manifest_version": 3,
+            "manifest_version": 2,
             "name": "BrightData Proxy Auth",
             "version": "1.0",
-            "permissions": ["proxy", "tabs", "unlimitedStorage", "storage"],
-            "background": {"service_worker": "background.js"}
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            }
         }
         with open(os.path.join(ext_dir, "manifest.json"), "w") as f:
             json.dump(manifest, f, indent=2)
 
         background_js = f"""
-        chrome.proxy.settings.set({{value: {{mode: "fixed_servers", rules: {{singleProxy: {{scheme: "http", host: "{host}", port: {port}}}}}}}, scope: "regular"}}, function() {{}});
+        chrome.proxy.settings.set({{
+            value: {{
+                mode: "fixed_servers",
+                rules: {{
+                    singleProxy: {{
+                        scheme: "http",
+                        host: "{host}",
+                        port: {port}
+                    }}
+                }}
+            }},
+            scope: "regular"
+        }}, function() {{}});
+
         chrome.webRequest.onAuthRequired.addListener(
-            function(details) {{ return {{authCredentials: {{username: "{user}", password: "{password}"}}}}; }},
-            {{urls: ["<all_urls>"]}}, ["blocking"]
+            function(details) {{
+                return {{
+                    authCredentials: {{
+                        username: "{user}",
+                        password: "{password}"
+                    }}
+                }};
+            }},
+            {{urls: ["<all_urls>"]}},
+            ["blocking"]
         );
         """
         with open(os.path.join(ext_dir, "background.js"), "w") as f:
