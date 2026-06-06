@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer
+from sqlalchemy import Column, String, Integer, Text
 from database.config import __get_base__
 
 Base = __get_base__()
@@ -7,29 +7,29 @@ class DailyFigures(Base):
     __tablename__: str = 'daily_figures'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    website = Column('website', String)
-    account_id = Column('account_id', String)
-    bet_status = Column('type', String)
-    book_ticket_id = Column('book_ticket_id', String)
-    game_no = Column('game_no', String)
-    team_1 = Column('team_1', String)
-    team_2 = Column('team_2', String)
-    bet_type = Column('bet_type', String)
-    odds = Column('odds', String)
-    spread = Column('spread', String)
-    total = Column('total', String)
-    team_bet_on = Column('team_bet_on', String)
-    risk = Column('risk', String)
-    win = Column('win', String)
-    status = Column('status', String)
-    final_score = Column('final_score', String)
-    accepted = Column('accepted', String)
-    placed_on = Column('placed_on', String)
-    sport = Column('sport', String)
-    period = Column('period', String)
-    date = Column('date', String, nullable=True)
-    time = Column('time', String, nullable=True)
-    timezone = Column('timezone', String, nullable=True)
+    website = Column('website', String(255))
+    account_id = Column('account_id', String(255))
+    bet_status = Column('type', String(255))
+    book_ticket_id = Column('book_ticket_id', String(255))
+    game_no = Column('game_no', String(255))
+    team_1 = Column('team_1', String(255))
+    team_2 = Column('team_2', String(255))
+    bet_type = Column('bet_type', String(255))
+    odds = Column('odds', String(255))
+    spread = Column('spread', String(255))
+    total = Column('total', String(255))
+    team_bet_on = Column('team_bet_on', String(255))
+    risk = Column('risk', String(255))
+    win = Column('win', String(255))
+    status = Column('status', String(255))
+    final_score = Column('final_score', String(255))
+    accepted = Column('accepted', String(255))
+    placed_on = Column('placed_on', String(255))
+    sport = Column('sport', String(255))
+    period = Column('period', String(255))
+    date = Column('date', String(255), nullable=True)
+    time = Column('time', String(255), nullable=True)
+    timezone = Column('timezone', String(255), nullable=True)
 
     def __init__(self, website: object, account_id: object, bet_status: object, book_ticket_id: object, game_no: object,
                  team_1: object,

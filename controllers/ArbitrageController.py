@@ -195,11 +195,12 @@ class ArbitrageController:
                     self.logger.info(f"  {best_match['book_2']}: {best_match['odds_2']}")
                     self.logger.info("========== Close Arb Opportunity (END) ==========")
 
-                self.db.commit()
             else:
                 self.logger.info(
                     f"Odds: 0 - Matches: 0 - Arbs: 0"
                 )
+
+            self.db.commit()
 
         except Exception as e:
             self.db.rollback()

@@ -21,6 +21,15 @@ from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
+
+# Use a project-local temporary directory to avoid FileNotFoundError on /tmp
+# (very common when running under systemd with PrivateTmp, small tmpfs, or
+# restricted service environments). We create 'tmp/' next to the project root
+# and force tempfile + Chrome to use it.
+PROJECT_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tmp'))
+os.makedirs(PROJECT_TMP_DIR, exist_ok=True)
+tempfile.tempdir = PROJECT_TMP_DIR
+
 class Sports411Controller:
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
