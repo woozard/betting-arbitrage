@@ -1,3 +1,5 @@
+import os
+import time
 import traceback
 import requests
 from time import sleep
@@ -8,7 +10,7 @@ from decimal import Decimal
 import pytz
 import asyncio
 import tracemalloc
-from utils.config import TELEGRAM
+from utils.config import TELEGRAM, LOG_DIR
 
 
 # engine = create_engine('mysql://root@localhost/lockz')
@@ -27,6 +29,31 @@ def get_session():
 def random_sleep(min_time=2, max_time=5):
     sleep_time = random.uniform(min_time, max_time)
     sleep(sleep_time)
+
+
+def get_debug_dir():
+    """Directory for HTML/JSON debug artifacts (under logs/debug, not project root)."""
+    debug_dir = os.path.join(LOG_DIR or "logs", "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    return debug_dir
+
+
+def debug_filepath(name: str) -> str:
+    """Build a timestamped path under logs/debug/. Pass name without extension."""
+    return os.path.join(get_debug_dir(), f"{name}_{int(time.time())}.html")
+
+
+def prune_debug_files(max_age_hours: int = 24):
+    """Remove debug artifacts older than max_age_hours from logs/debug/."""
+    debug_dir = get_debug_dir()
+    cutoff = time.time() - max_age_hours * 3600
+    try:
+        for fname in os.listdir(debug_dir):
+            path = os.path.join(debug_dir, fname)
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except Exception:
+        pass
 
 
 def parse_game_datetime(value):

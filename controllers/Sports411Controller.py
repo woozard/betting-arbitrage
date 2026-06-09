@@ -13,12 +13,14 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc   # ← NEW: for explicit table-missing error handling
 
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
+from utils.bet_placement import finalize_confirmed_bet
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
@@ -278,9 +280,10 @@ class Sports411Controller:
             self.driver.get(self.login_url)
             time.sleep(8)
 
-            with open(f"debug_login_sports411_{int(time.time())}.html", "w", encoding="utf-8") as f:
+            login_debug = debug_filepath("debug_login_sports411")
+            with open(login_debug, "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
-            self.logger.info("💾 Saved debug_login_sports411_*.html")
+            self.logger.info(f"💾 Saved {login_debug}")
 
             # Hard block detection
             page_source_lower = self.driver.page_source.lower()
@@ -316,7 +319,7 @@ class Sports411Controller:
 
         except Exception as e:
             self.logger.error(f"Login Failed: {e}")
-            with open(f"debug_login_sports411_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
+            with open(debug_filepath("debug_login_sports411_FAIL"), "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
             self._safe_send_monitoring_alert(e)  # <-- safe version
             raise
@@ -466,6 +469,7 @@ class Sports411Controller:
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
         self.logger.info(f"========== Fetching Odds ({self.sport_name}) via Selenium (START) ==========")
+        prune_debug_files()
 
         try:
             # Use the existing authenticated Selenium driver (with BrightData proxy)
@@ -505,7 +509,7 @@ class Sports411Controller:
                 self.logger.warning("Game content may still be loading after waiting.")
 
             # Save debug HTML after waiting attempts
-            debug_file = f"debug_sports411_{self.sport_name.lower()}_{int(time.time())}.html"
+            debug_file = debug_filepath(f"debug_sports411_{self.sport_name.lower()}")
             with open(debug_file, "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
             self.logger.info(f"💾 Saved debug HTML: {debug_file}")
@@ -599,6 +603,70 @@ class Sports411Controller:
             self._quit_driver()
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
     # END CHANGE
+
+    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
+        try:
+            pending_url = f"https://be.{self.website}/en/account/pending"
+            self.driver.get(pending_url)
+            time.sleep(2)
+            page = self.driver.page_source.lower()
+            return (
+                team_name.lower() in page
+                and team_1.lower() in page
+                and team_2.lower() in page
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not check existing open bets: {e}")
+            return False
+
+    def _verify_open_bet_on_pending(self, team_name: str, stake: float):
+        try:
+            pending_url = f"https://be.{self.website}/en/account/pending"
+            self.driver.get(pending_url)
+            time.sleep(3)
+            page = self.driver.page_source.lower()
+            team_l = team_name.lower()
+            if team_l not in page:
+                return False, "Bet not found on pending page"
+            stake_hits = (
+                f"{stake:.2f}" in page
+                or f"${stake:.0f}" in page
+                or f"risk: ${stake:.2f}" in page
+            )
+            if stake_hits:
+                return True, "Open bet found on pending page"
+            return True, "Open bet found on pending page (team match)"
+        except Exception as e:
+            return False, f"Could not verify open bet: {e}"
+
+    def _confirm_bet_accepted(self, team_name: str, stake: float, timeout: int = 10):
+        try:
+            alert_overlay = WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".alert-overlay"))
+            )
+            alert_message = alert_overlay.find_element(
+                By.CSS_SELECTOR, ".alert-message"
+            ).text.strip()
+            alert_classes = alert_overlay.find_element(
+                By.CSS_SELECTOR, ".AlertComponent"
+            ).get_attribute("class") or ""
+
+            try:
+                ok_btn = alert_overlay.find_element(By.CSS_SELECTOR, "button.okBtn")
+                self.driver.execute_script("arguments[0].click();", ok_btn)
+            except Exception:
+                pass
+
+            if "confirm-alert" not in alert_classes:
+                self.logger.error(f"Bet rejected by bookmaker alert: {alert_message}")
+                return False, alert_message or "Bet rejected"
+
+            time.sleep(1)
+            self.logger.info(f"Bet confirmed by alert: {alert_message}")
+            return True, alert_message or "Bet confirmed"
+        except TimeoutException:
+            self.logger.warning("No confirmation alert after Place Bet; checking pending wagers")
+            return self._verify_open_bet_on_pending(team_name, stake)
 
     # Execute Bet
     # --------------------------------------------------------
@@ -786,8 +854,11 @@ class Sports411Controller:
             self.driver.execute_script("arguments[0].click();", place_bet_btn)
             self.logger.info("Place Bet button clicked")
 
-            time.sleep(2)
-            self.logger.info("Bet placement attempted successfully")
+            confirmed, message = self._confirm_bet_accepted(team_name, stake)
+            if not confirmed:
+                raise Exception(message or "Bet not accepted by bookmaker")
+
+            self.logger.info(f"Bet accepted by bookmaker: {message}")
             return True, stake
 
         except Exception as e:
@@ -1044,70 +1115,46 @@ class Sports411Controller:
                     self.logger.warning("Bookmaker mismatch, skipping arb")
                     continue
 
-                # Place Bet
+                book_1 = arb.get("team_1_bookmaker")
+                book_2 = arb.get("team_2_bookmaker")
+
+                if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                    self.logger.info(
+                        f"Skipping — leg already confirmed on {self.bookmaker} | "
+                        f"{team_name} | {team_1} vs {team_2}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
+                if self._has_existing_open_bet(team_name, team_1, team_2):
+                    self.logger.warning(
+                        f"Open bet already exists for {team_name} on {self.bookmaker}; "
+                        f"marking leg placed and stopping new arb scans"
+                    )
+                    self.cache.mark_leg_placed(self.bookmaker, "moneyline", game_id)
+                    self.cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
                 bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
                 if bet_placed:
-
                     self.logger.info("Bet Placement Completed")
-                    
-                    # Cache: Remove Arbitrage
-                    self.cache.remove_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline', game_id=game_id)
-
-                    # Send Telegram Alert
-                    alert = (
-                        f"===== Moneyline Bet =====\n"
-                        f"Sport: {sport}\n"
-                        f"League: {league}\n"
-                        f"Date: {game_date}\n"
-                        f"Match: {team_1} vs {team_2}\n"
-                        f"Bet Type: {bet_type}\n"
-                        f"Team No: {team_no}\n"
-                        f"Team: {team_name}\n"
-                        f"Bookmaker: {self.bookmaker}\n"
-                        f"Odds: {moneyline_odd}\n"
-                        f"Stake: {stake}\n"
-                        # f"Attempts: {attempts}\n"
+                    finalize_confirmed_bet(
+                        self.cache,
+                        self.storage,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        team_no,
+                        team_name,
+                        game_id,
+                        stake,
+                        moneyline_odd,
+                        TELEGRAM,
                     )
-
-                    self.logger.info(f"========== Alert ==========")
-                    self.logger.info(alert)
-                    self.logger.info(f"========== Alert ==========")
-
-                    asyncio.run(send_telegram_alert(alert, TELEGRAM['arbitrage']))
-
-                    # ------------------------------
-                    # Save Bet
-                    # ------------------------------
-                    bet_data = {
-                        "sport": sport,
-                        "league": league,
-                        "game_id": game_id,
-                        "game_datetime": game_date,
-
-                        "team_1": team_1,
-                        "team_2": team_2,
-
-                        "bookmaker": self.bookmaker,
-                        "bet_type": bet_type,
-
-                        "team_no": team_no,
-                        "team_name": team_name,
-
-                        "odds": moneyline_odd,
-                        "stake": stake
-                    }
-
-                    saved_bet = self.storage.save_bet(bet_data)
-
-                    if saved_bet:
-                        self.logger.info("DB - Bet Saved")
-                    else:
-                        self.logger.warning("DB - Bet Not Saved")
-
-                    # Refreshing page before processing the next arbitrage
-                    self.logger.info("Refreshing page before processing the next arbitrage")
-                    self.driver.refresh()
-                    time.sleep(2)  # wait for page reload
+                    self.logger.info("Returning to sport page before next arbitrage")
+                    self.driver.get(self.sport_url)
+                    time.sleep(2)
 
         # The main arbitrage/betting loop above runs until the process is terminated.
         # Explicit returns in the setup phase or unrecoverable errors will end here.

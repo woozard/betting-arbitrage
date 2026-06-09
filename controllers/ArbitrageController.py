@@ -272,6 +272,17 @@ class ArbitrageController:
             )
             return None
 
+        game_dt = parse_game_datetime(o1.get("game_datetime"))
+        game_date = game_dt.date() if game_dt else datetime.utcnow().date()
+        if self.cache.is_arb_scan_locked(
+            o1["team_1"], o1["team_2"], t1["bookmaker"], t2["bookmaker"], str(game_date)
+        ):
+            self.logger.info(
+                f"Skipping arb (scan locked after prior confirmed leg) - "
+                f"{o1['team_1']} vs {o1['team_2']} | {t1['bookmaker']} vs {t2['bookmaker']}"
+            )
+            return None
+
         arb_data = self.__build_arb_data(o1, o2, t1_from, t2_from, arb_total)
 
         try:

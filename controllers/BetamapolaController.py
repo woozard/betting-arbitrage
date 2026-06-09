@@ -17,7 +17,8 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
+from utils.bet_placement import finalize_confirmed_bet
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
@@ -165,9 +166,7 @@ class BetamapolaController:
         """
         try:
             self.__login()
-            self.logger.info(f"Navigating to sports after recovery: {self.sport_url}")
-            self.driver.get(self.sport_url)
-            time.sleep(5)
+            self.__ensure_sport_offering_loaded()
             return True
         except Exception as e:
             self.logger.error(f"Re-login and navigation after driver recovery failed: {e}")
@@ -277,9 +276,10 @@ class BetamapolaController:
             self.driver.get(self.login_url)
             time.sleep(6)
 
-            with open(f"debug_login_betamapola_{int(time.time())}.html", "w", encoding="utf-8") as f:
+            login_debug = debug_filepath("debug_login_betamapola")
+            with open(login_debug, "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
-            self.logger.info("[SAVED] debug_login_betamapola_*.html")
+            self.logger.info(f"[SAVED] {login_debug}")
 
             # Hard block detection (reuse pattern)
             page_source_lower = self.driver.page_source.lower()
@@ -319,7 +319,7 @@ class BetamapolaController:
 
         except Exception as e:
             self.logger.error(f"Login Failed: {e}")
-            with open(f"debug_login_betamapola_FAIL_{int(time.time())}.html", "w", encoding="utf-8") as f:
+            with open(debug_filepath("debug_login_betamapola_FAIL"), "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
             self._safe_send_monitoring_alert(e)
             raise
@@ -348,11 +348,174 @@ class BetamapolaController:
     # Executed inside the authenticated Selenium session so cookies, JWT,
     # origin, and the BrightData proxy are all inherited automatically.
     # ===================================================================
-    def _fetch_game_lines_via_api(self):
-        """POST to GetSportOffering for MLB Straight Bet lines (all periods)."""
-        self.logger.info("Fetching via GetSportOffering API (browser context)...")
+    @staticmethod
+    def _normalize_us_odds(odds) -> str:
+        """Normalize -101.0 / '-101' / +100.0 to comparable integer strings."""
+        try:
+            val = int(float(odds))
+            return f"+{val}" if val > 0 else str(val)
+        except (TypeError, ValueError):
+            text = str(odds).strip()
+            return text if text.startswith(("+", "-")) else f"+{text}"
 
-        payload = {
+    def _odds_text_matches(self, displayed: str, expected) -> bool:
+        disp = self._normalize_us_odds((displayed or "").strip())
+        exp = self._normalize_us_odds(expected)
+        if disp == exp:
+            return True
+        raw = (displayed or "").strip()
+        return exp in raw or raw == str(expected).strip()
+
+    @staticmethod
+    def _team_name_matches(candidate: str, expected: str) -> bool:
+        cand = (candidate or "").strip().lower()
+        exp = (expected or "").strip().lower()
+        if not cand or not exp:
+            return False
+        return cand == exp or exp in cand or cand in exp
+
+    def _lookup_game_line_from_api(self, game_id: str, team_name: str):
+        """Resolve a live API game line by rotation game_id + team name."""
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        if len(rotations) < 2:
+            return None, None
+
+        rot1, rot2 = rotations[0], rotations[1]
+        api_lines = self._fetch_game_lines_via_api()
+        if not api_lines:
+            return None, None
+
+        for gl in api_lines:
+            if gl.get("PeriodNumber") != 0:
+                continue
+            gl_rot1 = str(gl.get("Team1RotNum") or "").strip()
+            gl_rot2 = str(gl.get("Team2RotNum") or "").strip()
+            if gl_rot1 != rot1 or gl_rot2 != rot2:
+                continue
+
+            team_no = None
+            if self._team_name_matches(gl.get("Team1ID"), team_name):
+                team_no = 1
+            elif self._team_name_matches(gl.get("Team2ID"), team_name):
+                team_no = 2
+
+            if team_no is None:
+                continue
+            return gl, team_no
+
+        return None, None
+
+    def _trigger_angular_offering_select(self) -> bool:
+        """Select the active sport/league in the Angular SPA (same UI path users take)."""
+        if self.sport_name == "NBA":
+            label_for = "gl_Basketball_NBA_G"
+        else:
+            label_for = "gl_Baseball_MLB_G"
+
+        try:
+            result = self.driver.execute_script("""
+                var labelFor = arguments[0];
+                var label = document.querySelector('label[for="' + labelFor + '"]');
+                if (!label) return false;
+
+                label.click();
+
+                try {
+                    var scope = angular.element(label).scope();
+                    if (scope && scope.Events && scope.sport && scope.sub) {
+                        if (scope.ClearFilter) scope.ClearFilter();
+                        scope.Events.ToggleOffering(scope.sport, scope.sub, true);
+                        if (scope.$apply) scope.$apply();
+                    }
+                } catch (e) {}
+
+                return true;
+            """, label_for)
+            if result:
+                self.logger.info(f"Triggered Angular offering select for {self.sport_name}")
+            else:
+                self.logger.warning(f"Could not find Angular offering label for {self.sport_name}")
+            return bool(result)
+        except Exception as e:
+            self.logger.warning(f"Angular offering select failed: {e}")
+            return False
+
+    def _wait_for_moneyline_button(self, game_num, team_no: int, timeout: int = 25):
+        """Wait for M{team}_{GameNum}_0 button (TicoSports DOM id format)."""
+        selector = f"button#M{team_no}_{game_num}_0, #M{team_no}_{game_num}_0"
+        end = time.time() + timeout
+        while time.time() < end:
+            elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            if elems:
+                return elems[0]
+            time.sleep(0.5)
+        return None
+
+    def _click_moneyline_via_angular(self, game_line: dict, team_no: int) -> bool:
+        """Add moneyline pick via Angular GameLineAction when DOM buttons are not clickable yet."""
+        try:
+            result = self.driver.execute_script("""
+                var gameNum = arguments[0];
+                var rot1 = String(arguments[1]);
+                var rot2 = String(arguments[2]);
+                var teamNo = arguments[3];
+
+                function invoke(scope) {
+                    if (!scope || !scope.GameLineAction) return false;
+                    var lines = scope.sortedGameLines || scope.GameLines || [];
+                    for (var i = 0; i < lines.length; i++) {
+                        var gl = lines[i];
+                        if (!gl || gl.IsTitle) continue;
+                        var match = String(gl.GameNum) === String(gameNum)
+                            || (String(gl.Team1RotNum) === rot1 && String(gl.Team2RotNum) === rot2);
+                        if (!match) continue;
+                        scope.GameLineAction(gl, 'M', teamNo);
+                        if (scope.$apply) scope.$apply();
+                        return true;
+                    }
+                    return false;
+                }
+
+                var root = document.getElementById('GameLinesCtrl')
+                    || document.querySelector('#gamesAccordion')
+                    || document.querySelector('app-sports');
+                if (!root || typeof angular === 'undefined') return false;
+
+                var scope = angular.element(root).scope();
+                if (invoke(scope)) return true;
+
+                var child = scope && scope.$$childHead;
+                while (child) {
+                    if (invoke(child)) return true;
+                    child = child.$$nextSibling;
+                }
+                return false;
+            """, game_line.get("GameNum"), game_line.get("Team1RotNum"),
+                 game_line.get("Team2RotNum"), team_no)
+            if result:
+                self.logger.info(
+                    f"Added moneyline via Angular GameLineAction "
+                    f"(GameNum={game_line.get('GameNum')}, team={team_no})"
+                )
+            return bool(result)
+        except Exception as e:
+            self.logger.warning(f"Angular GameLineAction failed: {e}")
+            return False
+
+    def _get_api_payload(self):
+        if self.sport_name == "NBA":
+            return {
+                "sportType": "Basketball",
+                "sportSubType": "NBA",
+                "wagerType": "Straight Bet",
+                "hoursAdjustment": 0,
+                "periodNumber": None,
+                "gameNum": None,
+                "parentGameNum": None,
+                "teaserName": "",
+                "requestMode": None,
+            }
+        return {
             "sportType": "Baseball",
             "sportSubType": "MLB",
             "wagerType": "Straight Bet",
@@ -361,8 +524,129 @@ class BetamapolaController:
             "gameNum": None,
             "parentGameNum": None,
             "teaserName": "",
-            "requestMode": None
+            "requestMode": None,
         }
+
+    def __ensure_sport_offering_loaded(self, game_num=None, team_no: int = None) -> bool:
+        """Navigate the SPA to the active sport (MLB/NBA) so game lines are in the DOM."""
+        self.logger.info(f"Ensuring {self.sport_name} offering is loaded in the SPA...")
+
+        self.driver.get(self.sport_url)
+
+        try:
+            self.wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "#gamesAccordion, .sport-lines-container, app-sports")
+                )
+            )
+        except Exception:
+            self.logger.warning("Main content containers not found quickly.")
+
+        try:
+            self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a.sportIcon, a#img_Baseball, a#img_Basketball"))
+            )
+        except Exception:
+            self.logger.warning("Sports sidebar icons did not appear quickly.")
+
+        if self.sport_name == "NBA":
+            sport_selectors = [
+                "a#img_Basketball",
+                "a[data-target='#sp_Basketball']",
+                "#gl_Basketball_NBA_G",
+                "label[for='gl_Basketball_NBA_G']",
+            ]
+        else:
+            sport_selectors = [
+                "a#img_Baseball",
+                "a[data-target='#sp_Baseball']",
+                "#gl_Baseball_MLB_G",
+                "label[for='gl_Baseball_MLB_G']",
+            ]
+
+        try:
+            if self.sport_name == "MLB":
+                baseball_link = self.driver.find_element(
+                    By.CSS_SELECTOR, "a#img_Baseball, a[data-target='#sp_Baseball']"
+                )
+                self.driver.execute_script("arguments[0].click();", baseball_link)
+                time.sleep(1)
+        except Exception as e:
+            self.logger.warning(f"Could not expand sport section: {e}")
+
+        selected = False
+        for selector in sport_selectors[2:]:
+            try:
+                elem = self.driver.find_element(By.CSS_SELECTOR, selector)
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+                self.driver.execute_script("arguments[0].click();", elem)
+                selected = True
+                self.logger.info(f"Selected {self.sport_name} via {selector}")
+                break
+            except Exception:
+                continue
+
+        if not selected:
+            try:
+                result = self.driver.execute_script("""
+                    var selectors = arguments[0];
+                    for (var i = 0; i < selectors.length; i++) {
+                        var el = document.querySelector(selectors[i]);
+                        if (el) { el.click(); return selectors[i]; }
+                    }
+                    var label = document.querySelector('label[for="gl_Baseball_MLB_G"]')
+                        || document.querySelector('label[for="gl_Basketball_NBA_G"]');
+                    if (label) { label.click(); return label.getAttribute('for'); }
+                    return null;
+                """, sport_selectors[2:])
+                if result:
+                    selected = True
+                    self.logger.info(f"Selected {self.sport_name} via JS click ({result})")
+            except Exception as e:
+                self.logger.warning(f"JS sport selection failed: {e}")
+
+        self._trigger_angular_offering_select()
+        time.sleep(3)
+
+        api_lines = self._fetch_game_lines_via_api()
+        api_has_lines = bool(api_lines)
+        if api_has_lines:
+            self.logger.info(f"API confirms {len(api_lines)} {self.sport_name} lines are available")
+
+        lines_ready = False
+        if game_num and team_no:
+            if self._wait_for_moneyline_button(game_num, team_no, timeout=20):
+                lines_ready = True
+                self.logger.info(f"Target moneyline button M{team_no}_{game_num}_0 is in DOM")
+
+        if not lines_ready:
+            for _ in range(20):
+                if self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "button[id^='M1_'], button[id^='M2_'], span[id^='M1_'], span[id^='M2_'], span.line-rot-num",
+                ):
+                    lines_ready = True
+                    break
+                time.sleep(1)
+
+        if lines_ready:
+            self.logger.info(f"{self.sport_name} lines detected in DOM")
+        elif api_has_lines:
+            self.logger.warning(
+                f"{self.sport_name} lines exist in API but not yet rendered in DOM; "
+                "will use GameNum selectors / Angular GameLineAction"
+            )
+            lines_ready = True
+        else:
+            self.logger.warning(f"{self.sport_name} lines not visible in DOM or API after navigation")
+
+        return lines_ready
+
+    def _fetch_game_lines_via_api(self):
+        """POST to GetSportOffering for current sport Straight Bet lines (all periods)."""
+        self.logger.info("Fetching via GetSportOffering API (browser context)...")
+
+        payload = self._get_api_payload()
 
         script = """
             const p = arguments[0];
@@ -481,61 +765,12 @@ class BetamapolaController:
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
         self.logger.info(f"========== Fetching Odds ({self.sport_name}) via Selenium (START) ==========")
+        prune_debug_files()
 
         try:
             # Ensure we are logged in using the existing Selenium driver
             self.__login()
-
-            self.logger.info(f"Navigating to {self.sport_url}")
-            self.driver.get(self.sport_url)
-
-            # Wait for main content containers to appear
-            try:
-                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#gamesAccordion, .sport-lines-container, app-sports")))
-            except Exception:
-                self.logger.warning("Main content containers not found quickly.")
-
-            # Wait for the sports sidebar icons to load (they are async)
-            try:
-                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.sportIcon, a#img_Baseball")))
-                self.logger.info("Sports sidebar loaded.")
-            except Exception:
-                self.logger.warning("Sports sidebar icons did not appear quickly.")
-
-            # Expand the Baseball section (contains MLB games)
-            try:
-                baseball_link = self.driver.find_element(
-                    By.CSS_SELECTOR, 
-                    "a#img_Baseball, a[data-target='#sp_Baseball'], a.sportIcon"
-                )
-                self.driver.execute_script("arguments[0].click();", baseball_link)
-                self.logger.info("Clicked to expand Baseball/MLB section.")
-                time.sleep(2)  # Allow expansion animation
-            except Exception as e:
-                self.logger.warning(f"Could not click to expand Baseball section: {e}")
-
-            # Directly trigger Angular to select the MLB league (more reliable than click)
-            try:
-                result = self.driver.execute_script("""
-                    var label = document.querySelector('label[for="gl_Baseball_MLB_G"]');
-                    if (label) {
-                        var scope = angular.element(label).scope();
-                        if (scope && scope.Events && scope.sport && scope.sub) {
-                            scope.ClearFilter && scope.ClearFilter();
-                            scope.Events.ToggleOffering(scope.sport, scope.sub, true);
-                            if (scope.$apply) scope.$apply();
-                            return true;
-                        }
-                    }
-                    return false;
-                """)
-                if result:
-                    self.logger.info("Directly triggered Angular ToggleOffering for MLB.")
-                else:
-                    self.logger.warning("Could not access Angular scope for MLB item.")
-                time.sleep(4)  # Allow games to load after toggling
-            except Exception as e:
-                self.logger.warning(f"Failed to trigger Angular MLB selection via scope: {e}")
+            self.__ensure_sport_offering_loaded()
 
             # ------------------------------------------------------------------
             # Preferred path: direct API call (GetSportOffering) - fast & reliable
@@ -606,7 +841,10 @@ class BetamapolaController:
                     self.logger.info("No obviously relevant network requests found during the load window.")
 
                 # Save full captured requests for later analysis
-                net_file = f"network_betamapola_{self.sport_name.lower()}_{int(time.time())}.json"
+                net_file = os.path.join(
+                    get_debug_dir(),
+                    f"network_betamapola_{self.sport_name.lower()}_{int(time.time())}.json",
+                )
                 with open(net_file, "w", encoding="utf-8") as f:
                     json.dump(network_requests, f, indent=2)
                 self.logger.info(f"💾 Saved full network log: {net_file}")
@@ -614,7 +852,7 @@ class BetamapolaController:
                 self.logger.warning(f"Failed to capture performance logs: {e}")
 
             # Save debug HTML after waiting (always useful for diagnostics)
-            debug_file = f"debug_betamapola_{self.sport_name.lower()}_{int(time.time())}.html"
+            debug_file = debug_filepath(f"debug_betamapola_{self.sport_name.lower()}")
             with open(debug_file, "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
             self.logger.info(f"💾 Saved debug HTML: {debug_file}")
@@ -750,6 +988,175 @@ class BetamapolaController:
             self._quit_driver()
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
 
+    def _find_moneyline_element(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd,
+        game_line: dict = None,
+        team_no: int = None,
+    ):
+        """Locate clickable moneyline button/span for team/odds on the loaded offering page."""
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        team_lower = team_name.lower()
+        moneyline_elem = None
+        game_num = (game_line or {}).get("GameNum")
+        period = (game_line or {}).get("PeriodNumber", 0)
+
+        # Strategy 1: TicoSports id format is M{teamNo}_{GameNum}_{PeriodNumber} on <button>
+        if game_num is not None and team_no in (1, 2):
+            for selector in (
+                f"button#M{team_no}_{game_num}_{period}",
+                f"#M{team_no}_{game_num}_{period}",
+                f"button[id='M{team_no}_{game_num}_{period}']",
+            ):
+                candidates = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if candidates:
+                    moneyline_elem = candidates[0]
+                    break
+
+        # Strategy 2: GameNum embedded in any M1_/M2_ button id + odds text match
+        if not moneyline_elem and game_num is not None:
+            for prefix in ("M1_", "M2_"):
+                candidates = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    f"button[id^='{prefix}'][id*='_{game_num}_'], span[id^='{prefix}'][id*='_{game_num}_']",
+                )
+                for cand in candidates:
+                    txt = (cand.text or cand.get_attribute("innerText") or "").strip()
+                    if self._odds_text_matches(txt, moneyline_odd):
+                        moneyline_elem = cand
+                        break
+                if moneyline_elem:
+                    break
+
+        # Strategy 3: team name in row + matching odds (buttons first, then spans)
+        if not moneyline_elem:
+            for cand in self.driver.find_elements(
+                By.CSS_SELECTOR, "button[id^='M1_'], button[id^='M2_'], span[id^='M1_'], span[id^='M2_']"
+            ):
+                try:
+                    row = cand.find_element(
+                        By.XPATH,
+                        "./ancestor::*[contains(@class,'game') or contains(@class,'line') or contains(@class,'betting')][1]",
+                    )
+                    row_text = (row.text or "").lower()
+                except Exception:
+                    row_text = (cand.text or "").lower()
+
+                txt = (cand.text or cand.get_attribute("innerText") or "").strip()
+                if team_lower in row_text and self._odds_text_matches(txt, moneyline_odd):
+                    moneyline_elem = cand
+                    break
+
+        # Strategy 4: rotation numbers visible in row + matching odds
+        if not moneyline_elem:
+            for row in self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "ul.bettinglines, .gameLineInfo, .sport-lines-container div, #gamesAccordion div",
+            ):
+                row_text = (row.text or "").lower()
+                if team_lower not in row_text:
+                    continue
+                if rotations and not all(rot in row_text for rot in rotations):
+                    continue
+                for cand in row.find_elements(
+                    By.CSS_SELECTOR,
+                    "button[id^='M1_'], button[id^='M2_'], span[id^='M1_'], span[id^='M2_'], span.text-black",
+                ):
+                    txt = (cand.text or "").strip()
+                    if self._odds_text_matches(txt, moneyline_odd):
+                        moneyline_elem = cand
+                        break
+                if moneyline_elem:
+                    break
+
+        return moneyline_elem
+
+    def _fetch_open_wagers_via_api(self):
+        script = """
+            return fetch('/sports/Api/Betting.asmx/GetWagerPicks', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json, text/plain, */*'
+                },
+                credentials: 'include',
+                body: JSON.stringify({})
+            }).then(r => r.json());
+        """
+        try:
+            result = self.driver.execute_script(script)
+            if not result:
+                return []
+            data = (result.get("d") or {}).get("Data") or result.get("d") or {}
+            if isinstance(data, list):
+                return data
+            for key in ("WagerPicks", "Picks", "OpenWagers", "Items"):
+                if isinstance(data.get(key), list):
+                    return data[key]
+            return []
+        except Exception as e:
+            self.logger.warning(f"GetWagerPicks failed: {e}")
+            return []
+
+    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
+        team_l = team_name.lower()
+        for pick in self._fetch_open_wagers_via_api():
+            text = json.dumps(pick).lower()
+            if team_l in text and team_1.lower() in text and team_2.lower() in text:
+                return True
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+            return team_l in body and team_1.lower() in body and team_2.lower() in body
+        except Exception:
+            return False
+
+    def _confirm_bet_accepted(self, team_name: str, team_1: str, team_2: str, stake: float):
+        time.sleep(2)
+        page = (self.driver.page_source or "").lower()
+        reject_markers = (
+            "rejected", "not accepted", "insufficient funds", "insufficient balance",
+            "failed to place", "wager declined", "unable to place",
+        )
+        for marker in reject_markers:
+            if marker in page:
+                return False, f"Bet rejected ({marker})"
+
+        success_markers = (
+            "wager accepted", "bet accepted", "ticket accepted",
+            "successfully placed", "your wager has been accepted",
+        )
+        for marker in success_markers:
+            if marker in page:
+                return True, marker
+
+        team_l = team_name.lower()
+        for pick in self._fetch_open_wagers_via_api():
+            text = json.dumps(pick).lower()
+            if team_l in text:
+                return True, "Open wager found via GetWagerPicks"
+
+        try:
+            for tab in self.driver.find_elements(
+                By.XPATH,
+                "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'open bet')]",
+            ):
+                self.driver.execute_script("arguments[0].click();", tab)
+                time.sleep(2)
+                break
+        except Exception:
+            pass
+
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+            if team_l in body and team_1.lower() in body and team_2.lower() in body:
+                return True, "Open bet visible on page"
+        except Exception:
+            pass
+
+        return False, "Bet not confirmed by bookmaker"
+
     # --------------------------------------------------------
     # Execute Bet (adapted for Betamapola /sports#/ SPA + betSlipDiv)
     # --------------------------------------------------------
@@ -758,7 +1165,9 @@ class BetamapolaController:
         game_id: str,
         team_name: str,
         moneyline_odd: str,
-        stake: float = 1.0
+        stake: float = 1.0,
+        team_1: str = None,
+        team_2: str = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
 
@@ -767,69 +1176,52 @@ class BetamapolaController:
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
             )
 
-            # Find the moneyline span by rotation or by searching text (M1_/M2_ ids contain the composite game_id)
-            moneyline_span = None
-
-            # Strategy 1: id contains the game_id parts (rotations)
-            for prefix in ["M1_", "M2_"]:
-                candidates = self.driver.find_elements(
-                    By.CSS_SELECTOR, f"span[id^='{prefix}'][id*='{game_id.split('-')[0]}']"
+            game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
+            if not game_line:
+                raise Exception(
+                    f"Game {game_id} ({team_name}) not found in live {self.sport_name} API offering"
                 )
-                for cand in candidates:
-                    txt = (cand.text or cand.get_attribute("innerText") or "").strip()
-                    if moneyline_odd in txt or txt == moneyline_odd:
-                        moneyline_span = cand
-                        break
-                if moneyline_span:
-                    break
 
-            # Strategy 2: search all M* spans + match team name + odd in nearby text
-            if not moneyline_span:
-                all_ml = self.driver.find_elements(By.CSS_SELECTOR, "span[id^='M1_'], span[id^='M2_']")
-                for cand in all_ml:
-                    parent_text = (cand.find_element(By.XPATH, "./ancestor::div[1]").text if cand.find_elements(By.XPATH, "./ancestor::div[1]") else cand.text) or ""
-                    parent_text = parent_text.lower()
-                    if team_name.lower() in parent_text and moneyline_odd in (cand.text or ""):
-                        moneyline_span = cand
-                        break
+            game_num = game_line.get("GameNum")
+            self.logger.info(
+                f"API resolved GameNum={game_num}, team_no={team_no}, "
+                f"rot={game_line.get('Team1RotNum')}-{game_line.get('Team2RotNum')}"
+            )
 
-            if not moneyline_span:
-                # Last resort: broad search
-                all_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.text-black, span.ng-binding")
-                for cand in all_spans:
-                    if (cand.text or "").strip() == moneyline_odd:
-                        # verify team context
-                        ctx = cand.find_element(By.XPATH, "./ancestor::*[contains(@class,'game') or contains(@class,'line')]").text.lower() if cand.find_elements(By.XPATH, "./ancestor::*[contains(@class,'game') or contains(@class,'line')]") else ""
-                        if team_name.lower() in ctx:
-                            moneyline_span = cand
-                            break
+            if not self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no):
+                raise Exception(f"{self.sport_name} lines not loaded before bet placement")
 
-            if not moneyline_span:
-                self.logger.warning(f"Moneyline span not found on first pass for {team_name} @ {moneyline_odd}, refreshing and retrying")
-                self.driver.refresh()
-                time.sleep(3)
-                # Re-run the three strategies after refresh (simplified: just re-search broad)
-                all_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.text-black, span.ng-binding")
-                for cand in all_spans:
-                    if (cand.text or "").strip() == str(moneyline_odd):
-                        ctx = ""
-                        try:
-                            ctx = cand.find_element(By.XPATH, "./ancestor::*[contains(@class,'game') or contains(@class,'line')]").text.lower()
-                        except:
-                            pass
-                        if team_name.lower() in ctx:
-                            moneyline_span = cand
-                            break
-                if not moneyline_span:
-                    raise Exception(f"Moneyline span not found for team '{team_name}' @ {moneyline_odd}")
+            moneyline_elem = self._find_moneyline_element(
+                game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
+            )
 
-            self.logger.info(f"Moneyline span located: {moneyline_span.get_attribute('id')}")
+            if not moneyline_elem:
+                self.logger.warning(
+                    f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, re-navigating"
+                )
+                self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
+                moneyline_elem = self._find_moneyline_element(
+                    game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
+                )
 
-            # Click the odds span (adds to bet slip)
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", moneyline_span)
-            time.sleep(0.4)
-            self.driver.execute_script("arguments[0].click();", moneyline_span)
-            self.logger.info("Moneyline span clicked")
+            added_to_slip = False
+            if moneyline_elem:
+                self.logger.info(f"Moneyline element located: {moneyline_elem.get_attribute('id')}")
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", moneyline_elem)
+                time.sleep(0.4)
+                self.driver.execute_script("arguments[0].click();", moneyline_elem)
+                self.logger.info("Moneyline element clicked")
+                added_to_slip = True
+            elif self._click_moneyline_via_angular(game_line, team_no):
+                added_to_slip = True
+            else:
+                raise Exception(
+                    f"Moneyline not found for team '{team_name}' @ {moneyline_odd} "
+                    f"(GameNum={game_num})"
+                )
+
+            if not added_to_slip:
+                raise Exception(f"Failed to add {team_name} moneyline to bet slip")
 
             # Wait for Bet Slip (id="betSlipDiv")
             self.wait.until(EC.presence_of_element_located((By.ID, "betSlipDiv")))
@@ -900,14 +1292,19 @@ class BetamapolaController:
                     place_btn = b
                     break
 
-            if place_btn:
-                self.driver.execute_script("arguments[0].click();", place_btn)
-                self.logger.info("Place Bet clicked")
-            else:
-                self.logger.warning("Place Bet button not auto-detected - manual intervention may be required")
+            if not place_btn:
+                raise Exception("Place Bet button not found")
 
-            time.sleep(3)
-            self.logger.info("Bet placement attempted successfully")
+            self.driver.execute_script("arguments[0].click();", place_btn)
+            self.logger.info("Place Bet clicked")
+
+            matchup_1 = team_1 or game_line.get("Team1ID") or ""
+            matchup_2 = team_2 or game_line.get("Team2ID") or ""
+            confirmed, message = self._confirm_bet_accepted(team_name, matchup_1, matchup_2, stake)
+            if not confirmed:
+                raise Exception(message or "Bet not accepted by bookmaker")
+
+            self.logger.info(f"Bet accepted by bookmaker: {message}")
             return True, stake
 
         except Exception as e:
@@ -1027,13 +1424,11 @@ class BetamapolaController:
         # Step 1: Login
         self.__login()
 
-        # Step 2: Go to sports SPA
-        self.logger.info(f"Navigating to sports: {self.sport_url}")
-        self.driver.get(self.sport_url)
-        time.sleep(3)
+        # Step 2: Load sport offering (same path as odds fetch / betting loop)
+        self.__ensure_sport_offering_loaded()
 
         # Step 3: Place Bet
-        self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+        self.__execute_bet(game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2)
 
         self.logger.info("==================== Place Bet (END) ====================")
 
@@ -1061,10 +1456,8 @@ class BetamapolaController:
                 # Step 1: Login (may raise if driver session is already gone)
                 self.__login()
 
-                # Step 2: Go to sports page
-                self.logger.info(f"Navigating to sports: {self.sport_url}")
-                self.driver.get(self.sport_url)
-                time.sleep(3)
+                # Step 2: Go to sports page and load MLB offering
+                self.__ensure_sport_offering_loaded()
 
                 setup_ok = True
                 break
@@ -1152,57 +1545,47 @@ class BetamapolaController:
                     self.logger.warning("Bookmaker mismatch, skipping arb")
                     continue
 
-                # Place Bet
-                bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+                book_1 = arb.get("team_1_bookmaker")
+                book_2 = arb.get("team_2_bookmaker")
+
+                if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                    self.logger.info(
+                        f"Skipping — leg already confirmed on {self.bookmaker} | "
+                        f"{team_name} | {team_1} vs {team_2}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
+                if self._has_existing_open_bet(team_name, team_1, team_2):
+                    self.logger.warning(
+                        f"Open bet already exists for {team_name} on {self.bookmaker}; "
+                        f"marking leg placed and stopping new arb scans"
+                    )
+                    self.cache.mark_leg_placed(self.bookmaker, "moneyline", game_id)
+                    self.cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
+                bet_placed, stake = self.__execute_bet(
+                    game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
+                )
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
-
-                    self.cache.remove_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline', game_id=game_id)
-
-                    alert = (
-                        f"===== Moneyline Bet =====\n"
-                        f"Sport: {sport}\n"
-                        f"League: {league}\n"
-                        f"Date: {game_date}\n"
-                        f"Match: {team_1} vs {team_2}\n"
-                        f"Bet Type: {bet_type}\n"
-                        f"Team No: {team_no}\n"
-                        f"Team: {team_name}\n"
-                        f"Bookmaker: {self.bookmaker}\n"
-                        f"Odds: {moneyline_odd}\n"
-                        f"Stake: {stake}\n"
+                    finalize_confirmed_bet(
+                        self.cache,
+                        self.storage,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        team_no,
+                        team_name,
+                        game_id,
+                        stake,
+                        moneyline_odd,
+                        TELEGRAM,
                     )
-
-                    self.logger.info("========== Alert ==========")
-                    self.logger.info(alert)
-                    self.logger.info("========== Alert ==========")
-
-                    asyncio.run(send_telegram_alert(alert, TELEGRAM['arbitrage']))
-
-                    bet_data = {
-                        "sport": sport,
-                        "league": league,
-                        "game_id": game_id,
-                        "game_datetime": game_date,
-                        "team_1": team_1,
-                        "team_2": team_2,
-                        "bookmaker": self.bookmaker,
-                        "bet_type": bet_type,
-                        "team_no": team_no,
-                        "team_name": team_name,
-                        "odds": moneyline_odd,
-                        "stake": stake
-                    }
-
-                    saved_bet = self.storage.save_bet(bet_data)
-                    if saved_bet:
-                        self.logger.info("DB - Bet Saved")
-                    else:
-                        self.logger.warning("DB - Bet Not Saved")
-
-                    self.logger.info("Refreshing page before next arbitrage")
-                    self.driver.refresh()
-                    time.sleep(3)
+                    self.logger.info("Re-establishing sport offering before next arbitrage")
+                    self.__ensure_sport_offering_loaded()
 
         # The main arbitrage/betting loop above runs until the process is terminated.
         # Explicit returns in the setup phase or unrecoverable errors will end here.
@@ -1212,9 +1595,16 @@ class BetamapolaController:
 # Quick self-test entrypoint (uses provided credentials)
 def main():
     from database.models.Accounts import Accounts
-    from utils.config import BETAMAPOLA
+    from utils.config import BETAMAPOLA, BETAMAPOLA_ACCOUNT, BETAMAPOLA_PASSWORD
 
-    account = Accounts(account='PC8396', password='SUN87', label='Reader-30K')
+    if not BETAMAPOLA_ACCOUNT or not BETAMAPOLA_PASSWORD:
+        raise ValueError("BETAMAPOLA_ACCOUNT and BETAMAPOLA_PASSWORD must be set in .env")
+
+    account = Accounts(
+        account=BETAMAPOLA_ACCOUNT,
+        password=BETAMAPOLA_PASSWORD,
+        label='Reader-30K',
+    )
     controller = BetamapolaController(account, BETAMAPOLA, sport="baseball")
     # Only fetch odds for testing (betting requires live arb cache)
     controller.fetch_odds()

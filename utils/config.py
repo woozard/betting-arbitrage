@@ -95,6 +95,10 @@ BETAMAPOLA = {
     'bookmaker': 'betamapola'
 }
 
+BETAMAPOLA_ACCOUNT = os.getenv('BETAMAPOLA_ACCOUNT')
+BETAMAPOLA_PASSWORD = os.getenv('BETAMAPOLA_PASSWORD')
+BETAMAPOLA_LABEL = os.getenv('BETAMAPOLA_LABEL', 'Bettor')
+
 PRADISEWAGER = {
     'website': 'paradisewager.com',
     'url': 'https://paradisewager.com',

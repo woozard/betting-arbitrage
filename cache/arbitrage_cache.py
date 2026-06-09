@@ -3,10 +3,11 @@ from utils.config import REDIS
 
 
 class ArbitrageCache:
-    def __init__(self, ttl=30, arb_ttl=180):
+    def __init__(self, ttl=30, arb_ttl=180, lock_ttl=86400):
         self.redis = RedisCache(REDIS['host'], REDIS['port'])
         self.ttl = ttl
         self.arb_ttl = arb_ttl
+        self.lock_ttl = lock_ttl
 
     # ---------------- Key format ----------------
     def _odd_key(self, row):
@@ -116,3 +117,56 @@ class ArbitrageCache:
     def remove_arbitrage(self, bookmaker, bet_type, game_id):
         key = self._arb_key(bookmaker, bet_type, game_id)
         self.redis.delete(key)
+
+    @staticmethod
+    def matchup_pair_key(team_1, team_2, book_1, book_2, game_date=None):
+        teams = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
+        books = tuple(sorted([(book_1 or "").strip().lower(), (book_2 or "").strip().lower()]))
+        date = str(game_date or "")[:10]
+        return f"{date}:{teams[0]}:{teams[1]}:{books[0]}:{books[1]}"
+
+    def _arb_scan_locked_key(self, pair_key):
+        return f"arb_scan_locked:{pair_key}"
+
+    def _leg_placed_key(self, bookmaker, bet_type, game_id):
+        return f"leg_placed:{bookmaker}:{bet_type}:{game_id}"
+
+    def _moneyline_alert_key(self, pair_key):
+        return f"moneyline_alert_sent:{pair_key}"
+
+    def is_arb_scan_locked(self, team_1, team_2, book_1, book_2, game_date=None):
+        """Stop surfacing NEW arb alerts for this event + bookmaker pair."""
+        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        return bool(self.redis.get(self._arb_scan_locked_key(pair_key)))
+
+    def lock_arb_scan(self, team_1, team_2, book_1, book_2, game_date=None):
+        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        self.redis.set(self._arb_scan_locked_key(pair_key), {"locked_at": "now"}, ttl=self.lock_ttl)
+
+    def is_leg_placed(self, bookmaker, bet_type, game_id):
+        """This bookmaker already has a confirmed leg for this game."""
+        return bool(self.redis.get(self._leg_placed_key(bookmaker, bet_type, game_id)))
+
+    def mark_leg_placed(self, bookmaker, bet_type, game_id):
+        self.redis.set(
+            self._leg_placed_key(bookmaker, bet_type, game_id),
+            {"placed_at": "now"},
+            ttl=self.lock_ttl,
+        )
+
+    def moneyline_alert_already_sent(self, team_1, team_2, book_1, book_2, game_date=None):
+        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        return bool(self.redis.get(self._moneyline_alert_key(pair_key)))
+
+    def mark_moneyline_alert_sent(self, team_1, team_2, book_1, book_2, game_date=None):
+        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        self.redis.set(self._moneyline_alert_key(pair_key), {"sent_at": "now"}, ttl=self.lock_ttl)
+
+    def remove_arbitrage_for_bookmaker(self, arb_data, bookmaker):
+        """Remove only the confirming bookmaker's cache entry; keep the other leg actionable."""
+        bet_type = arb_data.get("bet_type", "moneyline")
+        if bookmaker == arb_data.get("team_1_bookmaker"):
+            game_id = arb_data["team_1_game_id"]
+        else:
+            game_id = arb_data["team_2_game_id"]
+        self.remove_arbitrage(bookmaker, bet_type, game_id)
