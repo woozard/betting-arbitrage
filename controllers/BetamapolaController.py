@@ -17,7 +17,7 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
@@ -77,6 +77,23 @@ class BetamapolaController:
         self.dashboard_url = f"https://{self.website}/sports#/"
         self.sport_url = f"https://{self.website}/sports#/"
 
+        # Create BrightData-proxied Chrome (with retries + fresh temps). Extracted so
+        # _recover_driver can also use it for full re-initialization after crashes.
+        # We catch here so a flaky first creation does not kill the entry script before
+        # betting() (and its recovery loop) ever runs.
+        try:
+            self._create_driver()
+        except Exception as e:
+            self.logger.error(f"Initial driver creation failed in __init__ (betting() will retry with recovery): {e}")
+            self.driver = None
+            self.wait = None
+            self.user_data_dir = None
+            self.proxy_extension_dir = None
+
+    def _create_driver(self):
+        """Build ChromeOptions + BrightData MV2 proxy extension and launch webdriver.Chrome
+        with a 3-attempt retry. Used from __init__ and from _recover_driver.
+        """
         # === BrightData Proxy Extension (exact same as Sports411Controller) ===
         proxy_host = "brd.superproxy.io"
         proxy_port = 33335
@@ -100,7 +117,6 @@ class BetamapolaController:
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-accelerated-2d-canvas")
-        options.add_argument("--no-zygote")
         options.add_argument(f'--load-extension={self.proxy_extension_dir}')
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--disable-extensions-except=' + self.proxy_extension_dir)
@@ -115,8 +131,47 @@ class BetamapolaController:
         self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
         options.add_argument(f'--user-data-dir={self.user_data_dir}')
 
-        self.driver = webdriver.Chrome(options=options)
+        # Retry driver creation - Chrome + extension is flaky under systemd
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.driver = webdriver.Chrome(options=options)
+
+                # Smoke test: the webdriver object was returned but the actual browser
+                # process can die immediately (common with proxy extensions). Verify it responds.
+                try:
+                    _ = self.driver.current_url
+                except Exception as ve:
+                    self.logger.warning(f"Chrome created on attempt {attempt+1} but session is dead: {ve}")
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(5)
+                    continue
+
+                break
+            except Exception as e:
+                self.logger.warning(f"Chrome driver start attempt {attempt+1}/{max_retries} failed: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(5)
+
         self.wait = WebDriverWait(self.driver, 30)
+        time.sleep(2)  # brief stabilization
+
+    def _relogin_after_recovery(self) -> bool:
+        """After _recover_driver() has given us a brand-new Chrome instance (unlogged),
+        re-perform login and navigate to the target sport page so we are in a usable state.
+        Returns True if successful.
+        """
+        try:
+            self.__login()
+            self.logger.info(f"Navigating to sports after recovery: {self.sport_url}")
+            self.driver.get(self.sport_url)
+            time.sleep(5)
+            return True
+        except Exception as e:
+            self.logger.error(f"Re-login and navigation after driver recovery failed: {e}")
+            return False
 
     # === helper methods from Sports411Controller / Web5Controller ===
     def _create_proxy_extension(self, host: str, port: int, user: str, password: str) -> str:
@@ -692,6 +747,7 @@ class BetamapolaController:
             self.logger.error(f"Selenium fetch_odds failed: {e}", exc_info=True)
             self._safe_send_monitoring_alert(e)
         finally:
+            self._quit_driver()
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
 
     # --------------------------------------------------------
@@ -749,7 +805,23 @@ class BetamapolaController:
                             break
 
             if not moneyline_span:
-                raise Exception(f"Moneyline span not found for team '{team_name}' @ {moneyline_odd}")
+                self.logger.warning(f"Moneyline span not found on first pass for {team_name} @ {moneyline_odd}, refreshing and retrying")
+                self.driver.refresh()
+                time.sleep(3)
+                # Re-run the three strategies after refresh (simplified: just re-search broad)
+                all_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.text-black, span.ng-binding")
+                for cand in all_spans:
+                    if (cand.text or "").strip() == str(moneyline_odd):
+                        ctx = ""
+                        try:
+                            ctx = cand.find_element(By.XPATH, "./ancestor::*[contains(@class,'game') or contains(@class,'line')]").text.lower()
+                        except:
+                            pass
+                        if team_name.lower() in ctx:
+                            moneyline_span = cand
+                            break
+                if not moneyline_span:
+                    raise Exception(f"Moneyline span not found for team '{team_name}' @ {moneyline_odd}")
 
             self.logger.info(f"Moneyline span located: {moneyline_span.get_attribute('id')}")
 
@@ -840,10 +912,102 @@ class BetamapolaController:
 
         except Exception as e:
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
-            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM['arbitrage']))
+            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
             return False, stake
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
+
+    def _quit_driver(self):
+        """Safely terminate only this controller's WebDriver session."""
+        driver = getattr(self, "driver", None)
+        if not driver:
+            return
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        self.driver = None
+        self.wait = None
+
+    def _cleanup_owned_chrome(self):
+        """Kill only Chrome/chromedriver processes owned by this controller instance."""
+        import subprocess
+
+        owned_profile = getattr(self, "user_data_dir", None)
+        self._quit_driver()
+
+        if owned_profile:
+            try:
+                subprocess.run(
+                    ["pkill", "-f", owned_profile],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(1)
+            except Exception:
+                pass
+
+    def _cleanup_stale_temp_dirs(self, max_age_seconds: int = 3600):
+        """Remove old temp profile/extension dirs without killing live browser processes."""
+        import shutil
+        import glob
+
+        active_dirs = {
+            d for d in (
+                getattr(self, "user_data_dir", None),
+                getattr(self, "proxy_extension_dir", None),
+            )
+            if d
+        }
+
+        try:
+            now = time.time()
+            for pat in ("brightdata_proxy_*", "chrome_user_data_*"):
+                for d in glob.glob(os.path.join(PROJECT_TMP_DIR, pat)):
+                    if d in active_dirs:
+                        continue
+                    try:
+                        if now - os.path.getmtime(d) < max_age_seconds:
+                            continue
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _recover_driver(self):
+        """Attempt to recover from driver crash by killing processes, removing stale temps,
+        and creating a completely fresh driver + extension.
+        """
+        self.logger.info("Recovering from Chrome driver crash...")
+        owned_profile = getattr(self, "user_data_dir", None)
+        self._cleanup_owned_chrome()
+
+        # Remove this run's temp dirs (extension and user data) so the next create is clean
+        for attr in ('user_data_dir', 'proxy_extension_dir'):
+            d = getattr(self, attr, None)
+            if d and os.path.isdir(d):
+                try:
+                    import shutil
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+        if owned_profile:
+            try:
+                import subprocess
+                subprocess.run(
+                    ["pkill", "-f", owned_profile],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(1)
+            except Exception:
+                pass
+
+        # Fresh everything
+        self._create_driver()
 
     # --------------------------------------------------------
     # Place Bet
@@ -885,117 +1049,164 @@ class BetamapolaController:
 
         self.logger.info("==================== Betting (START) ====================")
 
-        try:
-            # Step 1: Login
-            self.__login()
+        # Clean only stale temp dirs; never pkill all Chrome (other jobs may be running).
+        self._cleanup_stale_temp_dirs()
 
-            # Step 2: Go to sports page
-            self.logger.info(f"Navigating to sports: {self.sport_url}")
-            self.driver.get(self.sport_url)
-            time.sleep(3)
+        # Initial driver is created in __init__, but under systemd + BrightData extension
+        # the session can be dead within seconds even if webdriver.Chrome() "succeeded".
+        # Wrap first login + nav in recovery retries so we don't lose the whole process.
+        setup_ok = False
+        for attempt in range(1, 6):
+            try:
+                # Step 1: Login (may raise if driver session is already gone)
+                self.__login()
 
-            while True:
-                time.sleep(2)
+                # Step 2: Go to sports page
+                self.logger.info(f"Navigating to sports: {self.sport_url}")
+                self.driver.get(self.sport_url)
+                time.sleep(3)
 
+                setup_ok = True
+                break
+            except Exception as e:
+                self.logger.error(f"Initial setup/login failed (attempt {attempt}/5): {e}")
+                self._recover_driver()
+                time.sleep(8)
+
+        if not setup_ok:
+            self.logger.error("Failed to establish a working browser session after recoveries.")
+            self.logger.info("==================== Betting (END) ====================")
+            return
+
+        consecutive_recoveries = 0
+        while True:
+            time.sleep(2)
+
+            try:
                 current_url = self.driver.current_url
-                if "/sports" not in current_url:
-                    error_msg = f"Terminating Process - Unexpected URL detected ({current_url})."
-                    self.logger.error(error_msg)
-                    raise Exception(error_msg)
+            except Exception as e:
+                self.logger.error(f"Driver error getting current URL: {e}. Attempting recovery...")
+                self._recover_driver()
+                consecutive_recoveries += 1
+                if consecutive_recoveries >= 3:
+                    backoff = min(60, 10 * consecutive_recoveries)
+                    self.logger.warning(f"Multiple recoveries ({consecutive_recoveries}). Backing off {backoff}s.")
+                    time.sleep(backoff)
+                    consecutive_recoveries = 0
+                if not self._relogin_after_recovery():
+                    time.sleep(8)
+                continue
 
-                arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
-                if not arbs:
-                    self.logger.info("Waiting for Arbitrage")
+            if "/sports" not in current_url:
+                self.logger.warning(f"Unexpected URL detected ({current_url}). Re-establishing session...")
+                self._recover_driver()
+                consecutive_recoveries += 1
+                if consecutive_recoveries >= 3:
+                    backoff = min(60, 10 * consecutive_recoveries)
+                    self.logger.warning(f"Multiple recoveries ({consecutive_recoveries}). Backing off {backoff}s.")
+                    time.sleep(backoff)
+                    consecutive_recoveries = 0
+                if not self._relogin_after_recovery():
+                    time.sleep(8)
+                continue
+
+            consecutive_recoveries = 0
+            arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
+            if not arbs:
+                self.logger.info("Waiting for Arbitrage")
+                continue
+
+            self.logger.info(f"Arbitrage opportunities: {len(arbs)}")
+
+            for arb in arbs:
+                sport = arb.get('sport')
+                league = arb.get('league')
+                game_date = arb.get('game_date')
+                game_datetime = arb.get('game_datetime')
+                bet_type = arb.get('bet_type')
+                team_1 = arb.get("team_1")
+                team_2 = arb.get("team_2")
+
+                if sport != self.sport_name or league != self.league:
                     continue
 
-                self.logger.info(f"Arbitrage opportunities: {len(arbs)}")
+                if not is_game_pregame(game_datetime):
+                    self.logger.info(
+                        f"Skipping arb (game started) | Match: {team_1} vs {team_2}"
+                    )
+                    continue
 
-                for arb in arbs:
-                    sport = arb.get('sport')
-                    league = arb.get('league')
-                    game_date = arb.get('game_date')
-                    bet_type = arb.get('bet_type')
-                    team_1 = arb.get("team_1")
-                    team_2 = arb.get("team_2")
+                self.logger.info(f"Arbitrage | Match: {team_1} vs {team_2}")
 
-                    self.logger.info(f"Arbitrage | Match: {team_1} vs {team_2}")
+                if arb.get("team_1_bookmaker") == self.bookmaker:
+                    team_no = 1
+                    game_id = arb.get("team_1_game_id")
+                    team_name = team_1
+                    moneyline_odd = arb.get("team_1_odds")
+                elif arb.get("team_2_bookmaker") == self.bookmaker:
+                    team_no = 2
+                    game_id = arb.get("team_2_game_id")
+                    team_name = team_2
+                    moneyline_odd = arb.get("team_2_odds")
+                else:
+                    self.logger.warning("Bookmaker mismatch, skipping arb")
+                    continue
 
-                    if arb.get("team_1_bookmaker") == self.bookmaker:
-                        team_no = 1
-                        game_id = arb.get("team_1_game_id")
-                        team_name = team_1
-                        moneyline_odd = arb.get("team_1_odds")
-                    elif arb.get("team_2_bookmaker") == self.bookmaker:
-                        team_no = 2
-                        game_id = arb.get("team_2_game_id")
-                        team_name = team_2
-                        moneyline_odd = arb.get("team_2_odds")
+                # Place Bet
+                bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+                if bet_placed:
+                    self.logger.info("Bet Placement Completed")
+
+                    self.cache.remove_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline', game_id=game_id)
+
+                    alert = (
+                        f"===== Moneyline Bet =====\n"
+                        f"Sport: {sport}\n"
+                        f"League: {league}\n"
+                        f"Date: {game_date}\n"
+                        f"Match: {team_1} vs {team_2}\n"
+                        f"Bet Type: {bet_type}\n"
+                        f"Team No: {team_no}\n"
+                        f"Team: {team_name}\n"
+                        f"Bookmaker: {self.bookmaker}\n"
+                        f"Odds: {moneyline_odd}\n"
+                        f"Stake: {stake}\n"
+                    )
+
+                    self.logger.info("========== Alert ==========")
+                    self.logger.info(alert)
+                    self.logger.info("========== Alert ==========")
+
+                    asyncio.run(send_telegram_alert(alert, TELEGRAM['arbitrage']))
+
+                    bet_data = {
+                        "sport": sport,
+                        "league": league,
+                        "game_id": game_id,
+                        "game_datetime": game_date,
+                        "team_1": team_1,
+                        "team_2": team_2,
+                        "bookmaker": self.bookmaker,
+                        "bet_type": bet_type,
+                        "team_no": team_no,
+                        "team_name": team_name,
+                        "odds": moneyline_odd,
+                        "stake": stake
+                    }
+
+                    saved_bet = self.storage.save_bet(bet_data)
+                    if saved_bet:
+                        self.logger.info("DB - Bet Saved")
                     else:
-                        self.logger.warning("Bookmaker mismatch, skipping arb")
-                        continue
+                        self.logger.warning("DB - Bet Not Saved")
 
-                    # Place Bet
-                    bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
-                    if bet_placed:
-                        self.logger.info("Bet Placement Completed")
+                    self.logger.info("Refreshing page before next arbitrage")
+                    self.driver.refresh()
+                    time.sleep(3)
 
-                        self.cache.remove_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline', game_id=game_id)
-
-                        alert = (
-                            f"===== Moneyline Bet =====\n"
-                            f"Sport: {sport}\n"
-                            f"League: {league}\n"
-                            f"Date: {game_date}\n"
-                            f"Match: {team_1} vs {team_2}\n"
-                            f"Bet Type: {bet_type}\n"
-                            f"Team No: {team_no}\n"
-                            f"Team: {team_name}\n"
-                            f"Bookmaker: {self.bookmaker}\n"
-                            f"Odds: {moneyline_odd}\n"
-                            f"Stake: {stake}\n"
-                        )
-
-                        self.logger.info("========== Alert ==========")
-                        self.logger.info(alert)
-                        self.logger.info("========== Alert ==========")
-
-                        asyncio.run(send_telegram_alert(alert, TELEGRAM['arbitrage']))
-
-                        bet_data = {
-                            "sport": sport,
-                            "league": league,
-                            "game_id": game_id,
-                            "game_datetime": game_date,
-                            "team_1": team_1,
-                            "team_2": team_2,
-                            "bookmaker": self.bookmaker,
-                            "bet_type": bet_type,
-                            "team_no": team_no,
-                            "team_name": team_name,
-                            "odds": moneyline_odd,
-                            "stake": stake
-                        }
-
-                        saved_bet = self.storage.save_bet(bet_data)
-                        if saved_bet:
-                            self.logger.info("DB - Bet Saved")
-                        else:
-                            self.logger.warning("DB - Bet Not Saved")
-
-                        self.logger.info("Refreshing page before next arbitrage")
-                        self.driver.refresh()
-                        time.sleep(3)
-
-        except Exception as e:
-            self.logger.error(f"Bet Place Failed: {e}", exc_info=True)
-            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM['arbitrage_monitoring']))
-            return None
-        finally:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.logger.info("==================== Betting (END) ====================")
+        # The main arbitrage/betting loop above runs until the process is terminated.
+        # Explicit returns in the setup phase or unrecoverable errors will end here.
+        self.logger.info("==================== Betting (END) ====================")
 
 
 # Quick self-test entrypoint (uses provided credentials)

@@ -28,6 +28,38 @@ def random_sleep(min_time=2, max_time=5):
     sleep_time = random.uniform(min_time, max_time)
     sleep(sleep_time)
 
+
+def parse_game_datetime(value):
+    """Parse game_datetime from str or datetime; returns naive UTC datetime or None."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    dt = datetime.strptime(text[:19], fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(pytz.UTC).replace(tzinfo=None)
+    return dt
+
+
+def is_game_pregame(game_datetime) -> bool:
+    """Return True when game_datetime is in the future (game has not started yet)."""
+    dt = parse_game_datetime(game_datetime)
+    if dt is None:
+        return False
+    return dt > datetime.utcnow()
+
 def run_async(coro):
     try:
         loop = asyncio.get_running_loop()
@@ -213,7 +245,7 @@ async def send_telegram_alert(alert, chat_id = None) -> None:
         bot = Bot(token=token)
         await bot.send_message(chat_id=chat_id, text=alert)
     except Exception as e:
-        print(f"Telegram alert failed (non-fatal): {e}")
+        print(f"Telegram alert failed (non-fatal) for chat_id={chat_id}: {e}")
 
 async def send_monitoring_alert(website, account, ex, chat_id = None) -> None:
     tracemalloc.start()
@@ -247,7 +279,7 @@ async def send_monitoring_alert(website, account, ex, chat_id = None) -> None:
         bot = Bot(token=token)
         await bot.send_message(chat_id=chat_id, text=alert)
     except Exception as e:
-        print(f"Telegram monitoring alert failed (non-fatal): {e}")
+        print(f"Telegram monitoring alert failed (non-fatal) for chat_id={chat_id}: {e}")
 
 
 async def send_testing_alert(alert, chat_id = None) -> None:
@@ -265,7 +297,68 @@ async def send_testing_alert(alert, chat_id = None) -> None:
         bot = Bot(token=token)
         await bot.send_message(chat_id=chat_id, text=alert)
     except Exception as e:
-        print(f"Telegram testing alert failed (non-fatal): {e}")
+        print(f"Telegram testing alert failed (non-fatal) for chat_id={chat_id}: {e}")
+
+
+async def discover_telegram_chats() -> None:
+    """Utility to discover chat IDs the bot can send to.
+
+    Consistent with colleague feedback: create a new group chat, add the bot
+    (kleyman_arb_bot) + the people who should receive arb alerts, send a test
+    message in the group, then run this to get the numeric chat ID (required for
+    groups; the bot must be a member).
+
+    Run with:
+        python -c '
+        import asyncio
+        from utils.helpers import discover_telegram_chats
+        asyncio.run(discover_telegram_chats())
+        '
+
+    Paste the printed Chat ID value into .env as TELEGRAM_CHAT_ARBITRAGE=-100...
+    (groups have large negative IDs). Then restart the service.
+
+    The bot created for this project is kleyman_arb_bot (token goes in TELEGRAM_BOT_TOKEN).
+
+    See TELEGRAM_SETUP.md (in the repo root) for the full tailored instructions, including the exact steps
+    after you received the BotFather token screenshot.
+    """
+    tracemalloc.start()
+    try:
+        from telegram import Bot
+        token = TELEGRAM.get('bot_token')
+        if not token:
+            print("No TELEGRAM_BOT_TOKEN - cannot discover chats")
+            return
+        bot = Bot(token=token)
+        updates = await bot.get_updates(limit=100, timeout=5)
+        if not updates:
+            print("No recent updates seen by the bot.")
+            print("Steps:")
+            print("  1. Create the Telegram group (or use existing).")
+            print("  2. Add the bot by searching for its username: kleyman_arb_bot")
+            print("  3. Add the recipient(s) to the group.")
+            print("  4. Post a message in the group from one of the members.")
+            print("  5. Re-run this discover function.")
+            return
+        seen = {}
+        for update in updates:
+            if update.message and update.message.chat:
+                chat = update.message.chat
+                cid = chat.id
+                if cid not in seen:
+                    seen[cid] = True
+                    name = chat.title or chat.username or (f"{chat.first_name or ''} {chat.last_name or ''}".strip()) or "unnamed"
+                    print(f"Chat ID: {cid}")
+                    print(f"  Type: {chat.type}")
+                    print(f"  Name/Title: {name}")
+                    print(f"  Suggested .env line: TELEGRAM_CHAT_ARBITRAGE={cid}")
+                    print()
+        if not seen:
+            print("No chats with messages found in updates.")
+    except Exception as e:
+        print(f"discover_telegram_chats failed (non-fatal): {e}")
+
 
 # -----------------------------------
 # Numbers

@@ -3,9 +3,10 @@ from utils.config import REDIS
 
 
 class ArbitrageCache:
-    def __init__(self, ttl=30):
+    def __init__(self, ttl=30, arb_ttl=180):
         self.redis = RedisCache(REDIS['host'], REDIS['port'])
         self.ttl = ttl
+        self.arb_ttl = arb_ttl
 
     # ---------------- Key format ----------------
     def _odd_key(self, row):
@@ -92,7 +93,7 @@ class ArbitrageCache:
         key = self._arb_key(bookmaker, bet_type, game_id)
 
         # ✅ No json.dumps
-        self.redis.set(key, arb_data, ttl=self.ttl)
+        self.redis.set(key, arb_data, ttl=self.arb_ttl)
 
     def get_arbitrage(self, bookmaker=None, bet_type=None, game_id=None):
         b = bookmaker or "*"

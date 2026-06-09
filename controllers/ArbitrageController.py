@@ -11,12 +11,16 @@ from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
 from utils.config import TELEGRAM
 from utils.logger import Logger
-from utils.helpers import send_telegram_alert, send_testing_alert, send_monitoring_alert
+from utils.helpers import send_telegram_alert, send_testing_alert, send_monitoring_alert, is_game_pregame, parse_game_datetime
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
 
 class ArbitrageController:
+    # Flag arbs up to 1% vig (colleague request: include -1% "close" opportunities)
+    ARB_THRESHOLD = Decimal("1.01")
+    CLOSE_LOG_THRESHOLD = Decimal("1.03")
+
     def __init__(self):
         # DB
         self.db: Session = __get_db1_session__()
@@ -156,7 +160,7 @@ class ArbitrageController:
                                         "book_2": o2["bookmaker"],
                                         "odds_2": o2["moneyline_team_2"],
                                     }
-                                if arb_total < 1:
+                                if arb_total < self.ARB_THRESHOLD:
                                     arb_found += 1
                                     self.__insert_arbitrage(o1, o2, "o1", "o2", arb_total)
 
@@ -175,7 +179,7 @@ class ArbitrageController:
                                         "book_2": o1["bookmaker"],
                                         "odds_2": o1["moneyline_team_2"],
                                     }
-                                if arb_total < 1:
+                                if arb_total < self.ARB_THRESHOLD:
                                     arb_found += 1
                                     self.__insert_arbitrage(o1, o2, "o2", "o1", arb_total)
 
@@ -184,9 +188,12 @@ class ArbitrageController:
                     msg += f" (closest total prob: {float(best_arb):.4f})"
                 self.logger.info(msg)
 
-                # Log details for close (but not yet arb) opportunities so we can see the actual lines
-                CLOSE_THRESHOLD = 1.03
-                if best_arb is not None and best_arb < CLOSE_THRESHOLD and best_match is not None:
+                # Log near-miss opportunities between the arb threshold and the wider close band
+                if (
+                    best_arb is not None
+                    and self.ARB_THRESHOLD <= best_arb < self.CLOSE_LOG_THRESHOLD
+                    and best_match is not None
+                ):
                     self.logger.info("========== Close Arb Opportunity (START) ==========")
                     self.logger.info(
                         f"Match: {best_match['team_1']} vs {best_match['team_2']} | Total Prob: {float(best_arb):.4f}"
@@ -213,22 +220,70 @@ class ArbitrageController:
     # --------------------------------------------------------
     # Save Arbitrage
     # --------------------------------------------------------
+    def __resolve_sides(self, o1, o2, t1_from, t2_from):
+        t1 = o1 if t1_from == "o1" else o2
+        t2 = o1 if t2_from == "o1" else o2
+        return t1, t2
+
+    def __build_arb_data(self, o1, o2, t1_from, t2_from, arb_total):
+        t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
+        game_dt = parse_game_datetime(o1.get("game_datetime"))
+        game_date = game_dt.date() if game_dt else datetime.utcnow().date()
+
+        return {
+            "sport": o1["sport"],
+            "league": o1["league"],
+            "game_date": str(game_date),
+            "game_datetime": game_dt.strftime("%Y-%m-%d %H:%M:%S") if game_dt else None,
+
+            "team_1": o1["team_1"],
+            "team_1_bookmaker": t1["bookmaker"],
+            "team_1_game_id": t1["game_id"],
+            "team_1_odds": float(t1["moneyline_team_1"]),
+
+            "team_2": o1["team_2"],
+            "team_2_bookmaker": t2["bookmaker"],
+            "team_2_game_id": t2["game_id"],
+            "team_2_odds": float(t2["moneyline_team_2"]),
+
+            "bet_type": "moneyline",
+            "arb_total_prob": float(arb_total),
+            "profit_pct": float(round((Decimal(1) - arb_total) * 100, 2)),
+            "read": False
+        }
+
+    def __store_arbitrage_cache(self, arb_data):
+        self.cache.add_arbitrage(
+            arb_data["team_1_bookmaker"], "moneyline", arb_data["team_1_game_id"], arb_data
+        )
+        self.cache.add_arbitrage(
+            arb_data["team_2_bookmaker"], "moneyline", arb_data["team_2_game_id"], arb_data
+        )
+
     def __insert_arbitrage(self, new_odds, existing, t1_from, t2_from, arb_total):
+        o1 = new_odds
+        o2 = existing
+        t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
+
+        if not is_game_pregame(o1.get("game_datetime")) or not is_game_pregame(o2.get("game_datetime")):
+            self.logger.info(
+                f"Skipping arb (game started or unknown start time) - "
+                f"{o1['team_1']} vs {o1['team_2']}"
+            )
+            return None
+
+        arb_data = self.__build_arb_data(o1, o2, t1_from, t2_from, arb_total)
+
         try:
-            o1 = new_odds
-            o2 = existing
-
-            t1 = o1 if t1_from == "o1" else o2
-            t2 = o1 if t2_from == "o1" else o2
-
             t1_odds = Decimal(t1["moneyline_team_1"])
             t2_odds = Decimal(t2["moneyline_team_2"])
             profit_pct = round((Decimal(1) - arb_total) * 100, 2)
-            # ---------------- DB ----------------
+            game_dt = parse_game_datetime(o1.get("game_datetime"))
+
             arb = Arbitrage(
                 sport=o1["sport"],
                 league=o1["league"],
-                game_date=datetime.fromisoformat(o1["game_datetime"]).date(),
+                game_date=game_dt.date() if game_dt else datetime.utcnow().date(),
 
                 team_1=o1["team_1"],
                 team_2=o1["team_2"],
@@ -256,19 +311,19 @@ class ArbitrageController:
                 f"{o1['team_1']} vs {o1['team_2']}" 
             )
 
-            # DB Insert Completed - Cache + Alert
-            self.__cache_arbitrage(arb, t1, t2, o1)
+            self.__store_arbitrage_cache(arb_data)
             self.__send_alert(arb)
 
             return arb
 
         except IntegrityError:
             self.logger.warning(
-                f"DB - Arbitrage Not Saved - "
+                f"DB - Arbitrage Not Saved (duplicate) - refreshing cache - "
                 f"{t1['bookmaker']} vs {t2['bookmaker']} - "
                 f"{o1['team_1']} vs {o1['team_2']}"  
             )
             self.db.rollback()
+            self.__store_arbitrage_cache(arb_data)
             return None
 
     # --------------------------------------------------------
@@ -279,6 +334,7 @@ class ArbitrageController:
             "sport": arb.sport,
             "league": arb.league,
             "game_date": str(arb.game_date),
+            "game_datetime": o1.get("game_datetime"),
 
             "team_1": arb.team_1,
             "team_1_bookmaker": arb.team_1_bookmaker,
@@ -296,12 +352,7 @@ class ArbitrageController:
             "read": False
         }
 
-        # store in cache
-        # self.cache.add_arbitrage(t1["bookmaker"], "moneyline", o1["game_id"], arb_data)
-        # self.cache.add_arbitrage(t2["bookmaker"], "moneyline", o1["game_id"], arb_data)
-
-        self.cache.add_arbitrage(arb.team_1_bookmaker, "moneyline", arb.team_1_game_id, arb_data)
-        self.cache.add_arbitrage(arb.team_2_bookmaker, "moneyline", arb.team_2_game_id, arb_data)
+        self.__store_arbitrage_cache(arb_data)
 
     # --------------------------------------------------------
     # Send Alert
@@ -337,7 +388,7 @@ class ArbitrageController:
         except Exception as e:
             self.db.rollback()
             self.logger.error("Arbitrage Alerts Failed", exc_info=True)
-            asyncio.run(send_monitoring_alert("arbitrage-alerts", "system", e, TELEGRAM['arbitrage']))
+            asyncio.run(send_monitoring_alert("arbitrage-alerts", "system", e, TELEGRAM.get('arbitrage_monitoring')))
 
         finally:
             self.logger.info("========== Arbitrage - Send Alerts (END) ==========")
