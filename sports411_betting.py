@@ -19,7 +19,7 @@ def run_betting(sport: str):
 
 
 def main():
-    sports = ["baseball", "basketball"]
+    sports = ["baseball"]
     processes = []
 
     for sport in sports:

@@ -278,12 +278,16 @@ class Sports411Controller:
 
             self.logger.info("Opening Login Page")
             self.driver.get(self.login_url)
-            time.sleep(8)
+            self._wait_for_login_page_or_sports()
 
             login_debug = debug_filepath("debug_login_sports411")
             with open(login_debug, "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
             self.logger.info(f"💾 Saved {login_debug}")
+
+            if self._is_already_logged_in():
+                self.logger.info("Already logged in; skipping credential entry")
+                return True
 
             # Hard block detection
             page_source_lower = self.driver.page_source.lower()
@@ -604,20 +608,242 @@ class Sports411Controller:
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
     # END CHANGE
 
+    def _wait_for_login_page_or_sports(self, timeout=15):
+        def ready(driver):
+            url = (driver.current_url or "").lower()
+            if f"be.{self.website}" in url and "/en/sports/" in url:
+                return True
+            account_fields = driver.find_elements(By.ID, "account")
+            return bool(account_fields) and account_fields[0].is_displayed()
+
+        WebDriverWait(self.driver, timeout).until(ready)
+
+    def _is_already_logged_in(self) -> bool:
+        try:
+            url = (self.driver.current_url or "").lower()
+            if f"be.{self.website}" not in url or "/en/sports/" not in url:
+                return False
+            account_fields = self.driver.find_elements(By.ID, "account")
+            return not account_fields or not account_fields[0].is_displayed()
+        except Exception:
+            return False
+
+    def _sport_games_present(self) -> bool:
+        try:
+            return bool(
+                self.driver.find_elements(By.CSS_SELECTOR, "div.sports-league-game")
+            )
+        except Exception:
+            return False
+
+    def _wait_for_sport_games_loaded(self, timeout=15):
+        WebDriverWait(self.driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.sports-league-game"))
+        )
+
+    def _is_session_valid(self) -> bool:
+        try:
+            url = (self.driver.current_url or "").lower()
+            if f"be.{self.website}" not in url:
+                return False
+            if "/en/sports/" not in url and "/en/account/" not in url:
+                return False
+            account_fields = self.driver.find_elements(By.ID, "account")
+            return not account_fields or not account_fields[0].is_displayed()
+        except Exception:
+            return False
+
+    def _is_on_sport_page_with_games(self) -> bool:
+        try:
+            if self.game_lines_path not in (self.driver.current_url or ""):
+                return False
+            return self._sport_games_present()
+        except Exception:
+            return False
+
+    def _return_to_sport_page(self):
+        try:
+            if (
+                self.game_lines_path in (self.driver.current_url or "")
+                and self._sport_games_present()
+            ):
+                return
+            self.driver.get(self.sport_url)
+            self._wait_for_sport_games_loaded()
+        except Exception as e:
+            self.logger.warning(f"Could not return to {self.sport_name} page: {e}")
+
+    def _is_off_sport_page(self, url: str) -> bool:
+        return self.game_lines_path not in (url or "")
+
+    def _should_soft_navigate_back(self, url: str) -> bool:
+        url_l = (url or "").lower()
+        return any(
+            marker in url_l
+            for marker in ("/account/pending", "/account/", "/logout", "/en/sports/")
+        ) and self.game_lines_path not in url_l
+
     def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
         try:
             pending_url = f"https://be.{self.website}/en/account/pending"
             self.driver.get(pending_url)
             time.sleep(2)
             page = self.driver.page_source.lower()
-            return (
-                team_name.lower() in page
+            team_l = team_name.lower()
+            teams_present = (
+                team_l in page
                 and team_1.lower() in page
                 and team_2.lower() in page
             )
+            if not teams_present:
+                return False
+            wager_context = any(
+                marker in page
+                for marker in (
+                    "risk:", "to win:", "pending wager", "open bet",
+                    "wager #", "ticket #", "straight bet",
+                )
+            )
+            return wager_context
         except Exception as e:
             self.logger.warning(f"Could not check existing open bets: {e}")
             return False
+        finally:
+            self._return_to_sport_page()
+
+    def _refresh_session_before_wager(self):
+        if self._is_session_valid() and self._is_on_sport_page_with_games():
+            self.logger.info(
+                "Session valid on sport page with games loaded; skipping login refresh"
+            )
+            return
+
+        if self._is_session_valid():
+            self.logger.info("Session valid but off sport page; navigating to sport page only")
+            self._return_to_sport_page()
+            return
+
+        self.logger.info("Session invalid; performing full login before wager placement")
+        self.__login()
+        self._return_to_sport_page()
+
+    def _install_wager_network_hook(self):
+        self.driver.execute_script("""
+            window.__wagerResponses = [];
+            if (window.__wagerHookInstalled) return;
+            window.__wagerHookInstalled = true;
+            const capture = (url, body) => {
+                if (!url) return;
+                const u = String(url).toLowerCase();
+                if (u.includes('wager') || u.includes('bet') || u.includes('ticket')
+                    || u.includes('place') || u.includes('pending')) {
+                    window.__wagerResponses.push({url: String(url), body: String(body || '').slice(0, 4000)});
+                }
+            };
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {
+                const reqUrl = args[0];
+                return origFetch.apply(this, args).then(resp => {
+                    resp.clone().text().then(t => capture(reqUrl, t)).catch(() => {});
+                    return resp;
+                });
+            };
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this.__arbUrl = url;
+                return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(...args) {
+                this.addEventListener('load', function() {
+                    capture(this.__arbUrl, this.responseText);
+                });
+                return origSend.apply(this, args);
+            };
+        """)
+
+    def _get_wager_network_log(self):
+        try:
+            return self.driver.execute_script("return window.__wagerResponses || []") or []
+        except Exception:
+            return []
+
+    def _scan_rejection_ui(self):
+        reject_markers = (
+            "rejected", "not accepted", "line changed", "line has changed",
+            "odds changed", "limit exceeded", "maximum bet", "minimum bet",
+            "insufficient funds", "insufficient balance", "session expired",
+            "logged out", "please log in", "unable to place", "wager declined",
+        )
+        try:
+            for overlay in self.driver.find_elements(By.CSS_SELECTOR, ".alert-overlay"):
+                try:
+                    message = overlay.find_element(By.CSS_SELECTOR, ".alert-message").text.strip()
+                except Exception:
+                    message = (overlay.text or "").strip()
+                if not message:
+                    continue
+                classes = ""
+                try:
+                    classes = overlay.find_element(By.CSS_SELECTOR, ".AlertComponent").get_attribute("class") or ""
+                except Exception:
+                    pass
+                msg_l = message.lower()
+                if "confirm-alert" not in classes or any(m in msg_l for m in reject_markers):
+                    try:
+                        ok_btn = overlay.find_element(By.CSS_SELECTOR, "button.okBtn")
+                        self.driver.execute_script("arguments[0].click();", ok_btn)
+                    except Exception:
+                        pass
+                    return True, message
+        except Exception:
+            pass
+
+        try:
+            page_l = (self.driver.page_source or "").lower()
+            for marker in reject_markers:
+                if marker in page_l:
+                    return True, f"Rejection marker on page: {marker}"
+        except Exception:
+            pass
+        return False, ""
+
+    def _accept_line_changes(self):
+        accepted = False
+        try:
+            accept_all = self.driver.find_element(By.ID, "accept_all")
+            if not accept_all.is_selected():
+                self.driver.execute_script("arguments[0].click();", accept_all)
+                accepted = True
+        except Exception:
+            pass
+
+        for selector in (
+            "input[id*='accept']",
+            "label[for='accept_all']",
+            ".accept-changes input[type='checkbox']",
+        ):
+            try:
+                for elem in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                    if elem.tag_name.lower() == "input" and not elem.is_selected():
+                        self.driver.execute_script("arguments[0].click();", elem)
+                        accepted = True
+            except Exception:
+                continue
+
+        for btn in self.driver.find_elements(By.CSS_SELECTOR, "button, a"):
+            try:
+                text = (btn.text or "").strip().lower()
+                if text in ("accept", "accept changes", "ok", "continue"):
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    accepted = True
+                    time.sleep(0.5)
+            except Exception:
+                continue
+
+        if accepted:
+            self.logger.info("Accepted line changes / odds update prompts")
+        return accepted
 
     def _verify_open_bet_on_pending(self, team_name: str, stake: float):
         try:
@@ -635,38 +861,62 @@ class Sports411Controller:
             )
             if stake_hits:
                 return True, "Open bet found on pending page"
-            return True, "Open bet found on pending page (team match)"
+            return False, "Team found on pending page but stake not verified"
         except Exception as e:
             return False, f"Could not verify open bet: {e}"
+        finally:
+            self._return_to_sport_page()
 
-    def _confirm_bet_accepted(self, team_name: str, stake: float, timeout: int = 10):
-        try:
-            alert_overlay = WebDriverWait(self.driver, timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".alert-overlay"))
-            )
-            alert_message = alert_overlay.find_element(
-                By.CSS_SELECTOR, ".alert-message"
-            ).text.strip()
-            alert_classes = alert_overlay.find_element(
-                By.CSS_SELECTOR, ".AlertComponent"
-            ).get_attribute("class") or ""
+    def _confirm_bet_accepted(self, team_name: str, stake: float, timeout: int = 25):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rejected, reject_msg = self._scan_rejection_ui()
+            if rejected:
+                self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
+                return False, reject_msg or "Bet rejected"
 
-            try:
-                ok_btn = alert_overlay.find_element(By.CSS_SELECTOR, "button.okBtn")
-                self.driver.execute_script("arguments[0].click();", ok_btn)
-            except Exception:
-                pass
+            for overlay in self.driver.find_elements(By.CSS_SELECTOR, ".alert-overlay"):
+                try:
+                    alert_message = overlay.find_element(By.CSS_SELECTOR, ".alert-message").text.strip()
+                    alert_classes = overlay.find_element(
+                        By.CSS_SELECTOR, ".AlertComponent"
+                    ).get_attribute("class") or ""
+                    try:
+                        ok_btn = overlay.find_element(By.CSS_SELECTOR, "button.okBtn")
+                        self.driver.execute_script("arguments[0].click();", ok_btn)
+                    except Exception:
+                        pass
+                    if "confirm-alert" in alert_classes:
+                        self.logger.info(f"Bet confirmed by alert: {alert_message}")
+                        return True, alert_message or "Bet confirmed"
+                    self.logger.error(f"Bet rejected by bookmaker alert: {alert_message}")
+                    return False, alert_message or "Bet rejected"
+                except Exception:
+                    continue
 
-            if "confirm-alert" not in alert_classes:
-                self.logger.error(f"Bet rejected by bookmaker alert: {alert_message}")
-                return False, alert_message or "Bet rejected"
+            for entry in self._get_wager_network_log():
+                body_l = (entry.get("body") or "").lower()
+                url = entry.get("url") or ""
+                if any(m in body_l for m in ("rejected", "declined", "error", "failed")):
+                    self.logger.error(f"Wager API rejection ({url}): {entry.get('body', '')[:500]}")
+                    return False, f"Wager API rejected: {url}"
+                if any(m in body_l for m in ("accepted", "confirmed", "success", "ticket")):
+                    self.logger.info(f"Wager API success ({url}): {entry.get('body', '')[:300]}")
+                    return True, "Wager API confirmed"
 
             time.sleep(1)
-            self.logger.info(f"Bet confirmed by alert: {alert_message}")
-            return True, alert_message or "Bet confirmed"
-        except TimeoutException:
-            self.logger.warning("No confirmation alert after Place Bet; checking pending wagers")
-            return self._verify_open_bet_on_pending(team_name, stake)
+
+        self.logger.warning(
+            f"No confirmation alert within {timeout}s; checking pending wagers with retries"
+        )
+        for attempt in range(1, 4):
+            confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
+            if confirmed:
+                return True, message
+            if attempt < 3:
+                self.logger.warning(f"Pending check attempt {attempt}/3 failed; retrying in 5s")
+                time.sleep(5)
+        return False, message
 
     # Execute Bet
     # --------------------------------------------------------
@@ -685,6 +935,12 @@ class Sports411Controller:
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
             )
 
+            self._refresh_session_before_wager()
+
+            if self._is_off_sport_page(self.driver.current_url):
+                self.logger.info(f"Navigating to {self.sport_name} page before bet placement")
+                self._return_to_sport_page()
+
             # -----------------------------------
             # FIND GAME CONTAINER
             # -----------------------------------
@@ -696,9 +952,10 @@ class Sports411Controller:
                     )
                 )
             except TimeoutException:
-                self.logger.warning(f"Game container not found for {game_id}, refreshing page and retrying once")
-                self.driver.refresh()
-                time.sleep(3)
+                self.logger.warning(
+                    f"Game container not found for {game_id}, reloading {self.sport_name} page and retrying once"
+                )
+                self._return_to_sport_page()
                 try:
                     game_container = self.wait.until(
                         EC.presence_of_element_located(
@@ -831,16 +1088,7 @@ class Sports411Controller:
             stake_input.send_keys(f"{stake:.2f}")
             self.logger.info(f"Stake entered: {stake:.2f}")
 
-            # -----------------------------------
-            # ACCEPT LINE CHANGES
-            # -----------------------------------
-            try:
-                accept_all = self.driver.find_element(By.ID, "accept_all")
-                if not accept_all.is_selected():
-                    self.driver.execute_script("arguments[0].click();", accept_all)
-                    self.logger.info("Accepted line changes")
-            except Exception:
-                self.logger.warning("Accept line changes option not available")
+            self._accept_line_changes()
 
             # -----------------------------------
             # WAIT UNTIL PLACE BET ENABLED
@@ -851,8 +1099,15 @@ class Sports411Controller:
                 )
             )
 
+            self._install_wager_network_hook()
+            self._accept_line_changes()
             self.driver.execute_script("arguments[0].click();", place_bet_btn)
             self.logger.info("Place Bet button clicked")
+            network_log = self._get_wager_network_log()
+            if network_log:
+                self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
+            else:
+                self.logger.warning("No wager network activity detected immediately after Place Bet click")
 
             confirmed, message = self._confirm_bet_accepted(team_name, stake)
             if not confirmed:
@@ -998,10 +1253,10 @@ class Sports411Controller:
         stake: float = 1.0
     ):
         # Logger & Storage
-        self.logger = Logger.get_logger(f"{self.bookmaker}-betting")
+        self.logger = Logger.get_logger(f"{self.bookmaker}-betting-{self.sport_name.lower()}")
         self.storage = Storage(self.logger)
 
-        self.logger.info("==================== Betting (START) ====================")
+        self.logger.info(f"==================== Betting ({self.sport_name}) (START) ====================")
 
         # Clean only stale temp dirs; never pkill all Chrome (other jobs may be running).
         self._cleanup_stale_temp_dirs()
@@ -1055,7 +1310,13 @@ class Sports411Controller:
             # The site often redirects to the parent /sports page (be.sports411.ag/) or www root
             # after login, idle periods, or page interactions. Use a tolerant path check instead of
             # exact startswith on the long URL.
-            if self.game_lines_path not in current_url:
+            if self._is_off_sport_page(current_url):
+                if self._should_soft_navigate_back(current_url):
+                    self.logger.warning(
+                        f"Off {self.sport_name} page ({current_url}); navigating back without driver reset"
+                    )
+                    self._return_to_sport_page()
+                    continue
                 self.logger.warning(f"Unexpected URL detected ({current_url}). Re-establishing session...")
                 self._recover_driver()
                 consecutive_recoveries += 1
@@ -1070,13 +1331,17 @@ class Sports411Controller:
 
             consecutive_recoveries = 0
             arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
-            if not arbs:
+            matching_arbs = [
+                arb for arb in arbs
+                if arb.get("sport") == self.sport_name and arb.get("league") == self.league
+            ]
+            if not matching_arbs:
                 self.logger.info("Waiting for Arbitrage")
                 continue
-            
-            self.logger.info(f"Arbitrage: {len(arbs)}")
 
-            for arb in arbs:
+            self.logger.info(f"Arbitrage: {len(matching_arbs)}")
+
+            for arb in matching_arbs:
 
                 sport = arb.get('sport')
                 league = arb.get('league')
@@ -1085,9 +1350,6 @@ class Sports411Controller:
                 bet_type = arb.get('bet_type')
                 team_1 = arb.get("team_1")
                 team_2 = arb.get("team_2")
-
-                if sport != self.sport_name or league != self.league:
-                    continue
 
                 if not is_game_pregame(game_datetime):
                     self.logger.info(
@@ -1128,12 +1390,9 @@ class Sports411Controller:
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
-                        f"Open bet already exists for {team_name} on {self.bookmaker}; "
-                        f"marking leg placed and stopping new arb scans"
+                        f"Open wager detected on pending page for {team_name} on {self.bookmaker}; "
+                        f"skipping duplicate placement (arb scan lock requires bookmaker confirmation)"
                     )
-                    self.cache.mark_leg_placed(self.bookmaker, "moneyline", game_id)
-                    self.cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
-                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
                 bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
