@@ -451,6 +451,52 @@ class BetamapolaController:
             time.sleep(0.5)
         return None
 
+    def _betslip_text(self) -> str:
+        try:
+            return (self.driver.find_element(By.ID, "betSlipDiv").text or "").strip()
+        except Exception:
+            return ""
+
+    def _betslip_has_team(self, team_name: str) -> bool:
+        slip = self._betslip_text().lower()
+        if not slip or "bet slip is empty" in slip:
+            return False
+        return team_name.lower() in slip
+
+    def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._betslip_has_team(team_name):
+                return True
+            time.sleep(0.4)
+        return False
+
+    def _add_moneyline_to_slip(
+        self, game_line: dict, team_no: int, team_name: str,
+        moneyline_elem=None,
+    ) -> bool:
+        """Click DOM and/or Angular until the bet slip actually contains the team."""
+        game_num = game_line.get("GameNum")
+
+        if moneyline_elem:
+            self.logger.info(f"Moneyline element located: {moneyline_elem.get_attribute('id')}")
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", moneyline_elem)
+            time.sleep(0.4)
+            self.driver.execute_script("arguments[0].click();", moneyline_elem)
+            self.logger.info("Moneyline element clicked")
+            if self._wait_for_betslip_team(team_name, timeout=4):
+                return True
+            self.logger.warning(
+                f"DOM click on M{team_no}_{game_num}_0 did not populate bet slip; trying Angular"
+            )
+
+        if self._click_moneyline_via_angular(game_line, team_no):
+            if self._wait_for_betslip_team(team_name, timeout=6):
+                return True
+            self.logger.warning("Angular GameLineAction did not populate bet slip")
+
+        return False
+
     def _click_moneyline_via_angular(self, game_line: dict, team_no: int) -> bool:
         """Add moneyline pick via Angular GameLineAction when DOM buttons are not clickable yet."""
         try:
@@ -1100,61 +1146,174 @@ class BetamapolaController:
             self.logger.warning(f"GetWagerPicks failed: {e}")
             return []
 
-    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
-        team_l = team_name.lower()
-        for pick in self._fetch_open_wagers_via_api():
-            text = json.dumps(pick).lower()
-            if team_l in text and team_1.lower() in text and team_2.lower() in text:
-                return True
-        try:
-            body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
-            return team_l in body and team_1.lower() in body and team_2.lower() in body
-        except Exception:
+    @staticmethod
+    def _pick_looks_like_open_wager(pick) -> bool:
+        if not isinstance(pick, dict):
             return False
-
-    def _confirm_bet_accepted(self, team_name: str, team_1: str, team_2: str, stake: float):
-        time.sleep(2)
-        page = (self.driver.page_source or "").lower()
-        reject_markers = (
-            "rejected", "not accepted", "insufficient funds", "insufficient balance",
-            "failed to place", "wager declined", "unable to place",
+        text = json.dumps(pick).lower()
+        wager_markers = (
+            "amount", "risk", "towin", "wageramount", "wageramt", "pickamount",
+            "ticketnumber", "wagernumber", "confirmation", "pickid", "wagerstatus",
         )
-        for marker in reject_markers:
-            if marker in page:
-                return False, f"Bet rejected ({marker})"
+        return any(marker in text for marker in wager_markers)
 
+    def _pick_matches_open_wager(self, pick, team_name: str, team_1: str, team_2: str) -> bool:
+        if not self._pick_looks_like_open_wager(pick):
+            return False
+        text = json.dumps(pick).lower()
+        return (
+            team_name.lower() in text
+            and team_1.lower() in text
+            and team_2.lower() in text
+        )
+
+    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
+        for pick in self._fetch_open_wagers_via_api():
+            if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
+                return True
+        return False
+
+    def _refresh_session_before_wager(self):
+        self.logger.info("Refreshing login session before wager placement")
+        self.__login()
+        self.__ensure_sport_offering_loaded()
+
+    def _install_wager_network_hook(self):
+        self.driver.execute_script("""
+            window.__wagerResponses = [];
+            if (window.__wagerHookInstalled) return;
+            window.__wagerHookInstalled = true;
+            const capture = (url, body) => {
+                if (!url) return;
+                const u = String(url).toLowerCase();
+                if (u.includes('wager') || u.includes('bet') || u.includes('ticket')
+                    || u.includes('process') || u.includes('pick')) {
+                    window.__wagerResponses.push({url: String(url), body: String(body || '').slice(0, 4000)});
+                }
+            };
+            const origFetch = window.fetch;
+            window.fetch = function(...args) {
+                const reqUrl = args[0];
+                return origFetch.apply(this, args).then(resp => {
+                    resp.clone().text().then(t => capture(reqUrl, t)).catch(() => {});
+                    return resp;
+                });
+            };
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                this.__arbUrl = url;
+                return origOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(...args) {
+                this.addEventListener('load', function() {
+                    capture(this.__arbUrl, this.responseText);
+                });
+                return origSend.apply(this, args);
+            };
+        """)
+
+    def _get_wager_network_log(self):
+        try:
+            return self.driver.execute_script("return window.__wagerResponses || []") or []
+        except Exception:
+            return []
+
+    def _scan_rejection_ui(self):
+        reject_markers = (
+            "error", "rejected", "not accepted", "another user has taken",
+            "insufficient funds", "insufficient balance", "failed to place",
+            "wager declined", "unable to place", "line changed", "odds changed",
+            "session expired", "logged out",
+        )
+        try:
+            slip = self._betslip_text().lower()
+            for marker in reject_markers:
+                if marker in slip:
+                    return True, f"Bet slip rejection: {self._betslip_text()[:300]}"
+        except Exception:
+            pass
+
+        try:
+            page_l = (self.driver.page_source or "").lower()
+            page_markers = tuple(m for m in reject_markers if m != "error")
+            for marker in page_markers:
+                if marker in page_l:
+                    return True, f"Page rejection marker: {marker}"
+        except Exception:
+            pass
+        return False, ""
+
+    def _accept_line_changes(self):
+        accepted = False
+        try:
+            for cb in self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"):
+                cb_id = (cb.get_attribute("id") or "").lower()
+                cb_class = (cb.get_attribute("class") or "").lower()
+                if "accept" in cb_id or "accept" in cb_class:
+                    if not cb.is_selected():
+                        self.driver.execute_script("arguments[0].click();", cb)
+                        accepted = True
+        except Exception:
+            pass
+
+        for btn in self.driver.find_elements(By.CSS_SELECTOR, "#betSlipDiv button, #betSlipDiv a"):
+            try:
+                text = (btn.text or "").strip().lower()
+                if text in ("accept", "accept changes", "ok", "continue"):
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    accepted = True
+                    time.sleep(0.5)
+            except Exception:
+                continue
+
+        if accepted:
+            self.logger.info("Accepted line changes / odds update prompts")
+        return accepted
+
+    def _confirm_bet_accepted(self, team_name: str, team_1: str, team_2: str, stake: float, timeout: int = 25):
+        deadline = time.time() + timeout
         success_markers = (
             "wager accepted", "bet accepted", "ticket accepted",
             "successfully placed", "your wager has been accepted",
         )
-        for marker in success_markers:
-            if marker in page:
-                return True, marker
 
-        team_l = team_name.lower()
-        for pick in self._fetch_open_wagers_via_api():
-            text = json.dumps(pick).lower()
-            if team_l in text:
-                return True, "Open wager found via GetWagerPicks"
+        while time.time() < deadline:
+            rejected, reject_msg = self._scan_rejection_ui()
+            if rejected:
+                self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
+                return False, reject_msg
 
-        try:
-            for tab in self.driver.find_elements(
-                By.XPATH,
-                "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'open bet')]",
-            ):
-                self.driver.execute_script("arguments[0].click();", tab)
-                time.sleep(2)
-                break
-        except Exception:
-            pass
+            page_l = (self.driver.page_source or "").lower()
+            for marker in success_markers:
+                if marker in page_l:
+                    return True, marker
 
-        try:
-            body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
-            if team_l in body and team_1.lower() in body and team_2.lower() in body:
-                return True, "Open bet visible on page"
-        except Exception:
-            pass
+            for entry in self._get_wager_network_log():
+                body_l = (entry.get("body") or "").lower()
+                url = entry.get("url") or ""
+                if any(m in body_l for m in ("rejected", "declined", "error", "another user")):
+                    self.logger.error(f"Wager API rejection ({url}): {entry.get('body', '')[:500]}")
+                    return False, f"Wager API rejected: {url}"
+                if any(m in body_l for m in ("accepted", "confirmed", "success", "ticket")):
+                    self.logger.info(f"Wager API success ({url}): {entry.get('body', '')[:300]}")
+                    return True, "Wager API confirmed"
 
+            for pick in self._fetch_open_wagers_via_api():
+                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
+                    return True, "Open wager found via GetWagerPicks"
+
+            time.sleep(1)
+
+        self.logger.warning(
+            f"Bet not confirmed within {timeout}s; final GetWagerPicks retries"
+        )
+        for attempt in range(1, 4):
+            for pick in self._fetch_open_wagers_via_api():
+                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
+                    return True, "Open wager found via GetWagerPicks (retry)"
+            if attempt < 3:
+                time.sleep(5)
         return False, "Bet not confirmed by bookmaker"
 
     # --------------------------------------------------------
@@ -1175,6 +1334,8 @@ class BetamapolaController:
             self.logger.info(
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
             )
+
+            self._refresh_session_before_wager()
 
             game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
             if not game_line:
@@ -1204,44 +1365,20 @@ class BetamapolaController:
                     game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
                 )
 
-            added_to_slip = False
-            if moneyline_elem:
-                self.logger.info(f"Moneyline element located: {moneyline_elem.get_attribute('id')}")
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", moneyline_elem)
-                time.sleep(0.4)
-                self.driver.execute_script("arguments[0].click();", moneyline_elem)
-                self.logger.info("Moneyline element clicked")
-                added_to_slip = True
-            elif self._click_moneyline_via_angular(game_line, team_no):
-                added_to_slip = True
-            else:
-                raise Exception(
-                    f"Moneyline not found for team '{team_name}' @ {moneyline_odd} "
-                    f"(GameNum={game_num})"
-                )
-
-            if not added_to_slip:
-                raise Exception(f"Failed to add {team_name} moneyline to bet slip")
-
-            # Wait for Bet Slip (id="betSlipDiv")
             self.wait.until(EC.presence_of_element_located((By.ID, "betSlipDiv")))
             self.logger.info("Bet slip appeared")
 
-            # Verify team in bet slip (safety)
-            try:
-                slip_text = self.driver.find_element(By.ID, "betSlipDiv").text.lower()
-                if team_name.lower() not in slip_text:
-                    self.logger.warning(f"Betslip team verification: expected '{team_name}' in slip text")
-            except Exception:
-                pass
+            if not self._add_moneyline_to_slip(
+                game_line, team_no, team_name, moneyline_elem=moneyline_elem
+            ):
+                slip_preview = self._betslip_text()[:200]
+                raise Exception(
+                    f"Bet slip still empty after click attempts for {team_name} "
+                    f"(GameNum={game_num}): {slip_preview}"
+                )
 
-            # Read limits if present (reuse pattern)
-            try:
-                limits_text = self.driver.find_element(By.ID, "betSlipDiv").text
-                # Betamapola shows limits in header area; parse if visible
-                self.logger.info(f"Bet slip context (limits may appear): {limits_text[:200]}")
-            except Exception:
-                pass
+            limits_text = self._betslip_text()
+            self.logger.info(f"Bet slip populated: {limits_text[:200]}")
 
             # ENTER STAKE - look for common risk/stake inputs (TicoSports style often uses input[id^=risk_] or ng-model risk)
             stake_input = None
@@ -1275,15 +1412,7 @@ class BetamapolaController:
             else:
                 self.logger.warning("Could not locate stake input - bet may use default")
 
-            # Accept line changes if checkbox/prompt appears (common)
-            try:
-                for cb in self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"):
-                    if "accept" in (cb.get_attribute("id") or "").lower() or "accept" in (cb.get_attribute("class") or "").lower():
-                        if not cb.is_selected():
-                            self.driver.execute_script("arguments[0].click();", cb)
-                            self.logger.info("Accepted line changes")
-            except Exception:
-                pass
+            self._accept_line_changes()
 
             # Click Place Bet (ng-click=ProcessTicket() or text)
             place_btn = None
@@ -1295,8 +1424,15 @@ class BetamapolaController:
             if not place_btn:
                 raise Exception("Place Bet button not found")
 
+            self._install_wager_network_hook()
+            self._accept_line_changes()
             self.driver.execute_script("arguments[0].click();", place_btn)
             self.logger.info("Place Bet clicked")
+            network_log = self._get_wager_network_log()
+            if network_log:
+                self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
+            else:
+                self.logger.warning("No wager network activity detected immediately after Place Bet click")
 
             matchup_1 = team_1 or game_line.get("Team1ID") or ""
             matchup_2 = team_2 or game_line.get("Team2ID") or ""
@@ -1558,12 +1694,9 @@ class BetamapolaController:
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
-                        f"Open bet already exists for {team_name} on {self.bookmaker}; "
-                        f"marking leg placed and stopping new arb scans"
+                        f"Open wager detected via API for {team_name} on {self.bookmaker}; "
+                        f"skipping duplicate placement (arb scan lock requires bookmaker confirmation)"
                     )
-                    self.cache.mark_leg_placed(self.bookmaker, "moneyline", game_id)
-                    self.cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
-                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
                 bet_placed, stake = self.__execute_bet(
