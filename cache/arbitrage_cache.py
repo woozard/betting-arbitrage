@@ -143,6 +143,13 @@ class ArbitrageCache:
         pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
         self.redis.set(self._arb_scan_locked_key(pair_key), {"locked_at": "now"}, ttl=self.lock_ttl)
 
+    def unlock_arb_scan(self, team_1, team_2, book_1, book_2, game_date=None):
+        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        self.redis.delete(self._arb_scan_locked_key(pair_key))
+
+    def clear_leg_placed(self, bookmaker, bet_type, game_id):
+        self.redis.delete(self._leg_placed_key(bookmaker, bet_type, game_id))
+
     def is_leg_placed(self, bookmaker, bet_type, game_id):
         """This bookmaker already has a confirmed leg for this game."""
         return bool(self.redis.get(self._leg_placed_key(bookmaker, bet_type, game_id)))

@@ -278,7 +278,7 @@ class ArbitrageController:
             o1["team_1"], o1["team_2"], t1["bookmaker"], t2["bookmaker"], str(game_date)
         ):
             self.logger.info(
-                f"Skipping arb (scan locked after prior confirmed leg) - "
+                f"Skipping arb (scan locked in Redis after prior leg) - "
                 f"{o1['team_1']} vs {o1['team_2']} | {t1['bookmaker']} vs {t2['bookmaker']}"
             )
             return None
