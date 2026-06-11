@@ -37,7 +37,13 @@ class Sports411Controller:
         "please log in",
         "session expired",
         "logged out",
+        "not authenticated",
+        "unauthorized",
+        '"error_code":"401"',
     )
+    MAX_WAGER_ATTEMPTS_PER_ARB = 2
+    PENDING_CHECK_CACHE_TTL = 45
+    CONFIRM_TIMEOUT_SECONDS = 12
 
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
@@ -50,6 +56,8 @@ class Sports411Controller:
         self.label = account.label if account.label else "N/A"
         self._force_wager_relogin = False
         self._last_bet_error = None
+        self._pending_check_cache = {}
+        self._arb_fail_counts = {}
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -294,6 +302,7 @@ class Sports411Controller:
             self.logger.info(f"💾 Saved {login_debug}")
 
             if self._is_already_logged_in():
+                self._force_wager_relogin = False
                 self.logger.info("Already logged in; skipping credential entry")
                 return True
 
@@ -478,15 +487,14 @@ class Sports411Controller:
     # ZenRows fetch_odds
     # ===================================================================
     @time_it
-    def fetch_odds(self, refresh_interval=10):
+    def fetch_odds(self, refresh_interval=10, quit_driver=True):
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
         self.logger.info(f"========== Fetching Odds ({self.sport_name}) via Selenium (START) ==========")
         prune_debug_files()
 
         try:
-            # Use the existing authenticated Selenium driver (with BrightData proxy)
-            self.__login()
+            self._ensure_odds_session()
 
             self.logger.info(f"Navigating to {self.sport_url}")
             self.driver.get(self.sport_url)
@@ -613,7 +621,8 @@ class Sports411Controller:
             self.logger.error(f"Selenium fetch_odds failed: {e}", exc_info=True)
             self._safe_send_monitoring_alert(e)
         finally:
-            self._quit_driver()
+            if quit_driver:
+                self._quit_driver()
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
     # END CHANGE
 
@@ -710,38 +719,78 @@ class Sports411Controller:
 
     def _should_soft_navigate_back(self, url: str) -> bool:
         url_l = (url or "").lower()
+        if self.game_lines_path in url_l:
+            return False
+        soft_markers = (
+            "/account/pending",
+            "/account/",
+            "/logout",
+            "/en/sports/",
+            f"www.{self.website}",
+            f"be.{self.website}",
+            "index.php",
+        )
+        return any(marker in url_l for marker in soft_markers)
+
+    def _fetch_pending_page_text(self) -> str:
+        """Fetch pending wagers HTML in-browser without navigating away from the sport page."""
+        script = """
+            return fetch('/en/account/pending', {
+                credentials: 'include',
+                headers: {'Accept': 'text/html,application/xhtml+xml'}
+            }).then(r => r.text()).catch(() => '');
+        """
+        try:
+            return self.driver.execute_script(script) or ""
+        except Exception as e:
+            self.logger.warning(f"Pending-page fetch failed: {e}")
+            return ""
+
+    @staticmethod
+    def _page_text_has_open_wager(page: str, team_name: str, team_1: str, team_2: str) -> bool:
+        page_l = (page or "").lower()
+        team_l = team_name.lower()
+        teams_present = (
+            team_l in page_l
+            and team_1.lower() in page_l
+            and team_2.lower() in page_l
+        )
+        if not teams_present:
+            return False
         return any(
-            marker in url_l
-            for marker in ("/account/pending", "/account/", "/logout", "/en/sports/")
-        ) and self.game_lines_path not in url_l
+            marker in page_l
+            for marker in (
+                "risk:", "to win:", "pending wager", "open bet",
+                "wager #", "ticket #", "straight bet",
+            )
+        )
 
     def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
+        cache_key = f"{team_name}:{team_1}:{team_2}".lower()
+        now = time.time()
+        cached = self._pending_check_cache.get(cache_key)
+        if cached and (now - cached["ts"]) < self.PENDING_CHECK_CACHE_TTL:
+            return cached["found"]
+
+        found = False
         try:
-            pending_url = f"https://be.{self.website}/en/account/pending"
-            self.driver.get(pending_url)
-            time.sleep(2)
-            page = self.driver.page_source.lower()
-            team_l = team_name.lower()
-            teams_present = (
-                team_l in page
-                and team_1.lower() in page
-                and team_2.lower() in page
-            )
-            if not teams_present:
-                return False
-            wager_context = any(
-                marker in page
-                for marker in (
-                    "risk:", "to win:", "pending wager", "open bet",
-                    "wager #", "ticket #", "straight bet",
+            page = self._fetch_pending_page_text()
+            if page:
+                found = self._page_text_has_open_wager(page, team_name, team_1, team_2)
+            else:
+                pending_url = f"https://be.{self.website}/en/account/pending"
+                self.driver.get(pending_url)
+                time.sleep(1)
+                found = self._page_text_has_open_wager(
+                    self.driver.page_source, team_name, team_1, team_2
                 )
-            )
-            return wager_context
+                self._return_to_sport_page()
         except Exception as e:
             self.logger.warning(f"Could not check existing open bets: {e}")
             return False
-        finally:
-            self._return_to_sport_page()
+
+        self._pending_check_cache[cache_key] = {"found": found, "ts": now}
+        return found
 
     def _refresh_session_before_wager(self):
         if self._force_wager_relogin:
@@ -764,6 +813,114 @@ class Sports411Controller:
         self.logger.info("Session invalid; performing full login before wager placement")
         self.__login()
         self._return_to_sport_page()
+
+    def _ensure_betting_session(self):
+        """Login for the betting loop only when the browser session is missing or invalid."""
+        if self._force_wager_relogin:
+            self.logger.info("Session flagged invalid; performing full login for betting loop")
+            self.__login()
+            self._return_to_sport_page()
+            return
+
+        if self._is_session_valid() and self._is_on_sport_page_with_games():
+            self.logger.info(
+                "Session valid on sport page with games loaded; skipping login for betting loop"
+            )
+            return
+
+        if self._is_session_valid():
+            self.logger.info("Session valid for betting loop; navigating to sport page only")
+            self._return_to_sport_page()
+            return
+
+        self.logger.info("Session invalid for betting loop; performing full login")
+        self.__login()
+        self._return_to_sport_page()
+
+    def _game_visible_on_page(self, game_id: str) -> bool:
+        try:
+            return bool(
+                self.driver.find_elements(
+                    By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']"
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_wager_api_body(body: str):
+        """Return ('rejected'|'accepted'|None, message)."""
+        if not body:
+            return None, ""
+        body_l = body.lower()
+        try:
+            data = json.loads(body)
+            if data.get("WagerResult") is False:
+                return "rejected", "SendBets WagerResult:false"
+            if data.get("WagerResult") is True:
+                return "accepted", "SendBets confirmed"
+            if data.get("ErrorCode") not in (None, 0, "0"):
+                return "rejected", f"SendBets ErrorCode:{data.get('ErrorCode')}"
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if '"wagerresult":false' in body_l or '"wagerresult": false' in body_l:
+            return "rejected", "SendBets WagerResult:false"
+        return None, ""
+
+    @staticmethod
+    def _is_fast_book_rejection(error_message: str) -> bool:
+        msg_l = (error_message or "").lower()
+        return any(
+            marker in msg_l
+            for marker in (
+                "wagerresult:false",
+                "sendbets",
+                "wager api rejected",
+                "line changed",
+                "odds changed",
+                "line has changed",
+                "not accepted",
+                "wager declined",
+                "limit exceeded",
+            )
+        )
+
+    def _set_sport(self, sport: str):
+        """Switch sport context (URL/league) on an existing browser session."""
+        self.sport = sport.lower()
+        if self.sport in ["basketball", "nba"]:
+            self.sport_url = f"https://be.{self.website}/en/sports/basketball/nba/game-lines/"
+            self.sport_name = "NBA"
+            self.league = "NBA"
+            self.game_lines_path = "/basketball/nba/game-lines"
+        elif self.sport in ["baseball", "mlb"]:
+            self.sport_url = f"https://be.{self.website}/en/sports/baseball/mlb/game-lines/"
+            self.sport_name = "MLB"
+            self.league = "MLB"
+            self.game_lines_path = "/baseball/mlb/game-lines"
+        else:
+            raise ValueError(f"Unsupported sport: {sport}")
+
+    def _ensure_odds_session(self):
+        """Login for odds fetch only when the browser session is missing or invalid."""
+        if self._force_wager_relogin:
+            self.logger.info("Session flagged invalid; performing full login for odds fetch")
+            self.__login()
+            return
+
+        if self._is_session_valid() and self._is_on_sport_page_with_games():
+            self.logger.info(
+                "Session valid on sport page with games loaded; skipping login for odds fetch"
+            )
+            return
+
+        if self._is_session_valid():
+            self.logger.info("Session valid for odds fetch; navigating to sport page only")
+            self._return_to_sport_page()
+            return
+
+        self.logger.info("Session invalid for odds fetch; performing full login")
+        self.__login()
 
     def _cached_odd_int(self, moneyline_odd) -> int:
         return int(float(moneyline_odd))
@@ -954,28 +1111,38 @@ class Sports411Controller:
 
     def _verify_open_bet_on_pending(self, team_name: str, stake: float):
         try:
-            pending_url = f"https://be.{self.website}/en/account/pending"
-            self.driver.get(pending_url)
-            time.sleep(3)
-            page = self.driver.page_source.lower()
+            page = self._fetch_pending_page_text()
+            if not page:
+                pending_url = f"https://be.{self.website}/en/account/pending"
+                self.driver.get(pending_url)
+                time.sleep(1)
+                page = self.driver.page_source
+                self._return_to_sport_page()
+
+            page_l = (page or "").lower()
             team_l = team_name.lower()
-            if team_l not in page:
+            if team_l not in page_l:
                 return False, "Bet not found on pending page"
             stake_hits = (
-                f"{stake:.2f}" in page
-                or f"${stake:.0f}" in page
-                or f"risk: ${stake:.2f}" in page
+                f"{stake:.2f}" in page_l
+                or f"${stake:.0f}" in page_l
+                or f"risk: ${stake:.2f}" in page_l
             )
             if stake_hits:
                 return True, "Open bet found on pending page"
             return False, "Team found on pending page but stake not verified"
         except Exception as e:
             return False, f"Could not verify open bet: {e}"
-        finally:
-            self._return_to_sport_page()
 
-    def _confirm_bet_accepted(self, team_name: str, stake: float, timeout: int = 25):
+    def _confirm_bet_accepted(
+        self,
+        team_name: str,
+        stake: float,
+        timeout: int = None,
+    ):
+        timeout = timeout or self.CONFIRM_TIMEOUT_SECONDS
         deadline = time.time() + timeout
+        sendbets_seen = False
         while time.time() < deadline:
             rejected, reject_msg = self._scan_rejection_ui()
             if rejected:
@@ -1004,30 +1171,43 @@ class Sports411Controller:
                     continue
 
             for entry in self._get_wager_network_log():
-                body_l = (entry.get("body") or "").lower()
                 url = entry.get("url") or ""
                 body = entry.get("body", "") or ""
-                if any(m in body_l for m in ("rejected", "declined", "error", "failed", "false")):
+                if "sendbets" in url.lower():
+                    sendbets_seen = True
+                verdict, detail = self._parse_wager_api_body(body)
+                if verdict == "rejected":
+                    if self._message_requires_relogin(body):
+                        self._invalidate_wager_session()
+                    self.logger.error(f"Wager API rejection ({url}): {body[:800]}")
+                    return False, f"Wager API rejected: {detail}"
+                if verdict == "accepted":
+                    self.logger.info(f"Wager API success ({url}): {body[:300]}")
+                    return True, detail
+
+                body_l = body.lower()
+                if any(m in body_l for m in ("rejected", "declined", "failed")):
+                    if self._message_requires_relogin(body):
+                        self._invalidate_wager_session()
                     self.logger.error(f"Wager API rejection ({url}): {body[:800]}")
                     snippet = body[:200].replace("\n", " ").strip()
-                    detail = f"{url} | {snippet}" if snippet else url
-                    return False, f"Wager API rejected: {detail}"
+                    msg = f"{url} | {snippet}" if snippet else url
+                    return False, f"Wager API rejected: {msg}"
                 if any(m in body_l for m in ("accepted", "confirmed", "success", "ticket")):
-                    self.logger.info(f"Wager API success ({url}): {entry.get('body', '')[:300]}")
+                    self.logger.info(f"Wager API success ({url}): {body[:300]}")
                     return True, "Wager API confirmed"
 
-            time.sleep(1)
+            time.sleep(0.4)
+
+        if sendbets_seen:
+            return False, "SendBets returned no acceptance within timeout"
 
         self.logger.warning(
-            f"No confirmation alert within {timeout}s; checking pending wagers with retries"
+            f"No confirmation within {timeout}s; checking pending wagers once"
         )
-        for attempt in range(1, 4):
-            confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
-            if confirmed:
-                return True, message
-            if attempt < 3:
-                self.logger.warning(f"Pending check attempt {attempt}/3 failed; retrying in 5s")
-                time.sleep(5)
+        confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
+        if confirmed:
+            return True, message
         return False, message
 
     # Execute Bet
@@ -1083,26 +1263,31 @@ class Sports411Controller:
 
         self._refresh_session_before_wager()
 
-        if self._is_off_sport_page(self.driver.current_url):
-            self.logger.info(f"Navigating to {self.sport_name} page before bet placement")
-            self._return_to_sport_page()
+        if not self._game_visible_on_page(game_id):
+            if self._is_off_sport_page(self.driver.current_url):
+                self.logger.info(f"Navigating to {self.sport_name} page before bet placement")
+                self._return_to_sport_page()
 
-        game_container = None
-        try:
-            game_container = self.wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+            game_container = None
+            try:
+                game_container = WebDriverWait(self.driver, 12).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+                    )
                 )
-            )
-        except TimeoutException:
-            self.logger.warning(
-                f"Game container not found for {game_id}, reloading {self.sport_name} page and retrying once"
-            )
-            self._return_to_sport_page()
-            game_container = self.wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+            except TimeoutException:
+                self.logger.warning(
+                    f"Game container not found for {game_id}, reloading {self.sport_name} page once"
                 )
+                self._return_to_sport_page()
+                game_container = WebDriverWait(self.driver, 12).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+                    )
+                )
+        else:
+            game_container = self.driver.find_element(
+                By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']"
             )
 
         moneyline_label, live_odds = self._find_moneyline_label(
@@ -1335,14 +1520,7 @@ class Sports411Controller:
         setup_ok = False
         for attempt in range(1, 6):
             try:
-                # Step 1: Login (may raise if driver session is already gone)
-                self.__login()
-
-                # Step 2: Go to sport-specific game-lines page
-                self.logger.info(f"Navigating to {self.sport_name} page: {self.sport_url}")
-                self.driver.get(self.sport_url)
-                time.sleep(2)  # Wait for initial load
-
+                self._ensure_betting_session()
                 setup_ok = True
                 break
             except Exception as e:
@@ -1484,7 +1662,21 @@ class Sports411Controller:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
+                if not bet_placed and self._is_fast_book_rejection(self._last_bet_error):
+                    fail_key = f"{game_id}:{team_name}".lower()
+                    self._arb_fail_counts[fail_key] = self._arb_fail_counts.get(fail_key, 0) + 1
+                    fail_count = self._arb_fail_counts[fail_key]
+                    if fail_count >= self.MAX_WAGER_ATTEMPTS_PER_ARB:
+                        self.logger.warning(
+                            f"Dropping arb after {fail_count} book rejections on {self.bookmaker} | "
+                            f"{team_name} | {team_1} vs {team_2}"
+                        )
+                        self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                        self._arb_fail_counts.pop(fail_key, None)
+                    continue
+
                 if bet_placed:
+                    self._arb_fail_counts.pop(f"{game_id}:{team_name}".lower(), None)
                     self.logger.info("Bet Placement Completed")
                     finalize_confirmed_bet(
                         self.cache,
@@ -1500,8 +1692,7 @@ class Sports411Controller:
                         TELEGRAM,
                     )
                     self.logger.info("Returning to sport page before next arbitrage")
-                    self.driver.get(self.sport_url)
-                    time.sleep(2)
+                    self._return_to_sport_page()
 
         # The main arbitrage/betting loop above runs until the process is terminated.
         # Explicit returns in the setup phase or unrecoverable errors will end here.
