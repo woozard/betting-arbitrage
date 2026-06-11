@@ -33,6 +33,12 @@ os.makedirs(PROJECT_TMP_DIR, exist_ok=True)
 tempfile.tempdir = PROJECT_TMP_DIR
 
 class Sports411Controller:
+    WAGER_SESSION_EXPIRED_MARKERS = (
+        "please log in",
+        "session expired",
+        "logged out",
+    )
+
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
     # ===================================================================
@@ -42,6 +48,8 @@ class Sports411Controller:
         self.account_id = account.account
         self.password = account.password
         self.label = account.label if account.label else "N/A"
+        self._force_wager_relogin = False
+        self._last_bet_error = None
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -318,6 +326,7 @@ class Sports411Controller:
             login_btn.click()
 
             self.wait.until(EC.url_contains("/en/sports/"))
+            self._force_wager_relogin = False
             self.logger.info("Login Successful")
             return True
 
@@ -641,8 +650,31 @@ class Sports411Controller:
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.sports-league-game"))
         )
 
+    def _message_requires_relogin(self, message: str) -> bool:
+        msg_l = (message or "").lower()
+        return any(marker in msg_l for marker in self.WAGER_SESSION_EXPIRED_MARKERS)
+
+    def _invalidate_wager_session(self):
+        self._force_wager_relogin = True
+
+    def _page_has_login_required_marker(self) -> bool:
+        try:
+            for elem in self.driver.find_elements(
+                By.CSS_SELECTOR, ".alert-overlay, .alert-message, #betslip"
+            ):
+                text = (elem.text or "").lower()
+                if any(marker in text for marker in self.WAGER_SESSION_EXPIRED_MARKERS):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _is_session_valid(self) -> bool:
         try:
+            if self._force_wager_relogin:
+                return False
+            if self._page_has_login_required_marker():
+                return False
             url = (self.driver.current_url or "").lower()
             if f"be.{self.website}" not in url:
                 return False
@@ -712,6 +744,12 @@ class Sports411Controller:
             self._return_to_sport_page()
 
     def _refresh_session_before_wager(self):
+        if self._force_wager_relogin:
+            self.logger.info("Wager session flagged invalid; performing full login before placement")
+            self.__login()
+            self._return_to_sport_page()
+            return
+
         if self._is_session_valid() and self._is_on_sport_page_with_games():
             self.logger.info(
                 "Session valid on sport page with games loaded; skipping login refresh"
@@ -726,6 +764,75 @@ class Sports411Controller:
         self.logger.info("Session invalid; performing full login before wager placement")
         self.__login()
         self._return_to_sport_page()
+
+    def _cached_odd_int(self, moneyline_odd) -> int:
+        return int(float(moneyline_odd))
+
+    def _live_odds_invalidates_arb(self, cached_odd, live_odd) -> bool:
+        cached = self._cached_odd_int(cached_odd)
+        live = self._cached_odd_int(live_odd)
+        if (cached > 0) != (live > 0):
+            return True
+        return abs(cached - live) > 15
+
+    def _find_moneyline_label(self, game_container, team_name: str, moneyline_odd):
+        labels = game_container.find_elements(
+            By.CSS_SELECTOR,
+            ".mline-1 label.bet-indicator, .mline-2 label.bet-indicator",
+        )
+        team_match = None
+        team_match_odds = None
+
+        for idx, label in enumerate(labels):
+            title = (label.get_attribute("title") or "").strip()
+            team = ""
+            odds_text = ""
+
+            if title:
+                match = re.match(r"(.+?)\s([+-]\d+)", title)
+                if match:
+                    team = match.group(1).strip()
+                    odds_text = match.group(2).strip()
+
+            if not odds_text:
+                try:
+                    odds_text = label.find_element(By.CSS_SELECTOR, ".odds span").text.strip()
+                except Exception:
+                    odds_text = ""
+
+            self.logger.info(
+                f"Moneyline [{idx}] | Team: '{team}' | Odds: '{odds_text}' | Title: '{title}'"
+            )
+
+            if team.lower() != team_name.lower():
+                continue
+
+            if team_match is None:
+                team_match = label
+                team_match_odds = odds_text
+
+            if odds_text and int(odds_text) == self._cached_odd_int(moneyline_odd):
+                self.logger.info(
+                    f"Matched Moneyline | Index: {idx} | Team: {team} | Odds: {odds_text}"
+                )
+                return label, odds_text
+
+        if team_match is not None:
+            if self._live_odds_invalidates_arb(moneyline_odd, team_match_odds):
+                raise Exception(
+                    f"Live odds {team_match_odds} invalidate cached arb odds {moneyline_odd} "
+                    f"for {team_name}; skipping placement"
+                )
+            self.logger.warning(
+                f"Cached odds {moneyline_odd} unavailable for {team_name}; "
+                f"using live board odds {team_match_odds}"
+            )
+            self.logger.info(
+                f"Matched Moneyline (team-only) | Team: {team_name} | Live odds: {team_match_odds}"
+            )
+            return team_match, team_match_odds
+
+        return None, None
 
     def _install_wager_network_hook(self):
         self.driver.execute_script("""
@@ -872,6 +979,8 @@ class Sports411Controller:
         while time.time() < deadline:
             rejected, reject_msg = self._scan_rejection_ui()
             if rejected:
+                if self._message_requires_relogin(reject_msg):
+                    self._invalidate_wager_session()
                 self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
                 return False, reject_msg or "Bet rejected"
 
@@ -897,9 +1006,12 @@ class Sports411Controller:
             for entry in self._get_wager_network_log():
                 body_l = (entry.get("body") or "").lower()
                 url = entry.get("url") or ""
-                if any(m in body_l for m in ("rejected", "declined", "error", "failed")):
-                    self.logger.error(f"Wager API rejection ({url}): {entry.get('body', '')[:500]}")
-                    return False, f"Wager API rejected: {url}"
+                body = entry.get("body", "") or ""
+                if any(m in body_l for m in ("rejected", "declined", "error", "failed", "false")):
+                    self.logger.error(f"Wager API rejection ({url}): {body[:800]}")
+                    snippet = body[:200].replace("\n", " ").strip()
+                    detail = f"{url} | {snippet}" if snippet else url
+                    return False, f"Wager API rejected: {detail}"
                 if any(m in body_l for m in ("accepted", "confirmed", "success", "ticket")):
                     self.logger.info(f"Wager API success ({url}): {entry.get('body', '')[:300]}")
                     return True, "Wager API confirmed"
@@ -928,200 +1040,156 @@ class Sports411Controller:
         stake: float = 1.0
     ):
         self.logger.info("========== Execute Bet (START) ==========")
+        self._last_bet_error = None
 
         try:
-
-            self.logger.info(
-                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
-            )
-
-            self._refresh_session_before_wager()
-
-            if self._is_off_sport_page(self.driver.current_url):
-                self.logger.info(f"Navigating to {self.sport_name} page before bet placement")
-                self._return_to_sport_page()
-
-            # -----------------------------------
-            # FIND GAME CONTAINER
-            # -----------------------------------
-            game_container = None
-            try:
-                game_container = self.wait.until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
-                    )
-                )
-            except TimeoutException:
-                self.logger.warning(
-                    f"Game container not found for {game_id}, reloading {self.sport_name} page and retrying once"
-                )
-                self._return_to_sport_page()
+            for attempt in range(1, 3):
                 try:
-                    game_container = self.wait.until(
-                        EC.presence_of_element_located(
-                            (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+                    if attempt > 1:
+                        self.logger.info(f"Retrying wager after re-login (attempt {attempt}/2)")
+                    return self._execute_bet_attempt(
+                        game_id, team_name, moneyline_odd, stake
+                    )
+                except Exception as e:
+                    if attempt == 1 and self._message_requires_relogin(str(e)):
+                        self.logger.warning(
+                            f"Wager blocked by expired session ({e}); forcing re-login and retry"
                         )
-                    )
-                except TimeoutException:
-                    raise  # will be caught by outer except, send to monitoring only
-
-            # -----------------------------------
-            # FIND MONEYLINE LABEL (TEAM + ODDS)
-            # -----------------------------------
-            moneyline_label = None
-
-            labels = game_container.find_elements(
-                By.CSS_SELECTOR,
-                ".mline-1 label.bet-indicator, .mline-2 label.bet-indicator"
-            )
-
-            for idx, label in enumerate(labels):
-                title = (label.get_attribute("title") or "").strip()
-
-                # -----------------------------
-                # TEAM NAME FROM TITLE
-                # -----------------------------
-                team = ""
-                odds_text = ""
-
-                if title:
-                    # Example: "Philadelphia 76ers -106"
-                    match = re.match(r"(.+?)\s([+-]\d+)", title)
-                    if match:
-                        team = match.group(1).strip()
-                        odds_text = match.group(2).strip()
-
-                # FALLBACK: read odds from DOM if needed
-                if not odds_text:
-                    try:
-                        odds_text = label.find_element(By.CSS_SELECTOR, ".odds span").text.strip()
-                    except Exception:
-                        odds_text = ""
-
-                # LOG
-                self.logger.info(
-                    f"Moneyline [{idx}] | Team: '{team}' | Odds: '{odds_text}' | Title: '{title}'"
-                )
-
-                # MATCH TEAM + ODDS
-                if team.lower() == team_name.lower() and int(odds_text) == int(moneyline_odd):
-                    moneyline_label = label
-                    self.logger.info(
-                        f"Matched Moneyline | Index: {idx} | Team: {team} | Odds: {odds_text}"
-                    )
-                    break
-
-
-            if not moneyline_label:
-                raise Exception("Moneyline label not found for given team & odds")
-
-            self.logger.info(f"Moneyline Label: {moneyline_label}")
-
-            # -----------------------------------
-            # CLICK MONEYLINE (ANGULAR SAFE)
-            # -----------------------------------
-            self.driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", moneyline_label
-            )
-            time.sleep(0.4)
-            self.driver.execute_script("arguments[0].click();", moneyline_label)
-
-            self.logger.info("Moneyline label clicked")
-
-            # -----------------------------------
-            # WAIT FOR BETSLIP
-            # -----------------------------------
-            self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
-
-            # -----------------------------------
-            # VERIFY BETSLIP TEAM (SAFETY)
-            # -----------------------------------
-            betslip_team = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#betslip .team-name"))
-            ).text.strip()
-
-            if betslip_team.lower() != team_name.lower():
-                raise Exception(
-                    f"Betslip team mismatch | Expected: {team_name} | Found: {betslip_team}"
-                )
-
-            self.logger.info(f"Betslip verified | Team: {betslip_team}")
-
-            # -----------------------------------
-            # READ MIN / MAX BET LIMITS
-            # -----------------------------------
-            try:
-                bet_limits = self.wait.until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "#betslip .bet-limits"))
-                )
-
-                amounts = bet_limits.find_elements(By.CSS_SELECTOR, "span.amount")
-                min_bet = currency_to_float(amounts[0].text.strip()) if len(amounts) > 0 else "N/A"
-                max_bet = currency_to_float(amounts[1].text.strip()) if len(amounts) > 1 else "N/A"
-
-                self.logger.info(
-                    f"Bet Limits | Min Bet: {min_bet} | Max Bet: {max_bet} | Stake: {stake}"
-                )
-
-                # Validate that the stake is within limits
-                if stake < min_bet:
-                    raise Exception(
-                        f"Stake {stake} is below minimum bet {min_bet}"
-                    )
-
-                if max_bet > 0 and stake > max_bet:
-                    raise Exception(
-                        f"Stake {stake} exceeds maximum bet {max_bet}"
-                    )
-
-            except Exception as e:
-                self.logger.warning(f"Bet limits could not be determined: {e}")
-
-            # -----------------------------------
-            # ENTER STAKE
-            # -----------------------------------
-            stake_input = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[id^='risk_']"))
-            )
-
-            stake_input.clear()
-            stake_input.send_keys(f"{stake:.2f}")
-            self.logger.info(f"Stake entered: {stake:.2f}")
-
-            self._accept_line_changes()
-
-            # -----------------------------------
-            # WAIT UNTIL PLACE BET ENABLED
-            # -----------------------------------
-            place_bet_btn = self.wait.until(
-                EC.element_to_be_clickable(
-                    (By.CSS_SELECTOR, ".place-bet-container button.btn-primary:not([disabled])")
-                )
-            )
-
-            self._install_wager_network_hook()
-            self._accept_line_changes()
-            self.driver.execute_script("arguments[0].click();", place_bet_btn)
-            self.logger.info("Place Bet button clicked")
-            network_log = self._get_wager_network_log()
-            if network_log:
-                self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
-            else:
-                self.logger.warning("No wager network activity detected immediately after Place Bet click")
-
-            confirmed, message = self._confirm_bet_accepted(team_name, stake)
-            if not confirmed:
-                raise Exception(message or "Bet not accepted by bookmaker")
-
-            self.logger.info(f"Bet accepted by bookmaker: {message}")
-            return True, stake
+                        self._invalidate_wager_session()
+                        self.__login()
+                        self._return_to_sport_page()
+                        continue
+                    raise
+            return False, stake
 
         except Exception as e:
+            self._last_bet_error = str(e)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
             return False, stake
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
+
+    def _execute_bet_attempt(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd: str,
+        stake: float = 1.0
+    ):
+        self.logger.info(
+            f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
+        )
+
+        self._refresh_session_before_wager()
+
+        if self._is_off_sport_page(self.driver.current_url):
+            self.logger.info(f"Navigating to {self.sport_name} page before bet placement")
+            self._return_to_sport_page()
+
+        game_container = None
+        try:
+            game_container = self.wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+                )
+            )
+        except TimeoutException:
+            self.logger.warning(
+                f"Game container not found for {game_id}, reloading {self.sport_name} page and retrying once"
+            )
+            self._return_to_sport_page()
+            game_container = self.wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']")
+                )
+            )
+
+        moneyline_label, live_odds = self._find_moneyline_label(
+            game_container, team_name, moneyline_odd
+        )
+        if not moneyline_label:
+            raise Exception("Moneyline label not found for given team & odds")
+
+        if live_odds and self._cached_odd_int(live_odds) != self._cached_odd_int(moneyline_odd):
+            self.logger.info(
+                f"Proceeding with live odds {live_odds} (cached arb odds were {moneyline_odd})"
+            )
+
+        self.logger.info(f"Moneyline Label: {moneyline_label}")
+
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", moneyline_label
+        )
+        time.sleep(0.4)
+        self.driver.execute_script("arguments[0].click();", moneyline_label)
+        self.logger.info("Moneyline label clicked")
+
+        self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
+
+        betslip_team = self.wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "#betslip .team-name"))
+        ).text.strip()
+
+        if betslip_team.lower() != team_name.lower():
+            raise Exception(
+                f"Betslip team mismatch | Expected: {team_name} | Found: {betslip_team}"
+            )
+
+        self.logger.info(f"Betslip verified | Team: {betslip_team}")
+
+        try:
+            bet_limits = self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#betslip .bet-limits"))
+            )
+            amounts = bet_limits.find_elements(By.CSS_SELECTOR, "span.amount")
+            min_bet = currency_to_float(amounts[0].text.strip()) if len(amounts) > 0 else "N/A"
+            max_bet = currency_to_float(amounts[1].text.strip()) if len(amounts) > 1 else "N/A"
+            self.logger.info(
+                f"Bet Limits | Min Bet: {min_bet} | Max Bet: {max_bet} | Stake: {stake}"
+            )
+            if stake < min_bet:
+                raise Exception(f"Stake {stake} is below minimum bet {min_bet}")
+            if max_bet > 0 and stake > max_bet:
+                raise Exception(f"Stake {stake} exceeds maximum bet {max_bet}")
+        except Exception as e:
+            self.logger.warning(f"Bet limits could not be determined: {e}")
+
+        stake_input = self.wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[id^='risk_']"))
+        )
+        stake_input.clear()
+        stake_input.send_keys(f"{stake:.2f}")
+        self.logger.info(f"Stake entered: {stake:.2f}")
+
+        self._accept_line_changes()
+
+        place_bet_btn = self.wait.until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, ".place-bet-container button.btn-primary:not([disabled])")
+            )
+        )
+
+        if self._page_has_login_required_marker():
+            self._invalidate_wager_session()
+            raise Exception("Rejection marker on page: please log in")
+
+        self._install_wager_network_hook()
+        self._accept_line_changes()
+        self.driver.execute_script("arguments[0].click();", place_bet_btn)
+        self.logger.info("Place Bet button clicked")
+        network_log = self._get_wager_network_log()
+        if network_log:
+            self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
+        else:
+            self.logger.warning("No wager network activity detected immediately after Place Bet click")
+
+        confirmed, message = self._confirm_bet_accepted(team_name, stake)
+        if not confirmed:
+            raise Exception(message or "Bet not accepted by bookmaker")
+
+        self.logger.info(f"Bet accepted by bookmaker: {message}")
+        return True, stake
 
     def _quit_driver(self):
         """Safely terminate only this controller's WebDriver session."""
@@ -1380,6 +1448,15 @@ class Sports411Controller:
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
 
+                if self.cache.is_arb_stale(arb):
+                    age = self.cache.arb_age_seconds(arb)
+                    self.logger.info(
+                        f"Skipping dead arb (identified {age:.0f}s ago, max {self.cache.arb_ttl}s) | "
+                        f"{team_1} vs {team_2}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
                 if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
                     self.logger.info(
                         f"Skipping — leg already confirmed on {self.bookmaker} | "
@@ -1396,6 +1473,17 @@ class Sports411Controller:
                     continue
 
                 bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+                if (
+                    not bet_placed
+                    and self._last_bet_error
+                    and "invalidate cached arb odds" in self._last_bet_error
+                ):
+                    self.logger.warning(
+                        f"Removing stale arb from cache for {team_1} vs {team_2} on {self.bookmaker}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
                     finalize_confirmed_bet(

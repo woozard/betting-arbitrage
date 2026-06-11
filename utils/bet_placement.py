@@ -28,17 +28,25 @@ def finalize_confirmed_bet(
 
     cache.mark_leg_placed(bookmaker, bet_type, game_id)
     cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
-    cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
 
     other_book = book_2 if bookmaker == book_1 else book_1
     other_game_id = (
         arb["team_2_game_id"] if bookmaker == arb["team_1_bookmaker"] else arb["team_1_game_id"]
     )
-    cache.add_arbitrage(other_book, bet_type, other_game_id, arb)
-    logger.info(
-        f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
-        f"arb scan locked; {other_book} leg refreshed and remains actionable"
-    )
+    other_leg_placed = cache.is_leg_placed(other_book, bet_type, other_game_id)
+
+    if other_leg_placed:
+        cache.remove_arbitrage_pair(arb)
+        logger.info(
+            f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
+            f"both legs confirmed; arb scan locked and cache cleared"
+        )
+    else:
+        logger.info(
+            f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
+            f"arb scan locked; {other_book} leg remains actionable in cache "
+            f"(simultaneous placement — not waiting for other book)"
+        )
 
     bet_data = {
         "sport": sport,

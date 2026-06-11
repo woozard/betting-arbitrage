@@ -1,3 +1,5 @@
+import time
+
 from cache.redis_cache import RedisCache
 from utils.config import REDIS
 
@@ -177,3 +179,23 @@ class ArbitrageCache:
         else:
             game_id = arb_data["team_2_game_id"]
         self.remove_arbitrage(bookmaker, bet_type, game_id)
+
+    def remove_arbitrage_pair(self, arb_data):
+        """Remove both bookmaker cache entries for a two-legged arb."""
+        bet_type = arb_data.get("bet_type", "moneyline")
+        self.remove_arbitrage(
+            arb_data["team_1_bookmaker"], bet_type, arb_data["team_1_game_id"]
+        )
+        self.remove_arbitrage(
+            arb_data["team_2_bookmaker"], bet_type, arb_data["team_2_game_id"]
+        )
+
+    def arb_age_seconds(self, arb_data):
+        identified_at = arb_data.get("identified_at")
+        if identified_at is None:
+            return 0
+        return max(0, time.time() - float(identified_at))
+
+    def is_arb_stale(self, arb_data):
+        """True when the arb has been actionable longer than arb_ttl (default 180s)."""
+        return self.arb_age_seconds(arb_data) > self.arb_ttl

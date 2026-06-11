@@ -249,7 +249,8 @@ class ArbitrageController:
             "bet_type": "moneyline",
             "arb_total_prob": float(arb_total),
             "profit_pct": float(round((Decimal(1) - arb_total) * 100, 2)),
-            "read": False
+            "read": False,
+            "identified_at": time.time(),
         }
 
     def __store_arbitrage_cache(self, arb_data):
@@ -360,7 +361,8 @@ class ArbitrageController:
             "bet_type": arb.bet_type,
             "arb_total_prob": float(arb.arb_total_prob),
             "profit_pct": float(arb.profit_pct),
-            "read": False
+            "read": False,
+            "identified_at": time.time(),
         }
 
         self.__store_arbitrage_cache(arb_data)

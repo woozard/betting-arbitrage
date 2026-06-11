@@ -32,6 +32,12 @@ tempfile.tempdir = PROJECT_TMP_DIR
 
 
 class BetamapolaController:
+    WAGER_SESSION_EXPIRED_MARKERS = (
+        "please log in",
+        "session expired",
+        "logged out",
+    )
+
     # ===================================================================
     # Betamapola.com - uses identical browser/scraping stack as Sports411
     # (Selenium + BrightData proxy extension + ZenRows for odds polling)
@@ -42,6 +48,8 @@ class BetamapolaController:
         self.account_id = account.account
         self.password = account.password
         self.label = account.label if account.label else "N/A"
+        self._force_wager_relogin = False
+        self._last_bet_error = None
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -314,6 +322,7 @@ class BetamapolaController:
             login_btn.click()
 
             self.wait.until(EC.url_contains("/sports"))
+            self._force_wager_relogin = False
             self.logger.info("Login Successful")
             return True
 
@@ -1173,8 +1182,111 @@ class BetamapolaController:
                 return True
         return False
 
+    def _message_requires_relogin(self, message: str) -> bool:
+        msg_l = (message or "").lower()
+        return any(marker in msg_l for marker in self.WAGER_SESSION_EXPIRED_MARKERS)
+
+    def _invalidate_wager_session(self):
+        self._force_wager_relogin = True
+
+    def _page_has_login_required_marker(self) -> bool:
+        try:
+            for elem in self.driver.find_elements(
+                By.CSS_SELECTOR, "#betSlipDiv, .alert, .modal-body, .login-form"
+            ):
+                text = (elem.text or "").lower()
+                if any(marker in text for marker in self.WAGER_SESSION_EXPIRED_MARKERS):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _is_session_valid(self) -> bool:
+        try:
+            if self._force_wager_relogin:
+                return False
+            if self._page_has_login_required_marker():
+                return False
+            url = (self.driver.current_url or "").lower()
+            if self.website.lower() not in url:
+                return False
+            if "/sports" not in url:
+                return False
+            account_fields = self.driver.find_elements(By.ID, "account")
+            return not account_fields or not account_fields[0].is_displayed()
+        except Exception:
+            return False
+
+    def _sport_games_present(self) -> bool:
+        try:
+            return bool(
+                self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "button[id^='M1_'], button[id^='M2_'], span.line-rot-num",
+                )
+            )
+        except Exception:
+            return False
+
+    def _is_on_sport_page_with_games(self) -> bool:
+        try:
+            url = (self.driver.current_url or "").lower()
+            if "/sports" not in url:
+                return False
+            return self._sport_games_present()
+        except Exception:
+            return False
+
+    def _return_to_sport_page(self):
+        try:
+            if self._is_on_sport_page_with_games():
+                return
+            self.__ensure_sport_offering_loaded()
+        except Exception as e:
+            self.logger.warning(f"Could not return to {self.sport_name} page: {e}")
+
+    def _ensure_betting_session(self):
+        """Login only when the browser session is missing or invalid."""
+        if self._force_wager_relogin:
+            self.logger.info("Wager session flagged invalid; performing full login")
+            self.__login()
+            self.__ensure_sport_offering_loaded()
+            return
+
+        if self._is_session_valid() and self._is_on_sport_page_with_games():
+            self.logger.info(
+                "Session valid on sport page with games loaded; skipping login"
+            )
+            return
+
+        if self._is_session_valid():
+            self.logger.info("Session valid but sport offering not loaded; navigating only")
+            self.__ensure_sport_offering_loaded()
+            return
+
+        self.logger.info("Session invalid; performing full login")
+        self.__login()
+        self.__ensure_sport_offering_loaded()
+
     def _refresh_session_before_wager(self):
-        self.logger.info("Refreshing login session before wager placement")
+        if self._force_wager_relogin:
+            self.logger.info("Wager session flagged invalid; performing full login before placement")
+            self.__login()
+            self.__ensure_sport_offering_loaded()
+            return
+
+        if self._is_session_valid() and self._is_on_sport_page_with_games():
+            self.logger.info(
+                "Session valid on sport page with games loaded; skipping login refresh"
+            )
+            return
+
+        if self._is_session_valid():
+            self.logger.info("Session valid but off sport page; navigating to sport page only")
+            self._return_to_sport_page()
+            return
+
+        self.logger.info("Session invalid; performing full login before wager placement")
         self.__login()
         self.__ensure_sport_offering_loaded()
 
@@ -1281,6 +1393,8 @@ class BetamapolaController:
         while time.time() < deadline:
             rejected, reject_msg = self._scan_rejection_ui()
             if rejected:
+                if self._message_requires_relogin(reject_msg):
+                    self._invalidate_wager_session()
                 self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
                 return False, reject_msg
 
@@ -1329,7 +1443,46 @@ class BetamapolaController:
         team_2: str = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
+        self._last_bet_error = None
 
+        try:
+            for attempt in range(1, 3):
+                try:
+                    if attempt > 1:
+                        self.logger.info(f"Retrying wager after re-login (attempt {attempt}/2)")
+                    return self._execute_bet_attempt(
+                        game_id, team_name, moneyline_odd, stake,
+                        team_1=team_1, team_2=team_2,
+                    )
+                except Exception as e:
+                    if attempt == 1 and self._message_requires_relogin(str(e)):
+                        self.logger.warning(
+                            f"Wager blocked by expired session ({e}); forcing re-login and retry"
+                        )
+                        self._invalidate_wager_session()
+                        self.__login()
+                        self.__ensure_sport_offering_loaded()
+                        continue
+                    raise
+            return False, stake
+
+        except Exception as e:
+            self._last_bet_error = str(e)
+            self.logger.error(f"Place Bet failed: {e}", exc_info=True)
+            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
+            return False, stake
+        finally:
+            self.logger.info("========== Execute Bet (END) ==========")
+
+    def _execute_bet_attempt(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd: str,
+        stake: float = 1.0,
+        team_1: str = None,
+        team_2: str = None,
+    ):
         try:
             self.logger.info(
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
@@ -1424,6 +1577,10 @@ class BetamapolaController:
             if not place_btn:
                 raise Exception("Place Bet button not found")
 
+            if self._page_has_login_required_marker():
+                self._invalidate_wager_session()
+                raise Exception("Rejection marker on page: please log in")
+
             self._install_wager_network_hook()
             self._accept_line_changes()
             self.driver.execute_script("arguments[0].click();", place_btn)
@@ -1443,12 +1600,8 @@ class BetamapolaController:
             self.logger.info(f"Bet accepted by bookmaker: {message}")
             return True, stake
 
-        except Exception as e:
-            self.logger.error(f"Place Bet failed: {e}", exc_info=True)
-            asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
-            return False, stake
-        finally:
-            self.logger.info("========== Execute Bet (END) ==========")
+        except Exception:
+            raise
 
     def _quit_driver(self):
         """Safely terminate only this controller's WebDriver session."""
@@ -1589,11 +1742,8 @@ class BetamapolaController:
         setup_ok = False
         for attempt in range(1, 6):
             try:
-                # Step 1: Login (may raise if driver session is already gone)
-                self.__login()
-
-                # Step 2: Go to sports page and load MLB offering
-                self.__ensure_sport_offering_loaded()
+                # Step 1: Ensure logged-in session (login only when invalid)
+                self._ensure_betting_session()
 
                 setup_ok = True
                 break
@@ -1683,6 +1833,15 @@ class BetamapolaController:
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
+
+                if self.cache.is_arb_stale(arb):
+                    age = self.cache.arb_age_seconds(arb)
+                    self.logger.info(
+                        f"Skipping dead arb (identified {age:.0f}s ago, max {self.cache.arb_ttl}s) | "
+                        f"{team_1} vs {team_2}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
 
                 if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
                     self.logger.info(
