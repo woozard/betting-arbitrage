@@ -99,11 +99,18 @@ BETAMAPOLA_ACCOUNT = os.getenv('BETAMAPOLA_ACCOUNT')
 BETAMAPOLA_PASSWORD = os.getenv('BETAMAPOLA_PASSWORD')
 BETAMAPOLA_LABEL = os.getenv('BETAMAPOLA_LABEL', 'Bettor')
 
-PRADISEWAGER = {
+PARADISEWAGER = {
     'website': 'paradisewager.com',
     'url': 'https://paradisewager.com',
     'bookmaker': 'paradisewager'
 }
+
+# Backward-compatible alias (typo in original config)
+PRADISEWAGER = PARADISEWAGER
+
+PARADIESWAGER_ACCOUNT = os.getenv('PARADIESWAGER_ACCOUNT')
+PARADIESWAGER_PASSWORD = os.getenv('PARADIESWAGER_PASSWORD')
+PARADIESWAGER_LABEL = os.getenv('PARADIESWAGER_LABEL', 'Bettor')
 
 _4CASTERS = {
     'website': '4casters.io',
@@ -344,6 +351,10 @@ BETWAR = {
     'url': 'https://betwar.com',
     'bookmaker': 'betwar'
 }
+
+BETWAR_ACCOUNT = os.getenv('BETWAR_ACCOUNT')
+BETWAR_PASSWORD = os.getenv('BETWAR_PASSWORD')
+BETWAR_LABEL = os.getenv('BETWAR_LABEL', 'Bettor')
 
 EBET2 = {
     'website': 'ebet2.com',

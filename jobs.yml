@@ -18,3 +18,11 @@ jobs:
   - name: betamapola_betting
     script: betamapola_betting.py
     interval_seconds: 30
+
+  - name: paradisewager_odds
+    script: paradisewager_odds.py
+    interval_seconds: 30
+
+  - name: paradisewager_betting
+    script: paradisewager_betting.py
+    interval_seconds: 30
