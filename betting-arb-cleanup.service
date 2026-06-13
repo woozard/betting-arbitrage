@@ -1,0 +1,13 @@
+[Unit]
+Description=Betting Arbitrage disk cleanup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/betting-arbitrage
+ExecStart=/home/ubuntu/betting-arbitrage/cleanup_disk.sh
+
+[Install]
+WantedBy=multi-user.target
