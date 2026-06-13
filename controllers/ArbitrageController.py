@@ -17,8 +17,8 @@ from cache.arbitrage_cache import ArbitrageCache
 
 
 class ArbitrageController:
-    # Flag arbs up to 1% vig (colleague request: include -1% "close" opportunities)
-    ARB_THRESHOLD = Decimal("1.01")
+    # Only surface actionable arbs with combined implied probability strictly below 1.0
+    ARB_THRESHOLD = Decimal("1")
     CLOSE_LOG_THRESHOLD = Decimal("1.03")
 
     def __init__(self):
