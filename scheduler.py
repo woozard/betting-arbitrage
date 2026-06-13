@@ -42,9 +42,17 @@ def run_job(job):
 
     return process  # return process handle if needed
 
+def _initial_last_run(job, now):
+    """Phase-offset first run so Chrome jobs do not all start at once."""
+    interval = job.get("interval_seconds", 60)
+    offset = job.get("start_offset_seconds", 0)
+    return now - interval + offset
+
+
 def main():
     jobs = load_jobs()
-    last_run = {job["name"]: 0 for job in jobs}
+    boot = time.time()
+    last_run = {job["name"]: _initial_last_run(job, boot) for job in jobs}
     running_processes = {}
 
     while True:
@@ -60,10 +68,10 @@ def main():
                 # Job still running, skip this interval
                 continue
 
-            # Check if interval has passed
+            # Check if interval has passed (offset preserved via last_run schedule)
             if now - last_run[job_name] >= interval:
                 running_processes[job_name] = run_job(job)
-                last_run[job_name] = time.time()
+                last_run[job_name] = now
 
         time.sleep(1)
 

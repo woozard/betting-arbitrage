@@ -24,11 +24,8 @@ from utils.helpers import (
 )
 from utils.bet_placement import finalize_confirmed_bet
 from utils.timing import time_it
+from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
-
-PROJECT_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tmp'))
-os.makedirs(PROJECT_TMP_DIR, exist_ok=True)
-tempfile.tempdir = PROJECT_TMP_DIR
 
 API_ORIGIN = "https://paradisewager.com/player-api"
 WEBSITE_KEY = "paradisewager"
@@ -87,6 +84,9 @@ class ParadiseWagerController:
         except Exception as e:
             self.logger.error(
                 f"Initial driver creation failed in __init__ (betting() will retry with recovery): {e}"
+            )
+            handle_init_driver_failure(
+                self.logger, self.user_data_dir, self.proxy_extension_dir
             )
             self.driver = None
             self.wait = None
@@ -1017,31 +1017,14 @@ class ParadiseWagerController:
                 pass
 
     def _cleanup_stale_temp_dirs(self, max_age_seconds: int = 3600):
-        import shutil
-        import glob
-
-        active_dirs = {
-            d for d in (
+        cleanup_stale_temp_dirs(
+            active_dirs=(
                 getattr(self, "user_data_dir", None),
                 getattr(self, "proxy_extension_dir", None),
-            )
-            if d
-        }
-
-        try:
-            now = time.time()
-            for pat in ("brightdata_proxy_*", "chrome_user_data_*"):
-                for d in glob.glob(os.path.join(PROJECT_TMP_DIR, pat)):
-                    if d in active_dirs:
-                        continue
-                    try:
-                        if now - os.path.getmtime(d) < max_age_seconds:
-                            continue
-                        shutil.rmtree(d, ignore_errors=True)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            ),
+            max_age_seconds=max_age_seconds,
+            logger=self.logger,
+        )
 
     def _recover_driver(self):
         self.logger.info("Recovering from Chrome driver crash...")

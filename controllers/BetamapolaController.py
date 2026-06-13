@@ -20,15 +20,8 @@ from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
 from utils.bet_placement import finalize_confirmed_bet
 from utils.timing import time_it
+from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
-
-# Use a project-local temporary directory to avoid FileNotFoundError on /tmp
-# (very common when running under systemd with PrivateTmp, small tmpfs, or
-# restricted service environments). We create 'tmp/' next to the project root
-# and force tempfile + Chrome to use it.
-PROJECT_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tmp'))
-os.makedirs(PROJECT_TMP_DIR, exist_ok=True)
-tempfile.tempdir = PROJECT_TMP_DIR
 
 
 class BetamapolaController:
@@ -94,6 +87,9 @@ class BetamapolaController:
             self._create_driver()
         except Exception as e:
             self.logger.error(f"Initial driver creation failed in __init__ (betting() will retry with recovery): {e}")
+            handle_init_driver_failure(
+                self.logger, self.user_data_dir, self.proxy_extension_dir
+            )
             self.driver = None
             self.wait = None
             self.user_data_dir = None
@@ -1635,31 +1631,14 @@ class BetamapolaController:
 
     def _cleanup_stale_temp_dirs(self, max_age_seconds: int = 3600):
         """Remove old temp profile/extension dirs without killing live browser processes."""
-        import shutil
-        import glob
-
-        active_dirs = {
-            d for d in (
+        cleanup_stale_temp_dirs(
+            active_dirs=(
                 getattr(self, "user_data_dir", None),
                 getattr(self, "proxy_extension_dir", None),
-            )
-            if d
-        }
-
-        try:
-            now = time.time()
-            for pat in ("brightdata_proxy_*", "chrome_user_data_*"):
-                for d in glob.glob(os.path.join(PROJECT_TMP_DIR, pat)):
-                    if d in active_dirs:
-                        continue
-                    try:
-                        if now - os.path.getmtime(d) < max_age_seconds:
-                            continue
-                        shutil.rmtree(d, ignore_errors=True)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            ),
+            max_age_seconds=max_age_seconds,
+            logger=self.logger,
+        )
 
     def _recover_driver(self):
         """Attempt to recover from driver crash by killing processes, removing stale temps,

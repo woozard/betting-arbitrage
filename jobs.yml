@@ -2,27 +2,34 @@ jobs:
   - name: arbitrage
     script: arbitrage.py
     interval_seconds: 30
+    start_offset_seconds: 0
 
   - name: sports411_odds
     script: sports411_odds.py
     interval_seconds: 30
+    start_offset_seconds: 0
 
   - name: betamapola_odds
     script: betamapola_odds.py
     interval_seconds: 30
-
-  - name: sports411_betting
-    script: sports411_betting.py
-    interval_seconds: 30
-
-  - name: betamapola_betting
-    script: betamapola_betting.py
-    interval_seconds: 30
+    start_offset_seconds: 5
 
   - name: paradisewager_odds
     script: paradisewager_odds.py
     interval_seconds: 30
+    start_offset_seconds: 10
+
+  - name: sports411_betting
+    script: sports411_betting.py
+    interval_seconds: 30
+    start_offset_seconds: 15
+
+  - name: betamapola_betting
+    script: betamapola_betting.py
+    interval_seconds: 30
+    start_offset_seconds: 20
 
   - name: paradisewager_betting
     script: paradisewager_betting.py
     interval_seconds: 30
+    start_offset_seconds: 25
