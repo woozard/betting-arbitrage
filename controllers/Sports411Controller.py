@@ -37,6 +37,7 @@ class Sports411Controller:
     MAX_WAGER_ATTEMPTS_PER_ARB = 2
     PENDING_CHECK_CACHE_TTL = 45
     CONFIRM_TIMEOUT_SECONDS = 12
+    MAX_SOFT_NAV_FAILURES = 3
 
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
@@ -698,17 +699,16 @@ class Sports411Controller:
         except Exception:
             return False
 
-    def _return_to_sport_page(self):
+    def _return_to_sport_page(self) -> bool:
         try:
-            if (
-                self.game_lines_path in (self.driver.current_url or "")
-                and self._sport_games_present()
-            ):
-                return
+            if self._is_on_sport_page_with_games():
+                return True
             self.driver.get(self.sport_url)
             self._wait_for_sport_games_loaded()
+            return self._is_on_sport_page_with_games()
         except Exception as e:
             self.logger.warning(f"Could not return to {self.sport_name} page: {e}")
+            return False
 
     def _is_off_sport_page(self, url: str) -> bool:
         return self.game_lines_path not in (url or "")
@@ -1513,6 +1513,7 @@ class Sports411Controller:
             return
 
         consecutive_recoveries = 0
+        consecutive_soft_nav_failures = 0
         while True:
             time.sleep(2)
 
@@ -1522,6 +1523,7 @@ class Sports411Controller:
                 self.logger.error(f"Driver error getting current URL: {e}. Attempting recovery...")
                 self._recover_driver()
                 consecutive_recoveries += 1
+                consecutive_soft_nav_failures = 0
                 if consecutive_recoveries >= 3:
                     backoff = min(60, 10 * consecutive_recoveries)
                     self.logger.warning(f"Multiple recoveries ({consecutive_recoveries}). Backing off {backoff}s.")
@@ -1541,10 +1543,36 @@ class Sports411Controller:
                         f"Off {self.sport_name} page ({current_url}); navigating back without driver reset"
                     )
                     self._return_to_sport_page()
+                    if self._is_on_sport_page_with_games():
+                        consecutive_soft_nav_failures = 0
+                        continue
+                    consecutive_soft_nav_failures += 1
+                    self.logger.warning(
+                        f"Still off {self.sport_name} page after soft navigation "
+                        f"({consecutive_soft_nav_failures}/{self.MAX_SOFT_NAV_FAILURES})"
+                    )
+                    if consecutive_soft_nav_failures >= self.MAX_SOFT_NAV_FAILURES:
+                        self.logger.warning(
+                            f"Soft navigation failed {consecutive_soft_nav_failures} times; "
+                            "escalating to driver recovery"
+                        )
+                        consecutive_soft_nav_failures = 0
+                        self._recover_driver()
+                        consecutive_recoveries += 1
+                        if consecutive_recoveries >= 3:
+                            backoff = min(60, 10 * consecutive_recoveries)
+                            self.logger.warning(
+                                f"Multiple recoveries ({consecutive_recoveries}). Backing off {backoff}s."
+                            )
+                            time.sleep(backoff)
+                            consecutive_recoveries = 0
+                        if not self._relogin_after_recovery():
+                            time.sleep(8)
                     continue
                 self.logger.warning(f"Unexpected URL detected ({current_url}). Re-establishing session...")
                 self._recover_driver()
                 consecutive_recoveries += 1
+                consecutive_soft_nav_failures = 0
                 if consecutive_recoveries >= 3:
                     backoff = min(60, 10 * consecutive_recoveries)
                     self.logger.warning(f"Multiple recoveries ({consecutive_recoveries}). Backing off {backoff}s.")
@@ -1555,6 +1583,7 @@ class Sports411Controller:
                 continue
 
             consecutive_recoveries = 0
+            consecutive_soft_nav_failures = 0
             arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
             matching_arbs = [
                 arb for arb in arbs

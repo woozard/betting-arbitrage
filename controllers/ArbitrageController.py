@@ -324,7 +324,27 @@ class ArbitrageController:
             )
 
             self.__store_arbitrage_cache(arb_data)
-            self.__send_alert(arb)
+            game_date_str = str(arb.game_date)
+            if self.cache.moneyline_alert_already_sent(
+                arb.team_1,
+                arb.team_2,
+                arb.team_1_bookmaker,
+                arb.team_2_bookmaker,
+                game_date_str,
+            ):
+                self.logger.info(
+                    f"Skipping duplicate Telegram alert - {arb.team_1} vs {arb.team_2} | "
+                    f"{arb.team_1_bookmaker} vs {arb.team_2_bookmaker}"
+                )
+            else:
+                self.__send_alert(arb)
+                self.cache.mark_moneyline_alert_sent(
+                    arb.team_1,
+                    arb.team_2,
+                    arb.team_1_bookmaker,
+                    arb.team_2_bookmaker,
+                    game_date_str,
+                )
 
             return arb
 

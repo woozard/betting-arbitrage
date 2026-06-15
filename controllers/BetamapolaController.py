@@ -1485,8 +1485,15 @@ class BetamapolaController:
             )
 
             self._refresh_session_before_wager()
+            self.__ensure_sport_offering_loaded()
 
             game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
+            if not game_line:
+                self.logger.warning(
+                    f"Game {game_id} not found in live API on first pass; refreshing offering"
+                )
+                self.__ensure_sport_offering_loaded()
+                game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
             if not game_line:
                 raise Exception(
                     f"Game {game_id} ({team_name}) not found in live {self.sport_name} API offering"
@@ -1840,6 +1847,15 @@ class BetamapolaController:
                 bet_placed, stake = self.__execute_bet(
                     game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
                 )
+                if not bet_placed:
+                    err = (self._last_bet_error or "").lower()
+                    if "not found in live" in err and "api offering" in err:
+                        self.logger.warning(
+                            f"Game gone from live {self.sport_name} offering; "
+                            f"removing arb from cache | {team_1} vs {team_2}"
+                        )
+                        self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                        continue
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
                     finalize_confirmed_bet(

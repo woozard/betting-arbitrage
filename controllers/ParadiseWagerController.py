@@ -40,6 +40,7 @@ class ParadiseWagerController:
         "logged out",
         "unauthorized",
         "invalid token",
+        "http 401",
     )
 
     def __init__(self, account, site, sport="baseball"):
@@ -712,6 +713,8 @@ class ParadiseWagerController:
         add_result = self._api_call("POST", "/api/wager/AddBet/", details)
         if not add_result or not add_result.get("ok"):
             status = (add_result or {}).get("status")
+            if status == 401:
+                raise Exception(f"AddBet unauthorized (HTTP {status})")
             raise Exception(f"AddBet failed (HTTP {status})")
 
         add_data = add_result.get("data") or {}
@@ -734,6 +737,8 @@ class ParadiseWagerController:
             save_result = self._api_call("POST", "/api/wager/SaveBet/", save_body)
             if not save_result or not save_result.get("ok"):
                 status = (save_result or {}).get("status")
+                if status == 401:
+                    raise Exception(f"SaveBet unauthorized (HTTP {status})")
                 raise Exception(f"SaveBet failed (HTTP {status})")
 
             save_data = save_result.get("data") or {}
