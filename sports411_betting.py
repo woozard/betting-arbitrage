@@ -15,7 +15,7 @@ def run_betting(sport: str):
         label='Bettor'
     )
     controller = Sports411Controller(account, SPORTS411, sport=sport)
-    controller.betting(stake=100)
+    controller.betting(stake=25)
 
 
 def main():

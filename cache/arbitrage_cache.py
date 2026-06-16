@@ -133,8 +133,11 @@ class ArbitrageCache:
     def _leg_placed_key(self, bookmaker, bet_type, game_id):
         return f"leg_placed:{bookmaker}:{bet_type}:{game_id}"
 
-    def _moneyline_alert_key(self, pair_key):
-        return f"moneyline_alert_sent:{pair_key}"
+    def _arb_opportunity_alert_key(self, pair_key):
+        return f"arb_opportunity_alert_sent:{pair_key}"
+
+    def _bet_confirmed_alert_key(self, bookmaker, bet_type, game_id):
+        return f"bet_confirmed_alert_sent:{bookmaker}:{bet_type}:{game_id}"
 
     def is_arb_scan_locked(self, team_1, team_2, book_1, book_2, game_date=None):
         """Stop surfacing NEW arb alerts for this event + bookmaker pair."""
@@ -163,13 +166,25 @@ class ArbitrageCache:
             ttl=self.lock_ttl,
         )
 
-    def moneyline_alert_already_sent(self, team_1, team_2, book_1, book_2, game_date=None):
+    def arb_opportunity_alert_already_sent(self, team_1, team_2, book_1, book_2, game_date=None):
+        """Scanner ===== Arbitrage ===== Telegram dedup (per event + book pair per day)."""
         pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
-        return bool(self.redis.get(self._moneyline_alert_key(pair_key)))
+        return bool(self.redis.get(self._arb_opportunity_alert_key(pair_key)))
 
-    def mark_moneyline_alert_sent(self, team_1, team_2, book_1, book_2, game_date=None):
+    def mark_arb_opportunity_alert_sent(self, team_1, team_2, book_1, book_2, game_date=None):
         pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
-        self.redis.set(self._moneyline_alert_key(pair_key), {"sent_at": "now"}, ttl=self.lock_ttl)
+        self.redis.set(self._arb_opportunity_alert_key(pair_key), {"sent_at": "now"}, ttl=self.lock_ttl)
+
+    def bet_confirmed_alert_already_sent(self, bookmaker, bet_type, game_id):
+        """===== Moneyline Bet ===== Telegram dedup (per confirmed leg)."""
+        return bool(self.redis.get(self._bet_confirmed_alert_key(bookmaker, bet_type, game_id)))
+
+    def mark_bet_confirmed_alert_sent(self, bookmaker, bet_type, game_id):
+        self.redis.set(
+            self._bet_confirmed_alert_key(bookmaker, bet_type, game_id),
+            {"sent_at": "now"},
+            ttl=self.lock_ttl,
+        )
 
     def remove_arbitrage_for_bookmaker(self, arb_data, bookmaker):
         """Remove only the confirming bookmaker's cache entry; keep the other leg actionable."""

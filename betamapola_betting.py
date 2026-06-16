@@ -22,7 +22,7 @@ def main():
     )
 
     controller = BetamapolaController(account, BETAMAPOLA)
-    controller.betting(stake=100)
+    controller.betting(stake=25)
 
 
 if __name__ == "__main__":

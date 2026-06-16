@@ -257,6 +257,17 @@ def format_website(url):
     website = url.replace('http://', '').replace('https://', '').replace('www.', '')
     return website.split('/')[0]  # Return only the domain
 
+
+def format_utc_timestamp(ts=None) -> str:
+    """Format a Unix timestamp (or now) for Telegram/log alerts."""
+    from datetime import datetime, timezone
+
+    if ts is None:
+        dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
 async def send_telegram_alert(alert, chat_id = None) -> None:
     tracemalloc.start()
     try:
@@ -372,19 +383,22 @@ async def discover_telegram_chats() -> None:
             return
         seen = {}
         for update in updates:
-            if update.message and update.message.chat:
-                chat = update.message.chat
-                cid = chat.id
-                if cid not in seen:
-                    seen[cid] = True
-                    name = chat.title or chat.username or (f"{chat.first_name or ''} {chat.last_name or ''}".strip()) or "unnamed"
-                    print(f"Chat ID: {cid}")
-                    print(f"  Type: {chat.type}")
-                    print(f"  Name/Title: {name}")
-                    print(f"  Suggested .env lines:")
-                    print(f"    TELEGRAM_CHAT_ARBITRAGE={cid}  # arb opportunity alerts")
-                    print(f"    TELEGRAM_CHAT_BETTING={cid}    # confirmed moneyline bet alerts")
-                    print()
+            msg = update.message or update.channel_post or update.edited_channel_post
+            if not msg or not msg.chat:
+                continue
+            chat = msg.chat
+            cid = chat.id
+            if cid in seen:
+                continue
+            seen[cid] = True
+            name = chat.title or chat.username or (f"{chat.first_name or ''} {chat.last_name or ''}".strip()) or "unnamed"
+            print(f"Chat ID: {cid}")
+            print(f"  Type: {chat.type}")
+            print(f"  Name/Title: {name}")
+            print(f"  Suggested .env lines:")
+            print(f"    TELEGRAM_CHAT_ARBITRAGE={cid}  # arb opportunity alerts")
+            print(f"    TELEGRAM_CHAT_BETTING={cid}    # confirmed moneyline bet alerts")
+            print()
         if not seen:
             print("No chats with messages found in updates.")
     except Exception as e:

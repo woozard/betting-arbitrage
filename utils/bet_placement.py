@@ -1,6 +1,6 @@
 import asyncio
 
-from utils.helpers import send_telegram_alert
+from utils.helpers import send_telegram_alert, format_utc_timestamp
 
 
 def finalize_confirmed_bet(
@@ -67,9 +67,16 @@ def finalize_confirmed_bet(
     else:
         logger.warning("DB - Bet Not Saved")
 
-    if not cache.moneyline_alert_already_sent(team_1, team_2, book_1, book_2, game_date):
+    if cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
+        logger.info(
+            f"Skipping duplicate bet-confirmed Telegram alert - {bookmaker}/{team_name} | "
+            f"{team_1} vs {team_2} | game_id={game_id}"
+        )
+    else:
+        identified_at = arb.get("identified_at")
         alert = (
             f"===== Moneyline Bet =====\n"
+            f"Identified At: {format_utc_timestamp(identified_at)}\n"
             f"Sport: {sport}\n"
             f"League: {league}\n"
             f"Date: {game_date}\n"
@@ -87,9 +94,4 @@ def finalize_confirmed_bet(
         logger.info("========== Alert ==========")
         betting_chat = telegram_config.get("betting") or telegram_config.get("arbitrage")
         asyncio.run(send_telegram_alert(alert, betting_chat))
-        cache.mark_moneyline_alert_sent(team_1, team_2, book_1, book_2, game_date)
-    else:
-        logger.info(
-            f"Moneyline Telegram alert already sent for {team_1} vs {team_2} "
-            f"({book_1}/{book_2}); skipping duplicate"
-        )
+        cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)

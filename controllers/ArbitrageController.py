@@ -11,16 +11,19 @@ from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
 from utils.config import TELEGRAM
 from utils.logger import Logger
-from utils.helpers import send_telegram_alert, send_testing_alert, send_monitoring_alert, is_game_pregame, parse_game_datetime
+from utils.helpers import (
+    send_telegram_alert,
+    send_testing_alert,
+    send_monitoring_alert,
+    is_game_pregame,
+    parse_game_datetime,
+    format_utc_timestamp,
+)
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
 
 
 class ArbitrageController:
-    # Only surface actionable arbs with combined implied probability strictly below 1.0
-    ARB_THRESHOLD = Decimal("1")
-    CLOSE_LOG_THRESHOLD = Decimal("1.03")
-
     def __init__(self):
         # DB
         self.db: Session = __get_db1_session__()
@@ -160,7 +163,7 @@ class ArbitrageController:
                                         "book_2": o2["bookmaker"],
                                         "odds_2": o2["moneyline_team_2"],
                                     }
-                                if arb_total < self.ARB_THRESHOLD:
+                                if arb_total < Decimal("1"):
                                     arb_found += 1
                                     self.__insert_arbitrage(o1, o2, "o1", "o2", arb_total)
 
@@ -179,7 +182,7 @@ class ArbitrageController:
                                         "book_2": o1["bookmaker"],
                                         "odds_2": o1["moneyline_team_2"],
                                     }
-                                if arb_total < self.ARB_THRESHOLD:
+                                if arb_total < Decimal("1"):
                                     arb_found += 1
                                     self.__insert_arbitrage(o1, o2, "o2", "o1", arb_total)
 
@@ -188,10 +191,10 @@ class ArbitrageController:
                     msg += f" (closest total prob: {float(best_arb):.4f})"
                 self.logger.info(msg)
 
-                # Log near-miss opportunities between the arb threshold and the wider close band
+                # Log near-miss opportunities at or above break-even but below 1.02
                 if (
                     best_arb is not None
-                    and self.ARB_THRESHOLD <= best_arb < self.CLOSE_LOG_THRESHOLD
+                    and Decimal("1") <= best_arb < Decimal("1.02")
                     and best_match is not None
                 ):
                     self.logger.info("========== Close Arb Opportunity (START) ==========")
@@ -325,7 +328,7 @@ class ArbitrageController:
 
             self.__store_arbitrage_cache(arb_data)
             game_date_str = str(arb.game_date)
-            if self.cache.moneyline_alert_already_sent(
+            if self.cache.arb_opportunity_alert_already_sent(
                 arb.team_1,
                 arb.team_2,
                 arb.team_1_bookmaker,
@@ -333,12 +336,12 @@ class ArbitrageController:
                 game_date_str,
             ):
                 self.logger.info(
-                    f"Skipping duplicate Telegram alert - {arb.team_1} vs {arb.team_2} | "
+                    f"Skipping duplicate arb opportunity Telegram alert - {arb.team_1} vs {arb.team_2} | "
                     f"{arb.team_1_bookmaker} vs {arb.team_2_bookmaker}"
                 )
             else:
-                self.__send_alert(arb)
-                self.cache.mark_moneyline_alert_sent(
+                self.__send_alert(arb, arb_data.get("identified_at"))
+                self.cache.mark_arb_opportunity_alert_sent(
                     arb.team_1,
                     arb.team_2,
                     arb.team_1_bookmaker,
@@ -390,12 +393,13 @@ class ArbitrageController:
     # --------------------------------------------------------
     # Send Alert
     # --------------------------------------------------------
-    def __send_alert(self, arb):
+    def __send_alert(self, arb, identified_at=None):
         try:
             self.logger.info("========== Arbitrage - Send Alerts (START) ==========")
 
             alert = (
                 f"===== Arbitrage =====\n"
+                f"Identified At: {format_utc_timestamp(identified_at)}\n"
                 f"Sport: {arb.sport}\n"
                 f"League: {arb.league}\n"
                 f"Date: {arb.game_date}\n"

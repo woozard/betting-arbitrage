@@ -37,7 +37,8 @@ class Sports411Controller:
     )
     MAX_WAGER_ATTEMPTS_PER_ARB = 2
     PENDING_CHECK_CACHE_TTL = 45
-    CONFIRM_TIMEOUT_SECONDS = 12
+    CONFIRM_TIMEOUT_SECONDS = 25
+    PLACE_BET_READY_TIMEOUT = 20
     MAX_SOFT_NAV_FAILURES = 3
 
     # ===================================================================
@@ -988,6 +989,65 @@ class Sports411Controller:
 
         return None, None
 
+    def _get_betslip_team_name(self) -> str:
+        try:
+            return (
+                self.driver.find_element(By.CSS_SELECTOR, "#betslip .team-name").text or ""
+            ).strip()
+        except Exception:
+            return ""
+
+    def _betslip_is_empty(self) -> bool:
+        try:
+            slip_text = (self.driver.find_element(By.ID, "betslip").text or "").lower()
+            if any(marker in slip_text for marker in ("empty", "no selections", "bet slip is empty")):
+                return True
+            return not self.driver.find_elements(By.CSS_SELECTOR, "#betslip .team-name")
+        except Exception:
+            return True
+
+    def _clear_betslip(self):
+        """Remove stale selections so rapid arb cycling does not read the previous leg."""
+        for _ in range(6):
+            if self._betslip_is_empty():
+                return
+
+            removed = False
+            for selector in (
+                "#betslip button.remove-bet",
+                "#betslip .remove-bet",
+                "#betslip .glyphicon-remove",
+                "#betslip a.remove",
+                "#betslip button.close",
+                "#betslip [class*='remove']",
+            ):
+                for btn in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                    try:
+                        if btn.is_displayed():
+                            self.driver.execute_script("arguments[0].click();", btn)
+                            removed = True
+                            time.sleep(0.3)
+                            break
+                    except Exception:
+                        continue
+                if removed:
+                    break
+
+            if not removed:
+                break
+
+        time.sleep(0.2)
+
+    def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> str:
+        deadline = time.time() + timeout
+        last_seen = ""
+        while time.time() < deadline:
+            last_seen = self._get_betslip_team_name()
+            if last_seen.lower() == team_name.lower():
+                return last_seen
+            time.sleep(0.35)
+        return last_seen
+
     def _install_wager_network_hook(self):
         self.driver.execute_script("""
             window.__wagerResponses = [];
@@ -1105,6 +1165,70 @@ class Sports411Controller:
         if accepted:
             self.logger.info("Accepted line changes / odds update prompts")
         return accepted
+
+    def _betslip_needs_line_acceptance(self) -> bool:
+        try:
+            slip_l = (self.driver.find_element(By.ID, "betslip").text or "").lower()
+        except Exception:
+            return False
+        return any(
+            marker in slip_l
+            for marker in (
+                "line changed",
+                "odds changed",
+                "accept changes",
+                "accept change",
+                "price changed",
+            )
+        )
+
+    def _dispatch_stake_input_events(self, stake_input):
+        for event_name in ("input", "change", "blur"):
+            self.driver.execute_script(
+                f"arguments[0].dispatchEvent(new Event('{event_name}', {{bubbles:true}}));",
+                stake_input,
+            )
+
+    def _find_enabled_place_bet_button(self):
+        for selector in (
+            ".place-bet-container button.btn-primary",
+            "#betslip button.btn-primary",
+            "#betslip .place-bet-container button",
+        ):
+            for btn in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                try:
+                    if btn.is_displayed() and btn.is_enabled():
+                        return btn
+                except Exception:
+                    continue
+        return None
+
+    def _wait_for_enabled_place_bet_button(self, timeout: int = None):
+        timeout = timeout or self.PLACE_BET_READY_TIMEOUT
+        deadline = time.time() + timeout
+        last_hint = "button not found"
+        logged_wait = False
+
+        while time.time() < deadline:
+            self._accept_line_changes()
+            if self._betslip_needs_line_acceptance():
+                last_hint = "betslip still shows line/odds change prompt"
+            else:
+                btn = self._find_enabled_place_bet_button()
+                if btn is not None:
+                    return btn
+                last_hint = "Place Bet button present but disabled"
+
+            if not logged_wait:
+                self.logger.info(
+                    f"Waiting for enabled Place Bet button ({last_hint})"
+                )
+                logged_wait = True
+            time.sleep(0.4)
+
+        raise TimeoutException(
+            f"Place Bet button not enabled after {timeout}s ({last_hint})"
+        )
 
     def _verify_open_bet_on_pending(self, team_name: str, stake: float):
         try:
@@ -1300,6 +1424,9 @@ class Sports411Controller:
 
         self.logger.info(f"Moneyline Label: {moneyline_label}")
 
+        self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
+        self._clear_betslip()
+
         self.driver.execute_script(
             "arguments[0].scrollIntoView({block:'center'});", moneyline_label
         )
@@ -1307,11 +1434,13 @@ class Sports411Controller:
         self.driver.execute_script("arguments[0].click();", moneyline_label)
         self.logger.info("Moneyline label clicked")
 
-        self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
-
-        betslip_team = self.wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "#betslip .team-name"))
-        ).text.strip()
+        betslip_team = self._wait_for_betslip_team(team_name, timeout=8)
+        if betslip_team.lower() != team_name.lower():
+            self.logger.warning(
+                f"Betslip still shows '{betslip_team}' after first click; retrying moneyline click"
+            )
+            self.driver.execute_script("arguments[0].click();", moneyline_label)
+            betslip_team = self._wait_for_betslip_team(team_name, timeout=6)
 
         if betslip_team.lower() != team_name.lower():
             raise Exception(
@@ -1342,15 +1471,11 @@ class Sports411Controller:
         )
         stake_input.clear()
         stake_input.send_keys(f"{stake:.2f}")
+        self._dispatch_stake_input_events(stake_input)
         self.logger.info(f"Stake entered: {stake:.2f}")
 
         self._accept_line_changes()
-
-        place_bet_btn = self.wait.until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, ".place-bet-container button.btn-primary:not([disabled])")
-            )
-        )
+        place_bet_btn = self._wait_for_enabled_place_bet_button()
 
         if self._page_has_login_required_marker():
             self._invalidate_wager_session()

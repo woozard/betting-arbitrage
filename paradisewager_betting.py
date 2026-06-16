@@ -22,7 +22,7 @@ def main():
     )
 
     controller = ParadiseWagerController(account, PARADISEWAGER, sport="baseball")
-    controller.betting(stake=100)
+    controller.betting(stake=25)
 
 
 if __name__ == "__main__":
