@@ -877,6 +877,7 @@ class Sports411Controller:
                 "line changed",
                 "odds changed",
                 "line has changed",
+                "line moved",
                 "not accepted",
                 "wager declined",
                 "limit exceeded",
@@ -923,12 +924,17 @@ class Sports411Controller:
     def _cached_odd_int(self, moneyline_odd) -> int:
         return int(float(moneyline_odd))
 
-    def _live_odds_invalidates_arb(self, cached_odd, live_odd) -> bool:
-        cached = self._cached_odd_int(cached_odd)
-        live = self._cached_odd_int(live_odd)
-        if (cached > 0) != (live > 0):
-            return True
-        return abs(cached - live) > 15
+    def _arb_odds_match(self, cached_odd, live_odd) -> bool:
+        if live_odd in (None, ""):
+            return False
+        return self._cached_odd_int(cached_odd) == self._cached_odd_int(live_odd)
+
+    def _reject_if_line_moved(self, cached_odd, live_odd, where: str):
+        if self._arb_odds_match(cached_odd, live_odd):
+            return
+        raise Exception(
+            f"Line moved ({where}): live odds {live_odd} differ from arb odds {cached_odd}"
+        )
 
     def _find_moneyline_label(self, game_container, team_name: str, moneyline_odd):
         labels = game_container.find_elements(
@@ -962,30 +968,20 @@ class Sports411Controller:
             if team.lower() != team_name.lower():
                 continue
 
-            if team_match is None:
-                team_match = label
-                team_match_odds = odds_text
-
-            if odds_text and int(odds_text) == self._cached_odd_int(moneyline_odd):
+            if odds_text and self._arb_odds_match(moneyline_odd, odds_text):
                 self.logger.info(
                     f"Matched Moneyline | Index: {idx} | Team: {team} | Odds: {odds_text}"
                 )
                 return label, odds_text
 
+            if odds_text and team_match is None:
+                team_match = label
+                team_match_odds = odds_text
+
         if team_match is not None:
-            if self._live_odds_invalidates_arb(moneyline_odd, team_match_odds):
-                raise Exception(
-                    f"Live odds {team_match_odds} invalidate cached arb odds {moneyline_odd} "
-                    f"for {team_name}; skipping placement"
-                )
-            self.logger.warning(
-                f"Cached odds {moneyline_odd} unavailable for {team_name}; "
-                f"using live board odds {team_match_odds}"
+            self._reject_if_line_moved(
+                moneyline_odd, team_match_odds, f"board for {team_name}"
             )
-            self.logger.info(
-                f"Matched Moneyline (team-only) | Team: {team_name} | Live odds: {team_match_odds}"
-            )
-            return team_match, team_match_odds
 
         return None, None
 
@@ -1037,6 +1033,23 @@ class Sports411Controller:
                 break
 
         time.sleep(0.2)
+
+    def _get_betslip_odds_text(self) -> str:
+        for selector in (
+            "#betslip .odds span",
+            "#betslip .odds",
+            "#betslip .line-odds",
+            "#betslip .price",
+        ):
+            try:
+                text = (
+                    self.driver.find_element(By.CSS_SELECTOR, selector).text or ""
+                ).strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+        return ""
 
     def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> str:
         deadline = time.time() + timeout
@@ -1203,32 +1216,22 @@ class Sports411Controller:
                     continue
         return None
 
-    def _wait_for_enabled_place_bet_button(self, timeout: int = None):
-        timeout = timeout or self.PLACE_BET_READY_TIMEOUT
-        deadline = time.time() + timeout
-        last_hint = "button not found"
-        logged_wait = False
+    def _require_place_bet_ready(self, cached_odd):
+        if self._betslip_needs_line_acceptance():
+            raise Exception(
+                "Line moved: betslip shows line/odds change prompt; rejecting per arb odds"
+            )
 
-        while time.time() < deadline:
-            self._accept_line_changes()
-            if self._betslip_needs_line_acceptance():
-                last_hint = "betslip still shows line/odds change prompt"
-            else:
-                btn = self._find_enabled_place_bet_button()
-                if btn is not None:
-                    return btn
-                last_hint = "Place Bet button present but disabled"
+        slip_odds = self._get_betslip_odds_text()
+        if slip_odds:
+            self._reject_if_line_moved(cached_odd, slip_odds, "betslip")
 
-            if not logged_wait:
-                self.logger.info(
-                    f"Waiting for enabled Place Bet button ({last_hint})"
-                )
-                logged_wait = True
-            time.sleep(0.4)
-
-        raise TimeoutException(
-            f"Place Bet button not enabled after {timeout}s ({last_hint})"
-        )
+        btn = self._find_enabled_place_bet_button()
+        if btn is None:
+            raise Exception(
+                "Line moved: Place Bet button disabled (odds likely changed from arb)"
+            )
+        return btn
 
     def _verify_open_bet_on_pending(self, team_name: str, stake: float):
         try:
@@ -1417,10 +1420,7 @@ class Sports411Controller:
         if not moneyline_label:
             raise Exception("Moneyline label not found for given team & odds")
 
-        if live_odds and self._cached_odd_int(live_odds) != self._cached_odd_int(moneyline_odd):
-            self.logger.info(
-                f"Proceeding with live odds {live_odds} (cached arb odds were {moneyline_odd})"
-            )
+        self._reject_if_line_moved(moneyline_odd, live_odds, f"board click for {team_name}")
 
         self.logger.info(f"Moneyline Label: {moneyline_label}")
 
@@ -1448,6 +1448,7 @@ class Sports411Controller:
             )
 
         self.logger.info(f"Betslip verified | Team: {betslip_team}")
+        self._reject_if_line_moved(moneyline_odd, self._get_betslip_odds_text(), "betslip after add")
 
         try:
             bet_limits = self.wait.until(
@@ -1474,15 +1475,13 @@ class Sports411Controller:
         self._dispatch_stake_input_events(stake_input)
         self.logger.info(f"Stake entered: {stake:.2f}")
 
-        self._accept_line_changes()
-        place_bet_btn = self._wait_for_enabled_place_bet_button()
+        place_bet_btn = self._require_place_bet_ready(moneyline_odd)
 
         if self._page_has_login_required_marker():
             self._invalidate_wager_session()
             raise Exception("Rejection marker on page: please log in")
 
         self._install_wager_network_hook()
-        self._accept_line_changes()
         self.driver.execute_script("arguments[0].click();", place_bet_btn)
         self.logger.info("Place Bet button clicked")
         network_log = self._get_wager_network_log()
@@ -1793,7 +1792,10 @@ class Sports411Controller:
                 if (
                     not bet_placed
                     and self._last_bet_error
-                    and "invalidate cached arb odds" in self._last_bet_error
+                    and (
+                        "invalidate cached arb odds" in self._last_bet_error
+                        or "line moved" in self._last_bet_error.lower()
+                    )
                 ):
                     self.logger.warning(
                         f"Removing stale arb from cache for {team_1} vs {team_2} on {self.bookmaker}"

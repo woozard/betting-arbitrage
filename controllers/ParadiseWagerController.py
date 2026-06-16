@@ -245,6 +245,9 @@ class ParadiseWagerController:
         raw = (displayed or "").strip()
         return exp in raw or raw == str(expected).strip()
 
+    def _arb_odds_exact_match(self, displayed, expected) -> bool:
+        return self._normalize_us_odds(displayed) == self._normalize_us_odds(expected)
+
     @staticmethod
     def _team_name_matches(candidate: str, expected: str) -> bool:
         cand = (candidate or "").strip().lower()
@@ -982,9 +985,9 @@ class ParadiseWagerController:
             raise Exception(f"No moneyline line Id for {team_name} on game {game_id}")
 
         live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
-        if live_odds is not None and not self._odds_text_matches(str(live_odds), moneyline_odd):
-            self.logger.warning(
-                f"Live odds {live_odds} differ from arb odds {moneyline_odd}; proceeding with line Id {line_id}"
+        if live_odds is not None and not self._arb_odds_exact_match(str(live_odds), moneyline_odd):
+            raise Exception(
+                f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
             )
 
         confirmed, message = self._place_bet_via_api(line_id, stake)
@@ -1200,6 +1203,18 @@ class ParadiseWagerController:
                 bet_placed, stake = self.__execute_bet(
                     game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
                 )
+                if (
+                    not bet_placed
+                    and self._last_bet_error
+                    and "line moved" in self._last_bet_error.lower()
+                ):
+                    self.logger.warning(
+                        f"Removing stale arb from cache (line moved) for {team_1} vs {team_2} "
+                        f"on {self.bookmaker}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
                     finalize_confirmed_bet(
