@@ -85,7 +85,8 @@ def finalize_confirmed_bet(
         logger.info("========== Alert ==========")
         logger.info(alert)
         logger.info("========== Alert ==========")
-        asyncio.run(send_telegram_alert(alert, telegram_config.get("arbitrage")))
+        betting_chat = telegram_config.get("betting") or telegram_config.get("arbitrage")
+        asyncio.run(send_telegram_alert(alert, betting_chat))
         cache.mark_moneyline_alert_sent(team_1, team_2, book_1, book_2, game_date)
     else:
         logger.info(

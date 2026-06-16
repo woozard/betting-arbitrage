@@ -342,8 +342,10 @@ async def discover_telegram_chats() -> None:
         asyncio.run(discover_telegram_chats())
         '
 
-    Paste the printed Chat ID value into .env as TELEGRAM_CHAT_ARBITRAGE=-100...
-    (groups have large negative IDs). Then restart the service.
+    Paste the printed Chat ID into .env:
+      TELEGRAM_CHAT_ARBITRAGE=-100...   (===== Arbitrage ===== alerts)
+      TELEGRAM_CHAT_BETTING=-100...     (===== Moneyline Bet ===== alerts)
+    Groups/channels use large negative IDs. Then restart the service.
 
     The bot created for this project is kleyman_arb_bot (token goes in TELEGRAM_BOT_TOKEN).
 
@@ -379,7 +381,9 @@ async def discover_telegram_chats() -> None:
                     print(f"Chat ID: {cid}")
                     print(f"  Type: {chat.type}")
                     print(f"  Name/Title: {name}")
-                    print(f"  Suggested .env line: TELEGRAM_CHAT_ARBITRAGE={cid}")
+                    print(f"  Suggested .env lines:")
+                    print(f"    TELEGRAM_CHAT_ARBITRAGE={cid}  # arb opportunity alerts")
+                    print(f"    TELEGRAM_CHAT_BETTING={cid}    # confirmed moneyline bet alerts")
                     print()
         if not seen:
             print("No chats with messages found in updates.")
