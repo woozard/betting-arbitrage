@@ -1,0 +1,11 @@
+[Unit]
+Description=Check betting-arbitrage log staleness and restart hung jobs
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/betting-arbitrage
+Environment=MAX_STALE_SEC=600
+ExecStart=/home/ubuntu/betting-arbitrage/check_betting_health.sh

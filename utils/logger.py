@@ -1,47 +1,73 @@
 import logging
-from logging.handlers import TimedRotatingFileHandler
 import os
 from datetime import datetime
+
 from utils.config import LOG_DIR
+
+
+class DailyFileHandler(logging.Handler):
+    """Write to {class_name}-{YYYY-MM-DD}.log and switch files at midnight."""
+
+    def __init__(self, log_dir: str, class_name: str):
+        super().__init__()
+        self.log_dir = log_dir
+        self.class_name = class_name
+        self._current_date = None
+        self._stream = None
+        self._open_for_today()
+
+    def _path_for(self, date_str: str) -> str:
+        return os.path.join(self.log_dir, f"{self.class_name}-{date_str}.log")
+
+    def _open_for_today(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today == self._current_date and self._stream:
+            return
+        if self._stream:
+            self._stream.close()
+        self._current_date = today
+        self._stream = open(self._path_for(today), "a", encoding="utf-8")
+
+    def emit(self, record):
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if today != self._current_date:
+                self._open_for_today()
+            self._stream.write(self.format(record) + "\n")
+            self._stream.flush()
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        if self._stream:
+            self._stream.close()
+            self._stream = None
+        super().close()
+
 
 class Logger:
     @staticmethod
     def get_logger(class_name):
-        # Create a logger for the class
         logger = logging.getLogger(class_name)
+        if logger.handlers:
+            return logger
+
         logger.setLevel(logging.DEBUG)
 
-        # Create a directory for the logs if it doesn't exist
-        log_dir = LOG_DIR or 'logs'
+        log_dir = LOG_DIR or "logs"
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
 
-        # Get today's date for the filename postfix
-        today_date = datetime.now().strftime('%Y-%m-%d')
-        filename = f'{log_dir}/{class_name}-{today_date}.log'
-
-        # Create a timed rotating file handler that creates a new log file daily
-        file_handler = TimedRotatingFileHandler(
-            filename=filename,
-            when='midnight',
-            interval=1,
-            backupCount=7
-        )
+        file_handler = DailyFileHandler(log_dir, class_name)
         file_handler.setLevel(logging.DEBUG)
 
-        # Create a console handler to display logs on the screen
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.DEBUG)
 
-        # Create a formatter and set it for the handlers
-        formatter = logging.Formatter('[%(asctime)s] %(name)s.%(levelname)s: %(message)s')
+        formatter = logging.Formatter("[%(asctime)s] %(name)s.%(levelname)s: %(message)s")
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
 
-        # Clear any existing handlers to ensure clean setup (prevents duplicates or stale config)
-        logger.handlers = []
-
-        # Add the handlers to the logger
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
 

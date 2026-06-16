@@ -21,6 +21,7 @@ from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
 from utils.bet_placement import finalize_confirmed_bet
+from utils.betting_watchdog import BettingLoopWatchdog
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -1490,6 +1491,9 @@ class Sports411Controller:
 
         self.logger.info(f"==================== Betting ({self.sport_name}) (START) ====================")
 
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+
         # Clean only stale temp dirs; never pkill all Chrome (other jobs may be running).
         self._cleanup_stale_temp_dirs()
 
@@ -1498,6 +1502,7 @@ class Sports411Controller:
         # Wrap first login + nav in recovery retries so we don't lose the whole process.
         setup_ok = False
         for attempt in range(1, 6):
+            watchdog.beat()
             try:
                 self._ensure_betting_session()
                 setup_ok = True
@@ -1515,6 +1520,7 @@ class Sports411Controller:
         consecutive_recoveries = 0
         consecutive_soft_nav_failures = 0
         while True:
+            watchdog.beat()
             time.sleep(2)
 
             try:

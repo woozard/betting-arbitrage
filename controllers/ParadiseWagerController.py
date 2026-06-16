@@ -23,6 +23,7 @@ from utils.helpers import (
     prune_debug_files,
 )
 from utils.bet_placement import finalize_confirmed_bet
+from utils.betting_watchdog import BettingLoopWatchdog
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -1074,10 +1075,15 @@ class ParadiseWagerController:
         self.storage = Storage(self.logger)
 
         self.logger.info("==================== Betting (START) ====================")
+
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+
         self._cleanup_stale_temp_dirs()
 
         setup_ok = False
         for attempt in range(1, 6):
+            watchdog.beat()
             try:
                 self._ensure_betting_session()
                 self._refresh_schedule_cache()
@@ -1095,6 +1101,7 @@ class ParadiseWagerController:
 
         consecutive_recoveries = 0
         while True:
+            watchdog.beat()
             time.sleep(2)
 
             try:

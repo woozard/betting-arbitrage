@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily restart of betting-arbitrage Chrome jobs before evening MLB
+
+[Timer]
+OnCalendar=*-*-* 14:00:00 UTC
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

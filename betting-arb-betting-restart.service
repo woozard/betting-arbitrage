@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart betting-arbitrage Chrome betting jobs
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/betting-arbitrage
+ExecStart=/home/ubuntu/betting-arbitrage/restart_betting_jobs.sh
