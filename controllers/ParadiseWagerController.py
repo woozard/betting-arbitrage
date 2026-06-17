@@ -691,25 +691,66 @@ class ParadiseWagerController:
             "PropParlay": False,
         }]
 
+    @staticmethod
+    def _log_wager_api_payload(logger, stage: str, data, ticket_number=None):
+        """Log full wager API JSON when ParadiseWager rejects or returns a non-success status."""
+        try:
+            payload = json.dumps(data, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            payload = repr(data)
+        if len(payload) > 6000:
+            payload = payload[:6000] + "...(truncated)"
+        ticket_note = f" ticket={ticket_number}" if ticket_number else ""
+        logger.warning(f"PW wager API payload ({stage}{ticket_note}): {payload}")
+
     def _extract_bet_errors(self, data: dict) -> list:
         errors = []
         if not isinstance(data, dict):
             return errors
-        for key in ("BetErrors", "Errors", "ErrorMessage"):
+        for key in (
+            "BetErrors",
+            "Errors",
+            "ErrorMessage",
+            "Message",
+            "StatusMessage",
+            "RejectReason",
+            "RejectMessage",
+            "Description",
+        ):
             val = data.get(key)
             if isinstance(val, list):
-                errors.extend(val)
+                errors.extend(str(v) for v in val if v not in (None, ""))
             elif isinstance(val, str) and val.strip():
-                errors.append(val)
+                errors.append(val.strip())
+            elif val not in (None, "", 0, False):
+                errors.append(str(val))
+        if data.get("HasLineChange"):
+            errors.append("HasLineChange=true")
         details = data.get("Details") or []
         if isinstance(details, list):
             for detail in details:
                 if not isinstance(detail, dict):
                     continue
+                if detail.get("HasLineChange"):
+                    errors.append("Detail HasLineChange=true")
+                for key in ("ErrorMessage", "Message", "Description", "RejectReason"):
+                    val = detail.get(key)
+                    if isinstance(val, str) and val.strip():
+                        errors.append(val.strip())
                 err = detail.get("Error") or {}
-                if isinstance(err, dict) and err.get("Description"):
-                    errors.append(err.get("Description"))
-        return errors
+                if isinstance(err, dict):
+                    for key in ("Description", "Message", "Code"):
+                        val = err.get(key)
+                        if val not in (None, ""):
+                            errors.append(str(val))
+        # De-dupe while preserving order
+        seen = set()
+        unique = []
+        for err in errors:
+            if err not in seen:
+                seen.add(err)
+                unique.append(err)
+        return unique
 
     def _place_bet_via_api(self, line_id, stake: float, timeout: int = 45):
         details = self._build_straight_wager_payload(line_id, stake)
@@ -724,7 +765,8 @@ class ParadiseWagerController:
         add_data = add_result.get("data") or {}
         add_errors = self._extract_bet_errors(add_data)
         if add_errors:
-            raise Exception(f"AddBet rejected: {add_errors[:3]}")
+            self._log_wager_api_payload(self.logger, "AddBet rejected", add_data)
+            raise Exception(f"AddBet rejected: {add_errors[:5]}")
 
         delay_key = add_data.get("DelayKey") or ""
         save_body = {
@@ -748,7 +790,8 @@ class ParadiseWagerController:
             save_data = save_result.get("data") or {}
             save_errors = self._extract_bet_errors(save_data)
             if save_errors and not save_data.get("TicketNumber"):
-                raise Exception(f"SaveBet rejected: {save_errors[:3]}")
+                self._log_wager_api_payload(self.logger, "SaveBet rejected", save_data)
+                raise Exception(f"SaveBet rejected: {save_errors[:5]}")
 
             delay_seconds = save_data.get("DelaySeconds") or 0
             if delay_seconds and int(delay_seconds) > 0:
@@ -767,15 +810,20 @@ class ParadiseWagerController:
             raise Exception("SaveBet did not return TicketNumber")
 
         confirm_deadline = time.time() + timeout
+        last_confirm_data = None
         while time.time() < confirm_deadline:
             confirm_result = self._api_call(
                 "POST", "/api/wager/confirmBet/", {"TicketNumber": ticket_number}
             )
             if not confirm_result or not confirm_result.get("ok"):
                 status = (confirm_result or {}).get("status")
+                self._log_wager_api_payload(
+                    self.logger, f"confirmBet HTTP {status}", confirm_result, ticket_number
+                )
                 raise Exception(f"confirmBet failed (HTTP {status})")
 
             confirm_data = confirm_result.get("data") or {}
+            last_confirm_data = confirm_data
             status_code = confirm_data.get("Status")
             if status_code == 2:
                 self.logger.info(f"Bet confirmed (TicketNumber={ticket_number})")
@@ -783,10 +831,26 @@ class ParadiseWagerController:
 
             if status_code in (3, 4):
                 errors = self._extract_bet_errors(confirm_data)
-                raise Exception(f"confirmBet rejected (status={status_code}): {errors[:3]}")
+                self._log_wager_api_payload(
+                    self.logger,
+                    f"confirmBet rejected status={status_code}",
+                    confirm_data,
+                    ticket_number,
+                )
+                detail = errors[:5] if errors else ["no parsed rejection message"]
+                raise Exception(
+                    f"confirmBet rejected (status={status_code}): {detail}"
+                )
 
             time.sleep(1)
 
+        if last_confirm_data is not None:
+            self._log_wager_api_payload(
+                self.logger,
+                "confirmBet timeout last response",
+                last_confirm_data,
+                ticket_number,
+            )
         raise Exception(f"confirmBet not accepted within {timeout}s (ticket={ticket_number})")
 
     def _fetch_open_wagers_via_api(self):
