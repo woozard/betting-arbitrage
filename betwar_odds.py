@@ -16,7 +16,7 @@ def main():
         label=BETWAR_LABEL,
     )
 
-    sports = ["baseball", "basketball"]
+    sports = ["baseball"]
     controller = BetWarController(account, BETWAR, sport=sports[0])
 
     for i, sport in enumerate(sports):
@@ -24,7 +24,7 @@ def main():
         controller._set_sport(sport)
         controller.fetch_odds(quit_driver=(i == len(sports) - 1))
 
-    print("\n✅ Finished fetching NBA + MLB moneyline odds")
+    print("\nFinished fetching MLB moneyline odds from BetWar")
 
 
 if __name__ == "__main__":

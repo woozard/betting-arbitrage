@@ -7,6 +7,7 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+import pytz
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -22,15 +23,8 @@ from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
 from utils.bet_placement import finalize_confirmed_bet
 from utils.timing import time_it
+from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
-
-# Use a project-local temporary directory to avoid FileNotFoundError on /tmp
-# (very common when running under systemd with PrivateTmp, small tmpfs, or
-# restricted service environments). We create 'tmp/' next to the project root
-# and force tempfile + Chrome to use it.
-PROJECT_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tmp'))
-os.makedirs(PROJECT_TMP_DIR, exist_ok=True)
-tempfile.tempdir = PROJECT_TMP_DIR
 
 
 class BetWarController:
@@ -96,6 +90,9 @@ class BetWarController:
             self._create_driver()
         except Exception as e:
             self.logger.error(f"Initial driver creation failed in __init__ (betting() will retry with recovery): {e}")
+            handle_init_driver_failure(
+                self.logger, self.user_data_dir, self.proxy_extension_dir
+            )
             self.driver = None
             self.wait = None
             self.user_data_dir = None
@@ -829,26 +826,70 @@ class BetWarController:
             self.driver.get(self._player_portal_url())
             time.sleep(3)
 
-    def _open_sports_sidebar(self):
-        self._ensure_player_portal()
+    def _portal_click(self, elem):
+        """Click via Selenium first so ASP.NET postback handlers fire."""
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+        time.sleep(0.3)
         try:
-            if self.driver.find_elements(
-                By.CSS_SELECTOR,
-                "#div-sportsSidebar.open, #div-sportsSidebar.show, #div-sportsSidebar[style*='display']",
-            ):
-                return
+            elem.click()
+            return
         except Exception:
             pass
+        self.driver.execute_script("arguments[0].click();", elem)
+
+    def _sports_view_ready(self) -> bool:
+        try:
+            link = self.driver.find_element(By.ID, "linkSports")
+            if (link.get_attribute("aria-expanded") or "").lower() != "true":
+                return False
+            if not self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "#div-sportsSidebar.show, #div-sportsSidebar.collapse.show",
+            ):
+                return False
+            return bool(self.driver.find_elements(By.CSS_SELECTOR, ".sport-sfl-item"))
+        except Exception:
+            return False
+
+    def _open_sports_sidebar(self):
+        self._ensure_player_portal()
+        if self._sports_view_ready():
+            self.logger.info("Sports sidebar already active")
+            return
 
         for selector in ("#linkSports", "a#linkSports"):
             elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
             if elems:
-                self.driver.execute_script("arguments[0].click();", elems[0])
+                self._portal_click(elems[0])
                 self.logger.info("Opened sports sidebar via linkSports")
-                time.sleep(2)
-                return
+                break
+        else:
+            self.logger.warning("linkSports not found")
+            return
 
-        self.logger.warning("linkSports not found; sidebar may already be visible")
+        try:
+            WebDriverWait(self.driver, 15).until(lambda _: self._sports_view_ready())
+        except TimeoutException:
+            self.logger.warning("Sports sidebar did not become active after linkSports click")
+
+    def _sport_expanded(self, sport_name: str) -> bool:
+        elems = self.driver.find_elements(
+            By.CSS_SELECTOR, f'.sport-sfl-item[data-sportname="{sport_name}"]'
+        )
+        if not elems:
+            return False
+        is_open = (elems[0].get_attribute("data-is-open") or "").lower() == "true"
+        has_stl = bool(self._find_sport_stl_items(sport_name))
+        return is_open and has_stl
+
+    def _find_sport_stl_items(self, sport_name: str = None):
+        sport_name = sport_name or self._sidebar_sport_name()
+        xpath = (
+            f"//div[contains(@class,'sport-sfl-item') and @data-sportname='{sport_name}']"
+            f"/following-sibling::div[contains(@class,'sport-tl-menu')]"
+            f"//div[contains(@class,'sport-stl-item')]"
+        )
+        return self.driver.find_elements(By.XPATH, xpath)
 
     def _click_sidebar_sport(self):
         sport_name = self._sidebar_sport_name()
@@ -856,76 +897,201 @@ class BetWarController:
         elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
         if not elems:
             raise Exception(f"Sport sidebar item not found for {sport_name}")
-        self.driver.execute_script("arguments[0].click();", elems[0])
-        self.logger.info(f"Clicked sport sidebar: {sport_name}")
-        time.sleep(2)
 
-    def _click_league_or_subleague(self) -> bool:
-        """Select league under expanded sport. BetWar often uses sport-stl-item, not league-sfl-item."""
+        if self._sport_expanded(sport_name):
+            self.logger.info(f"Sport {sport_name} already expanded with sub-menu")
+            return
+
+        self._portal_click(elems[0])
+        self.logger.info(f"Clicked sport sidebar: {sport_name}")
+        try:
+            WebDriverWait(self.driver, 15).until(lambda _: self._sport_expanded(sport_name))
+        except TimeoutException:
+            self.logger.warning(f"Sport {sport_name} sub-menu did not appear after click")
+
+    def _click_sport_ssl_league(self) -> bool:
+        """Select MLB/NBA under the expanded sport (sport-ssl-item), not the sport header."""
         keywords = self._league_keywords()
 
-        for elem in self.driver.find_elements(By.CSS_SELECTOR, ".league-sfl-item"):
-            name = (elem.get_attribute("data-leaguename") or elem.text or "").strip().lower()
-            if name and any(kw in name for kw in keywords):
-                self.driver.execute_script("arguments[0].click();", elem)
-                self.logger.info(f"Clicked league-sfl-item: {(elem.text or name)[:80]}")
-                time.sleep(2)
+        for elem in self.driver.find_elements(By.CSS_SELECTOR, ".sport-ssl-item"):
+            label = (elem.get_attribute("data-sportname") or elem.text or "").strip().lower()
+            if label and any(kw in label for kw in keywords):
+                self._portal_click(elem)
+                self.logger.info(f"Clicked sport-ssl-item league: {(elem.text or label)[:80]}")
+                self._wait_for_postback()
+                self._wait_for_loading_hidden()
                 return True
 
         for span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblLeagueName, p.lblLeagueName"):
             text = (span.text or "").strip()
-            text_l = text.lower()
             if not text:
                 continue
-            if any(kw in text_l for kw in keywords):
-                clickable = span
+            text_l = text.lower()
+            if keywords and not any(kw in text_l for kw in keywords):
+                continue
+            clickable = span
+            for xpath in (
+                "./ancestor::div[contains(@class,'sport-ssl-item')][1]",
+                "./ancestor::div[contains(@class,'sport-sfl-item')][1]",
+            ):
                 try:
-                    clickable = span.find_element(
-                        By.XPATH,
-                        "./ancestor::div[contains(@class,'list-group-item')][1]",
-                    )
+                    clickable = span.find_element(By.XPATH, xpath)
+                    break
                 except Exception:
-                    pass
-                self.driver.execute_script("arguments[0].click();", clickable)
-                self.logger.info(f"Clicked lblLeagueName league: {text[:80]}")
-                time.sleep(2)
-                return True
+                    continue
+            self._portal_click(clickable)
+            self.logger.info(f"Clicked lblLeagueName league: {text[:80]}")
+            self._wait_for_postback()
+            self._wait_for_loading_hidden()
+            return True
+        return False
 
-        stl_items = self.driver.find_elements(By.CSS_SELECTOR, ".sport-stl-item")
+    def _click_game_subleague_item(self) -> bool:
+        """Click the Game/Full Game period under the selected league."""
+        sport_name = self._sidebar_sport_name()
+        stl_items = self._find_sport_stl_items(sport_name)
+        if not stl_items:
+            stl_items = self.driver.find_elements(By.CSS_SELECTOR, ".sport-stl-item")
+
+        target = None
         for elem in stl_items:
             label = (elem.text or "").strip().lower()
             if label in ("game", "games", "full game") or "game" in label:
-                self.driver.execute_script("arguments[0].click();", elem)
-                self.logger.info(f"Clicked sport-stl-item: {(elem.text or '')[:80]}")
-                time.sleep(2)
-                return True
+                target = elem
+                break
+        if target is None and stl_items:
+            target = stl_items[0]
 
-        if stl_items:
-            self.driver.execute_script("arguments[0].click();", stl_items[0])
-            self.logger.info(f"Clicked first sport-stl-item fallback: {(stl_items[0].text or '')[:80]}")
-            time.sleep(2)
-            return True
+        if not target:
+            self.logger.warning(f"No sport-stl-item found under {sport_name}")
+            return False
 
-        self.logger.warning(f"No league/subleague item found for {self.sport_name}")
+        self._portal_click(target)
+        self.logger.info(f"Clicked sport-stl-item: {(target.text or '')[:80]}")
+        self._wait_for_postback()
+        self._wait_for_loading_hidden()
+        return True
+
+    def _click_league_or_subleague(self) -> bool:
+        """Select league (sport-ssl-item) then Game period (sport-stl-item)."""
+        for elem in self.driver.find_elements(By.CSS_SELECTOR, ".league-sfl-item"):
+            name = (elem.get_attribute("data-leaguename") or elem.text or "").strip().lower()
+            if name and any(kw in name for kw in self._league_keywords()):
+                self._portal_click(elem)
+                self.logger.info(f"Clicked league-sfl-item: {(elem.text or name)[:80]}")
+                self._wait_for_postback()
+                break
+
+        if not self._click_sport_ssl_league():
+            self.logger.warning(
+                f"No {self.sport_name} league item found in sidebar; lines may not load"
+            )
+            return False
+
+        return self._click_game_subleague_item()
+
+    def _straights_tab_active(self) -> bool:
+        for elem in self.driver.find_elements(By.CSS_SELECTOR, "#btnStraights"):
+            classes = (elem.get_attribute("class") or "").lower()
+            return "active" in classes or "btn-danger" in classes
         return False
 
     def _ensure_straights_tab(self):
-        for selector in ("#btnStraights", "[id='btnStraights']"):
-            elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
-            if elems:
-                self.driver.execute_script("arguments[0].click();", elems[0])
-                time.sleep(1)
-                return
+        if self._straights_tab_active():
+            self.logger.info("Straights tab already active; skipping submit click")
+            return
+
+        elems = self.driver.find_elements(By.CSS_SELECTOR, "#btnStraights")
+        if elems:
+            self._portal_click(elems[0])
+            self._wait_for_postback()
+
+    def _wait_for_postback(self, timeout: int = 20):
+        """BetWar sidebar clicks trigger ASP.NET postbacks; wait for DOM to settle."""
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            pass
+        time.sleep(2)
+
+    def _wait_for_loading_hidden(self, timeout: int = 45):
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                EC.invisibility_of_element_located((By.ID, "divLoading"))
+            )
+        except TimeoutException:
+            pass
+
+    @staticmethod
+    def _normalize_ml_odds(value) -> str:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.lower() == "even":
+            return "+100"
+        return text
+
+    def _parse_betwar_game_datetime(self, raw: str) -> str:
+        raw = (raw or "").strip()
+        if not raw:
+            return parse_to_mysql_datetime(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                tz_name=self.game_tz,
+            )
+
+        tz = pytz.timezone(self.game_tz)
+        year = datetime.now(tz).year
+        match = re.search(
+            r"([A-Za-z]{3})\s+(\d{1,2})\s*-\s*(\d{1,2}:\d{2}\s*[APap][Mm])",
+            raw,
+        )
+        if match:
+            try:
+                local_dt = datetime.strptime(
+                    f"{match.group(1)} {match.group(2)} {year} {match.group(3)}",
+                    "%b %d %Y %I:%M %p",
+                )
+                utc_dt = tz.localize(local_dt).astimezone(pytz.utc)
+                return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        normalized = parse_to_mysql_datetime(raw, tz_name=self.game_tz)
+        return normalized or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _page_indicates_no_lines(self) -> bool:
+        try:
+            page_l = (self.driver.page_source or "").lower()
+            markers = (
+                "no games available",
+                "no lines available",
+                "no contests available",
+                "there are no",
+                "currently no",
+            )
+            return any(marker in page_l for marker in markers)
+        except Exception:
+            return False
 
     def _player_lines_populated(self) -> bool:
         try:
-            team_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.lblTeamName")
-            rot_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation")
-            has_team = any((s.text or "").strip() for s in team_spans)
-            has_rot = any((s.text or "").strip() for s in rot_spans)
-            return has_team and has_rot
+            if self.driver.find_elements(By.CSS_SELECTOR, ".btnMLLine, .divMLLine"):
+                team_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.lblTeamName")
+                rot_spans = self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation")
+                has_team = any((s.text or "").strip() for s in team_spans)
+                has_rot = any((s.text or "").strip() for s in rot_spans)
+                if has_team and has_rot:
+                    return True
+            game_content = self.driver.find_elements(By.CSS_SELECTOR, "#divGameContent .divTeamContent")
+            if len(game_content) >= 2:
+                return True
         except Exception:
-            return False
+            pass
+        return False
 
     def _wait_for_player_game_lines(self, timeout: int = 45) -> bool:
         deadline = time.time() + timeout
@@ -948,13 +1114,155 @@ class BetWarController:
         if team_elem:
             team = team_elem.get_text(strip=True)
 
-        for odds_elem in row.select("span.odds, .odds, [class*='odds']"):
-            txt = odds_elem.get_text(strip=True)
-            if re.search(r"^[+-]?\d+$", txt):
-                ml = txt
-                break
+        ml_btn = row.select_one(".btnMLLine, .divMLLine")
+        if ml_btn:
+            ml = self._normalize_ml_odds(ml_btn.get_text(strip=True))
+
+        if not ml:
+            for odds_elem in row.select("span.odds, .odds, [class*='odds']"):
+                txt = odds_elem.get_text(strip=True)
+                if re.search(r"^[+-]?\d+$", txt) or txt.lower() == "even":
+                    ml = self._normalize_ml_odds(txt)
+                    break
 
         return {"rotation": rot, "team": team, "moneyline": ml}
+
+    def _fetch_lines_via_getlines_api(self) -> list:
+        """Call linesAJX.aspx/GetLines inside the authenticated browser session."""
+        script = """
+            const callback = arguments[arguments.length - 1];
+            (async () => {
+                try {
+                    const sigEl = document.getElementById('_hiddenAppSignature');
+                    const sig = sigEl ? sigEl.value : '';
+                    const challenge = (typeof generateJsChallenge === 'function')
+                        ? generateJsChallenge() : '';
+
+                    let menuItems = [];
+                    if (typeof menuItemsSelected !== 'undefined' && menuItemsSelected.length) {
+                        menuItems = menuItemsSelected;
+                    } else {
+                        const active = document.querySelector(
+                            '.sport-ssl-item.active, .sport-stl-item.active'
+                        );
+                        if (active) {
+                            menuItems = [{
+                                idSport: active.getAttribute('data-value'),
+                                name: active.getAttribute('data-sportname') || '',
+                                token: active.getAttribute('data-token') || ''
+                            }];
+                        }
+                    }
+
+                    if (!menuItems.length) {
+                        callback({error: 'no menuItemsSelected'});
+                        return;
+                    }
+
+                    const payload = {
+                        menuItems: menuItems,
+                        iscontest: false,
+                        wagerTypeInfo: (typeof wagerTypeSelected !== 'undefined'
+                            ? wagerTypeSelected : '1'),
+                        isRefresh: false,
+                        contestOrderBy: 0,
+                        isContestRelated: false,
+                        specialEvent: null,
+                        getOnlyPeriods: false
+                    };
+
+                    const resp = await fetch(
+                        '/Player/app/services/linesAJX.aspx/GetLines',
+                        {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json; charset=utf-8',
+                                'X-App-Signature': sig,
+                                'X-Js-Challenge': challenge,
+                                'X-Requested-With': 'XMLHttpRequest'
+                            },
+                            body: JSON.stringify(payload)
+                        }
+                    );
+                    const body = await resp.json();
+                    callback({ok: true, status: resp.status, body: body});
+                } catch (e) {
+                    callback({error: String(e)});
+                }
+            })();
+        """
+        try:
+            result = self.driver.execute_async_script(script)
+        except Exception as e:
+            self.logger.warning(f"GetLines browser API call failed: {e}")
+            return []
+
+        if not result or result.get("error"):
+            self.logger.warning(f"GetLines API unavailable: {result}")
+            return []
+
+        return self._parse_getlines_response(result.get("body") or {})
+
+    def _parse_getlines_response(self, body: dict) -> list:
+        raw = (body or {}).get("d") or ""
+        if not raw:
+            return []
+
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError) as e:
+            self.logger.warning(f"GetLines response JSON parse failed: {e}")
+            return []
+
+        events = []
+        for grp in data.get("groups") or []:
+            events.extend(grp.get("lines") or [])
+        if not events:
+            events = data.get("lines") or []
+
+        games = []
+        for ev in events:
+            if ev.get("eventtype") != 2:
+                continue
+            sides = ev.get("sides") or []
+            if len(sides) < 2:
+                continue
+
+            s1, s2 = sides[0], sides[1]
+            rot1 = str(s1.get("rotation") or "").strip()
+            rot2 = str(s2.get("rotation") or "").strip()
+            team1 = (s1.get("name") or "").strip()
+            team2 = (s2.get("name") or "").strip()
+            ml1 = self._normalize_ml_odds((s1.get("moneyline") or {}).get("odds"))
+            ml2 = self._normalize_ml_odds((s2.get("moneyline") or {}).get("odds"))
+
+            if not rot1 or not rot2 or not team1 or not team2 or not ml1 or not ml2:
+                continue
+
+            normalized_dt = self._parse_betwar_game_datetime(ev.get("dateandtime"))
+
+            games.append({
+                "bookmaker": self.bookmaker,
+                "sport": self.sport_name,
+                "league": self.league,
+                "game_id": f"{rot1}-{rot2}",
+                "game_datetime": normalized_dt,
+                "match": f"{team1} vs {team2}",
+                "team_1": team1,
+                "team_2": team2,
+                "moneyline": {"team_1": ml1, "team_2": ml2},
+                "spread": {
+                    "team_1_spread": None, "team_2_spread": None,
+                    "team_1_odds": None, "team_2_odds": None,
+                },
+                "total": {
+                    "over_total": None, "under_total": None,
+                    "over_odds": None, "under_odds": None,
+                },
+            })
+
+        self.logger.info(f"Parsed {len(games)} games from GetLines API")
+        return games
 
     def _parse_player_portal_dom(self, html: str) -> list:
         """Parse game lines from BetWar Player portal DOM (divGameTeam rows)."""
@@ -962,7 +1270,7 @@ class BetWarController:
         games = []
         rows = []
 
-        for row in soup.select("div.divGameTeam"):
+        for row in soup.select("div.divTeamContent, div.divGameTeam"):
             parsed = self._extract_team_row(row)
             if parsed["team"] and parsed["rotation"]:
                 rows.append(parsed)
@@ -1023,11 +1331,16 @@ class BetWarController:
         self._open_sports_sidebar()
         self._click_sidebar_sport()
         self._click_league_or_subleague()
+        # Straights is usually already active; clicking the submit input resets the board.
         self._ensure_straights_tab()
 
-        lines_ready = self._wait_for_player_game_lines(timeout=45)
+        lines_ready = self._wait_for_player_game_lines(timeout=60)
         if lines_ready:
             self.logger.info(f"{self.sport_name} lines detected in Player portal DOM")
+        elif self._page_indicates_no_lines():
+            self.logger.warning(
+                f"{self.sport_name} board loaded but bookmaker reports no available lines"
+            )
         else:
             debug_file = debug_filepath(f"debug_betwar_{self.sport_name.lower()}_nav_fail")
             with open(debug_file, "w", encoding="utf-8") as f:
@@ -1200,20 +1513,30 @@ class BetWarController:
             self._ensure_odds_session()
             self.__ensure_sport_offering_loaded()
 
-            games = []
-            api_lines = []
+            games = self._fetch_lines_via_getlines_api()
+            if games:
+                self.logger.info(f"Using GetLines API: {len(games)} full-game lines")
+            else:
+                api_lines = self._fetch_game_lines_via_api()
+                if api_lines:
+                    games = self._parse_api_game_lines(api_lines)
+                    self.logger.info(
+                        f"Using GetSportOffering API: {len(games)} full-game lines"
+                    )
 
-            if not self._player_lines_populated():
-                self.logger.info("Waiting for Player portal game lines to populate...")
-                self._wait_for_player_game_lines(timeout=30)
-                time.sleep(3)
-
-            games = self._parse_player_portal_dom(self.driver.page_source)
             if not games:
-                self.logger.warning(
-                    "Player portal DOM scrape returned no games; "
-                    "account may not offer this league or lines are still loading"
-                )
+                if not self._player_lines_populated():
+                    self.logger.info("Waiting for Player portal game lines to populate...")
+                    self._wait_for_player_game_lines(timeout=30)
+                    self._wait_for_loading_hidden(timeout=15)
+                    time.sleep(2)
+
+                games = self._parse_player_portal_dom(self.driver.page_source)
+                if not games:
+                    self.logger.warning(
+                        "Player portal scrape returned no games; "
+                        "account may not offer this league or lines are still loading"
+                    )
 
             # Capture network requests made during the load (useful for both paths)
             try:
@@ -1928,31 +2251,14 @@ class BetWarController:
 
     def _cleanup_stale_temp_dirs(self, max_age_seconds: int = 3600):
         """Remove old temp profile/extension dirs without killing live browser processes."""
-        import shutil
-        import glob
-
-        active_dirs = {
-            d for d in (
+        cleanup_stale_temp_dirs(
+            active_dirs=(
                 getattr(self, "user_data_dir", None),
                 getattr(self, "proxy_extension_dir", None),
-            )
-            if d
-        }
-
-        try:
-            now = time.time()
-            for pat in ("brightdata_proxy_*", "chrome_user_data_*"):
-                for d in glob.glob(os.path.join(PROJECT_TMP_DIR, pat)):
-                    if d in active_dirs:
-                        continue
-                    try:
-                        if now - os.path.getmtime(d) < max_age_seconds:
-                            continue
-                        shutil.rmtree(d, ignore_errors=True)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            ),
+            max_age_seconds=max_age_seconds,
+            logger=self.logger,
+        )
 
     def _recover_driver(self):
         """Attempt to recover from driver crash by killing processes, removing stale temps,
