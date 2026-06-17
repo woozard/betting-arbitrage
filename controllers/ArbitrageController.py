@@ -72,11 +72,37 @@ class ArbitrageController:
 
     # DB-backed odds fetch (as assumed by design)
     # --------------------------------------------------------
+    @staticmethod
+    def _odds_dedup_key(row: dict) -> tuple:
+        team_a, team_b = sorted(
+            [(row.get("team_1") or "").strip().lower(), (row.get("team_2") or "").strip().lower()]
+        )
+        dt = row.get("game_datetime") or ""
+        date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
+        return row["bookmaker"], team_a, team_b, date_key
+
+    @staticmethod
+    def _prefer_odds_row(candidate: dict, current: dict) -> dict:
+        if candidate["created_at"] > current["created_at"]:
+            return candidate
+        if candidate["created_at"] < current["created_at"]:
+            return current
+
+        # Same scrape timestamp: S411 often inserts two game_ids for one matchup.
+        if candidate.get("bookmaker") == "sports411":
+            try:
+                cand_id = int(candidate.get("game_id") or 0)
+                cur_id = int(current.get("game_id") or 0)
+                return candidate if cand_id > cur_id else current
+            except (TypeError, ValueError):
+                pass
+        return current
+
     def get_recent_moneyline_odds_from_db(self, minutes: int = 60):
         """Pull recent moneyline odds from DB (populated by controllers like Sports411 and Betamapola).
 
-        Returns only the *latest* row per bookmaker per (team_1, team_2) to avoid
-        comparing stale historical snapshots against each other.
+        Returns only the *latest* row per bookmaker per normalized matchup to avoid
+        comparing stale historical snapshots (or duplicate S411 game_ids) against each other.
         """
         cutoff = datetime.utcnow() - timedelta(minutes=minutes)
         rows = (
@@ -106,9 +132,11 @@ class ArbitrageController:
         # Deduplicate: keep only the most recent odds per bookmaker + matchup
         latest = {}
         for o in results:
-            key = (o["bookmaker"], o["team_1"], o["team_2"])
-            if key not in latest or o["created_at"] > latest[key]["created_at"]:
+            key = self._odds_dedup_key(o)
+            if key not in latest:
                 latest[key] = o
+            else:
+                latest[key] = self._prefer_odds_row(o, latest[key])
 
         # Remove the internal created_at before returning
         for o in latest.values():

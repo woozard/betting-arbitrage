@@ -57,4 +57,5 @@ check_one() {
   check_one "sports411-betting-mlb" "sports411_betting.py" "/tmp/sports411_betting.lock"
   check_one "betamapola-betting" "betamapola_betting.py" "/tmp/betamapola_betting.lock"
   check_one "paradisewager-betting" "paradisewager_betting.py" "/tmp/paradisewager_betting.lock"
+  check_one "betwar-betting" "betwar_betting.py" "/tmp/betwar_betting.lock"
 } >>"$LOG_FILE" 2>&1

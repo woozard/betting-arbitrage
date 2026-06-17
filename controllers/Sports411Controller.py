@@ -428,6 +428,51 @@ class Sports411Controller:
 
         return None
 
+    @staticmethod
+    def _matchup_key(team_1: str, team_2: str, game_datetime: str) -> tuple:
+        teams = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
+        date_part = (game_datetime or "")[:10]
+        return teams + (date_part,)
+
+    @staticmethod
+    def _pick_canonical_game(existing: dict, candidate: dict) -> dict:
+        """When the DOM lists the same matchup twice, keep the higher idgame.
+
+        Placement clicks use div.sports-league-game[idgame='…']; the higher idgame
+        is the node that matches live betting (e.g. 52002449 vs 51977641).
+        """
+        try:
+            existing_id = int(existing.get("game_id") or 0)
+            candidate_id = int(candidate.get("game_id") or 0)
+        except (TypeError, ValueError):
+            return existing
+        return candidate if candidate_id > existing_id else existing
+
+    def _dedupe_games_by_matchup(self, games: list) -> list:
+        seen = {}
+        for game in games:
+            key = self._matchup_key(
+                game.get("team_1"), game.get("team_2"), game.get("game_datetime")
+            )
+            if key not in seen:
+                seen[key] = game
+                continue
+
+            prev = seen[key]
+            chosen = self._pick_canonical_game(prev, game)
+            dropped = prev if chosen is game else game
+            kept = chosen
+            self.logger.warning(
+                f"Dropping duplicate S411 game_id={dropped.get('game_id')} "
+                f"({dropped.get('team_1')} vs {dropped.get('team_2')}, "
+                f"ML {dropped.get('moneyline')}); "
+                f"keeping game_id={kept.get('game_id')} "
+                f"(ML {kept.get('moneyline')})"
+            )
+            seen[key] = chosen
+
+        return list(seen.values())
+
     def _combine_date_with_time(self, time_str: str) -> str:
         """ '7:10 PM' or '19:10' or '19:10:00' -> '2026-06-01 19:10:00' (today's date)
         The resulting string is passed through parse_to_mysql_datetime with this book's
@@ -585,6 +630,13 @@ class Sports411Controller:
                 except Exception as e:
                     self.logger.error(f"Error parsing game: {e}", exc_info=True)
                     continue
+
+            raw_count = len(games)
+            games = self._dedupe_games_by_matchup(games)
+            if raw_count != len(games):
+                self.logger.info(
+                    f"Deduped S411 matchups: {raw_count} DOM nodes -> {len(games)} unique games"
+                )
 
             self.logger.info(f"Extracted {len(games)} {self.sport_name} matches via Selenium")
 

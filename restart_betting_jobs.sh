@@ -11,14 +11,14 @@ mkdir -p "$LOG_DIR"
 {
   echo "[$STAMP] === Restarting betting jobs ==="
 
-  for pattern in sports411_betting.py betamapola_betting.py paradisewager_betting.py; do
+  for pattern in sports411_betting.py betamapola_betting.py paradisewager_betting.py betwar_betting.py; do
     pkill -f "$pattern" || true
   done
 
   sleep 2
-  pkill -9 -f 'sports411_betting.py|betamapola_betting.py|paradisewager_betting.py' || true
+  pkill -9 -f 'sports411_betting.py|betamapola_betting.py|paradisewager_betting.py|betwar_betting.py' || true
 
-  rm -f /tmp/sports411_betting.lock /tmp/betamapola_betting.lock /tmp/paradisewager_betting.lock
+  rm -f /tmp/sports411_betting.lock /tmp/betamapola_betting.lock /tmp/paradisewager_betting.lock /tmp/betwar_betting.lock
 
   echo "[$STAMP] Betting jobs killed; scheduler will respawn within ~30s"
 } >>"$LOG_FILE" 2>&1

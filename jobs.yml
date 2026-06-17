@@ -19,6 +19,11 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 10
 
+  - name: betwar_odds
+    script: betwar_odds.py
+    interval_seconds: 30
+    start_offset_seconds: 12
+
   - name: sports411_betting
     script: sports411_betting.py
     interval_seconds: 30
@@ -33,3 +38,8 @@ jobs:
     script: paradisewager_betting.py
     interval_seconds: 30
     start_offset_seconds: 25
+
+  - name: betwar_betting
+    script: betwar_betting.py
+    interval_seconds: 30
+    start_offset_seconds: 30

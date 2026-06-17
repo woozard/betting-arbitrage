@@ -21,8 +21,8 @@ def main():
         label=BETWAR_LABEL,
     )
 
-    controller = BetWarController(account, BETWAR)
-    controller.betting(stake=100)
+    controller = BetWarController(account, BETWAR, sport="baseball")
+    controller.betting(stake=25)
 
 
 if __name__ == "__main__":
