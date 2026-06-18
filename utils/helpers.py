@@ -676,6 +676,19 @@ def odds_equal(odds1, odds2, tolerance=1e-6):
 
     return abs(p1 - p2) <= tolerance
 
+
+def is_plausible_moneyline_pair(ml_1, ml_2) -> bool:
+    """Reject obvious scrape glitches for 2-way American moneylines."""
+    try:
+        a = float(ml_1)
+        b = float(ml_2)
+    except (TypeError, ValueError):
+        return False
+    if a == 0.0 or b == 0.0:
+        return False
+    # One side must be the underdog (+) and the other the favorite (-).
+    return (a > 0 and b < 0) or (a < 0 and b > 0)
+
 def parse_odds(payload: dict) -> list[dict]:
     rows = []
 

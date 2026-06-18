@@ -18,6 +18,7 @@ from utils.helpers import (
     is_game_pregame,
     parse_game_datetime,
     format_utc_timestamp,
+    is_plausible_moneyline_pair,
 )
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
@@ -102,7 +103,13 @@ class ArbitrageController:
                 pass
         return current
 
-    def get_recent_moneyline_odds_from_db(self, minutes: int = 60):
+    def get_recent_moneyline_odds_from_db(
+        self,
+        minutes: int = 60,
+        *,
+        keep_created_at: bool = False,
+        require_plausible_moneyline: bool = False,
+    ):
         """Pull recent moneyline odds from DB (populated by controllers like Sports411 and Betamapola).
 
         Returns only the *latest* row per bookmaker per normalized matchup to avoid
@@ -113,20 +120,25 @@ class ArbitrageController:
             self.db.query(ArbitrageOdds)
             .filter(ArbitrageOdds.bet_type == "moneyline")
             .filter(ArbitrageOdds.created_at >= cutoff)
+            .order_by(ArbitrageOdds.created_at.desc())
             .all()
         )
 
-        # Build list with created_at for deduping
+        # Build list with created_at for deduping (query is newest-first).
         results = []
         for r in rows:
+            ml_1 = float(r.moneyline_team_1) if r.moneyline_team_1 is not None else None
+            ml_2 = float(r.moneyline_team_2) if r.moneyline_team_2 is not None else None
+            if require_plausible_moneyline and not is_plausible_moneyline_pair(ml_1, ml_2):
+                continue
             results.append({
                 "bookmaker": r.bookmaker,
                 "bet_type": r.bet_type,
                 "game_id": r.game_id,
                 "team_1": r.team_1,
                 "team_2": r.team_2,
-                "moneyline_team_1": float(r.moneyline_team_1) if r.moneyline_team_1 is not None else None,
-                "moneyline_team_2": float(r.moneyline_team_2) if r.moneyline_team_2 is not None else None,
+                "moneyline_team_1": ml_1,
+                "moneyline_team_2": ml_2,
                 "sport": r.sport,
                 "league": r.league,
                 "game_datetime": r.game_datetime.isoformat() if r.game_datetime else None,
@@ -142,9 +154,9 @@ class ArbitrageController:
             else:
                 latest[key] = self._prefer_odds_row(o, latest[key])
 
-        # Remove the internal created_at before returning
-        for o in latest.values():
-            o.pop("created_at", None)
+        if not keep_created_at:
+            for o in latest.values():
+                o.pop("created_at", None)
 
         return list(latest.values())
 

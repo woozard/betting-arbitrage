@@ -74,7 +74,7 @@ async def run_bot():
                 if cmd == "/scan":
                     logger.info("/scan requested")
                     try:
-                        report = build_scan_report(minutes=30)
+                        report = build_scan_report()
                         await _send_report(bot, chat_id, report)
                     except Exception as exc:
                         logger.error(f"/scan failed: {exc}", exc_info=True)

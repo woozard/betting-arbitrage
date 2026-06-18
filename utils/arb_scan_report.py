@@ -10,6 +10,9 @@ from typing import List, Optional, Tuple
 
 from controllers.ArbitrageController import ArbitrageController
 from utils.config import ACTIVE_ARB_BOOKMAKERS, ACTIVE_ARB_BOOK_PAIRS, ARB_MAX_TOTAL_PROB, MIN_ARB_PROFIT_PCT
+from utils.helpers import is_plausible_moneyline_pair
+
+SCAN_ODDS_WINDOW_MINUTES = 10
 
 BOOK_LABELS = {
     "sports411": "S411",
@@ -39,6 +42,55 @@ def valid_ml(value) -> bool:
         return float(value) != 0.0
     except (TypeError, ValueError):
         return False
+
+
+def _row_is_usable(row: dict) -> bool:
+    ml_1 = row.get("moneyline_team_1")
+    ml_2 = row.get("moneyline_team_2")
+    return (
+        valid_ml(ml_1)
+        and valid_ml(ml_2)
+        and is_plausible_moneyline_pair(ml_1, ml_2)
+    )
+
+
+def _store_matchup_row(by_matchup: dict, row: dict) -> None:
+    """Keep the newest scrape per bookmaker for each normalized matchup."""
+    if not _row_is_usable(row):
+        return
+    key = matchup_key(row)
+    book = row["bookmaker"]
+    current = by_matchup[key].get(book)
+    if current is None:
+        by_matchup[key][book] = row
+        return
+    cur_ts = current.get("created_at")
+    new_ts = row.get("created_at")
+    if cur_ts is None or (new_ts is not None and new_ts >= cur_ts):
+        by_matchup[key][book] = row
+
+
+def _book_freshness_lines(odds: list) -> List[str]:
+    latest_by_book = {}
+    for row in odds:
+        book = row.get("bookmaker")
+        ts = row.get("created_at")
+        if not book or ts is None:
+            continue
+        if book not in latest_by_book or ts > latest_by_book[book]:
+            latest_by_book[book] = ts
+
+    if not latest_by_book:
+        return ["Book freshness: no recent scrapes in window"]
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    lines = ["Book freshness (latest DB scrape):"]
+    for book in sorted(latest_by_book):
+        ts = latest_by_book[book]
+        age_s = max(0, int((now - ts).total_seconds()))
+        label = BOOK_LABELS.get(book, book)
+        lines.append(f"  {label:<9} {ts.strftime('%H:%M:%S')} UTC ({age_s}s ago)")
+    return lines
 
 
 def matchup_key(row: dict) -> tuple:
@@ -171,33 +223,37 @@ def format_pair_section(book_a: str, book_b: str, rows: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_scan_report(minutes: int = 30) -> str:
+def build_scan_report(minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> str:
     ctrl = ArbitrageController()
-    odds = ctrl.get_recent_moneyline_odds_from_db(minutes=minutes)
+    odds = ctrl.get_recent_moneyline_odds_from_db(
+        minutes=minutes,
+        keep_created_at=True,
+        require_plausible_moneyline=True,
+    )
 
     by_matchup = defaultdict(dict)
     for row in odds:
         if row["bookmaker"] not in ACTIVE_ARB_BOOKMAKERS:
             continue
-        if not valid_ml(row.get("moneyline_team_1")) or not valid_ml(row.get("moneyline_team_2")):
-            continue
-        key = matchup_key(row)
-        by_matchup[key][row["bookmaker"]] = row
+        _store_matchup_row(by_matchup, row)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    threshold_line = (
-        f"Execute when profit >= {MIN_ARB_PROFIT_PCT:.2f}% "
-        f"(total prob < {ARB_MAX_TOTAL_PROB:.4f})"
-        if MIN_ARB_PROFIT_PCT > 0
-        else f"Execute when total prob < {ARB_MAX_TOTAL_PROB:.4f} (positive profit %)"
-    )
+    if MIN_ARB_PROFIT_PCT != 0:
+        threshold_line = (
+            f"Execute when profit >= {MIN_ARB_PROFIT_PCT:.2f}% "
+            f"(total prob < {ARB_MAX_TOTAL_PROB:.4f})"
+        )
+    else:
+        threshold_line = f"Execute when total prob < {ARB_MAX_TOTAL_PROB:.4f} (positive profit %)"
     sections = [
         "===== MLB Scan =====",
         f"Time: {now}",
-        f"Odds window: last {minutes} min",
+        f"Odds window: last {minutes} min (latest scrape per book/matchup)",
         threshold_line,
         "",
     ]
+    sections.extend(_book_freshness_lines(odds))
+    sections.append("")
 
     global_best: Optional[Tuple[float, str, dict]] = None
     pair_sections = []
