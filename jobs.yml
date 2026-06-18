@@ -33,3 +33,8 @@ jobs:
     script: betamapola_betting.py
     interval_seconds: 30
     start_offset_seconds: 30
+
+  - name: telegram_ops_bot
+    script: telegram_ops_bot.py
+    interval_seconds: 300
+    start_offset_seconds: 0

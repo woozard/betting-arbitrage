@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from database.config import __get_db1_session__
 from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
-from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, is_active_arb_pair
+from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, is_active_arb_pair, ARB_MAX_TOTAL_PROB
 from utils.logger import Logger
 from utils.helpers import (
     send_telegram_alert,
@@ -200,7 +200,7 @@ class ArbitrageController:
                                         "book_2": o2["bookmaker"],
                                         "odds_2": o2["moneyline_team_2"],
                                     }
-                                if arb_total < Decimal("1"):
+                                if arb_total < Decimal(str(ARB_MAX_TOTAL_PROB)):
                                     arb_found += 1
                                     self.__insert_arbitrage(o1, o2, "o1", "o2", arb_total)
 
@@ -219,7 +219,7 @@ class ArbitrageController:
                                         "book_2": o1["bookmaker"],
                                         "odds_2": o1["moneyline_team_2"],
                                     }
-                                if arb_total < Decimal("1"):
+                                if arb_total < Decimal(str(ARB_MAX_TOTAL_PROB)):
                                     arb_found += 1
                                     self.__insert_arbitrage(o1, o2, "o2", "o1", arb_total)
 

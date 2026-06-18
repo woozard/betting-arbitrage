@@ -51,6 +51,13 @@ BET_STAKE = float(os.getenv('BET_STAKE', '20'))
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'true').lower() in (
     '1', 'true', 'yes',
 )
+MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '0'))
+if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
+    ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))
+elif MIN_ARB_PROFIT_PCT > 0:
+    ARB_MAX_TOTAL_PROB = 1.0 - (MIN_ARB_PROFIT_PCT / 100.0)
+else:
+    ARB_MAX_TOTAL_PROB = 1.0
 ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
