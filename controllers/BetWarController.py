@@ -18,11 +18,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
-from utils.bet_placement import finalize_confirmed_bet
+from utils.bet_placement import finalize_confirmed_bet, maybe_notify_partial_arb_exposure
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -703,6 +703,108 @@ class BetWarController:
             if self._betslip_has_team(team_name):
                 return True
             time.sleep(0.4)
+        return False
+
+    def _ensure_betslip_expanded(self):
+        """BetWar hides the slip in a Bootstrap collapse panel on smaller viewports."""
+        try:
+            slip = self.driver.find_element(By.CSS_SELECTOR, "#div-betSlip")
+            slip_class = slip.get_attribute("class") or ""
+            if "collapse" in slip_class and "show" not in slip_class:
+                for selector in ("#btnBetSlipCart", "[data-target='#div-betSlip']", ".btnBetSlipCart"):
+                    try:
+                        btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                        if btn.is_displayed():
+                            self.driver.execute_script("arguments[0].click();", btn)
+                            time.sleep(0.5)
+                            break
+                    except Exception:
+                        continue
+                self.driver.execute_script(
+                    "var el = document.getElementById('div-betSlip');"
+                    "if (el) { el.classList.add('show'); el.style.display = 'block'; }"
+                )
+        except Exception:
+            pass
+
+    def _enter_betslip_stake(self, stake: float) -> bool:
+        self._ensure_betslip_expanded()
+        stake_input = None
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            for inp in self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "#pills-betslip input.txtRiskAmount, #divBetSlip input.txtRiskAmount",
+            ):
+                if inp.is_displayed() and inp.is_enabled():
+                    stake_input = inp
+                    break
+            if stake_input:
+                break
+            time.sleep(0.3)
+
+        if not stake_input:
+            return False
+
+        stake_str = f"{stake:.2f}"
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", stake_input
+        )
+        try:
+            stake_input.click()
+            stake_input.clear()
+            stake_input.send_keys(stake_str)
+        except Exception:
+            self.driver.execute_script(
+                """
+                var el = arguments[0];
+                var val = arguments[1];
+                el.focus();
+                el.value = val;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                if (typeof calculateBStxtWin === 'function') calculateBStxtWin(el);
+                """,
+                stake_input,
+                stake_str,
+            )
+        self.logger.info(f"Stake entered: {stake_str}")
+        return True
+
+    def _fill_wager_password_if_required(self):
+        try:
+            pwd_input = self.driver.find_element(By.CSS_SELECTOR, "#txtPassword")
+            if not pwd_input.is_displayed():
+                return
+            pwd_input.clear()
+            pwd_input.send_keys(self.password or "")
+            self.logger.info("Wager password confirmation entered")
+        except Exception:
+            pass
+
+    def _click_place_bets_button(self):
+        for selector in ("#btnBSSaveWagers", "button.btnBSSaveSelections"):
+            try:
+                btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                if btn.is_displayed():
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.2)
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    self.logger.info("Place Bets clicked")
+                    return True
+            except Exception:
+                continue
+
+        for btn in self.driver.find_elements(
+            By.CSS_SELECTOR, "#div-betSlip button, #pills-betslip button"
+        ):
+            onclick = (btn.get_attribute("onclick") or "").lower()
+            btn_text = (btn.text or "").lower()
+            if "processwagers" in onclick or "place bet" in btn_text or "submit" in btn_text:
+                if btn.is_displayed():
+                    self.driver.execute_script("arguments[0].click();", btn)
+                    self.logger.info("Place Bets clicked (fallback)")
+                    return True
         return False
 
     def _add_moneyline_to_slip(
@@ -1725,6 +1827,45 @@ class BetWarController:
         rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
         team_lower = team_name.lower()
 
+        # Modern layout: team name in divGameTeam, moneyline click target in sibling divLineContainer.
+        for team_label in self.driver.find_elements(By.CSS_SELECTOR, "span.lblTeamName"):
+            label_text = (team_label.text or "").strip().lower()
+            if team_lower not in label_text and label_text not in team_lower:
+                continue
+
+            team_row = team_label.find_element(
+                By.XPATH,
+                "./ancestor::div[contains(@class,'row')][.//div[contains(@class,'divLineContainer')]][1]",
+            )
+            team_block = team_label.find_element(
+                By.XPATH,
+                "./ancestor::div[contains(@class,'divGameTeam')][1]",
+            )
+            rot_spans = team_block.find_elements(By.CSS_SELECTOR, "span.lblRotation")
+            rot_text = (rot_spans[0].text if rot_spans else "").strip()
+            if rotations and rot_text and rot_text not in rotations:
+                continue
+
+            for ml_card in team_row.find_elements(
+                By.CSS_SELECTOR,
+                "div.btnMLLine, div.gc-line.btnMLLine, div.divMLLine .gc-line",
+            ):
+                odds_elem = None
+                for cand in ml_card.find_elements(By.CSS_SELECTOR, "span.odds, .odds"):
+                    txt = (cand.text or "").strip()
+                    if self._odds_text_matches(txt, moneyline_odd):
+                        odds_elem = cand
+                        break
+                if not odds_elem:
+                    txt = (ml_card.text or "").strip()
+                    if not self._odds_text_matches(txt, moneyline_odd):
+                        continue
+                click_target = ml_card
+                if ml_card.get_attribute("onclick"):
+                    return click_target
+                parent = ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@onclick][1]")
+                return parent or click_target
+
         for row in self.driver.find_elements(By.CSS_SELECTOR, "div.divGameTeam"):
             row_text = (row.text or "").lower()
             if team_lower not in row_text:
@@ -1882,10 +2023,10 @@ class BetWarController:
         )
 
     def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
-        for pick in self._fetch_open_wagers_via_api():
-            if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
-                return True
-        return False
+        confirmed, _ = self._verify_open_bet_on_my_bets(
+            team_name, stake=None, team_1=team_1, team_2=team_2
+        )
+        return confirmed
 
     def _message_requires_relogin(self, message: str) -> bool:
         msg_l = (message or "").lower()
@@ -2033,6 +2174,97 @@ class BetWarController:
         except Exception:
             return []
 
+    def _is_wager_submission_response(self, url: str, body: str) -> bool:
+        url_l = (url or "").lower()
+        if any(
+            probe in url_l
+            for probe in ("getwagerpicks", "getsportoffering", "getlines", "getpending")
+        ):
+            return False
+        body_l = (body or "").lstrip().lower()
+        if body_l.startswith("<!doctype") or body_l.startswith("<html"):
+            return False
+        return any(
+            marker in url_l
+            for marker in ("processwager", "savewager", "placewager", "submitwager", "wagerajx")
+        )
+
+    def _open_my_bets_tab(self):
+        tab = self.driver.find_element(By.CSS_SELECTOR, "#pillsPendingTab")
+        selected = (tab.get_attribute("aria-selected") or "").lower() == "true"
+        if not selected:
+            self.driver.execute_script("arguments[0].click();", tab)
+
+    def _my_bets_tab_text(self, timeout: int = 10) -> str:
+        """Load and return visible text from the Player portal My Bets tab."""
+        self._open_my_bets_tab()
+        deadline = time.time() + timeout
+        last_text = ""
+        while time.time() < deadline:
+            try:
+                pending = self.driver.find_element(By.CSS_SELECTOR, "#pills-pending")
+                text = (pending.text or "").strip()
+                if text:
+                    last_text = text
+                text_l = text.lower()
+                loading = not text or text_l in ("my bets", "loading", "loading...")
+                has_wagers = any(
+                    marker in text_l
+                    for marker in ("risk", "to win", "pending", "wager", "no pending", "no open")
+                )
+                tab_loaded = (self.driver.find_element(
+                    By.CSS_SELECTOR, "#pillsPendingTab"
+                ).get_attribute("data-loaded") or "").lower() == "true"
+                if not loading and (has_wagers or tab_loaded):
+                    return text
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return last_text
+
+    def _verify_open_bet_on_my_bets(
+        self,
+        team_name: str,
+        stake: float = None,
+        team_1: str = None,
+        team_2: str = None,
+    ):
+        """
+        BetWar Player portal confirmation: verify the wager appears on My Bets.
+        The legacy /sports/Api/Betting.asmx endpoints are not available here.
+        """
+        try:
+            text = self._my_bets_tab_text(timeout=12)
+            if not text:
+                return False, "My Bets tab did not load"
+            text_l = text.lower()
+            self.logger.info(f"My Bets tab preview: {text[:250]}")
+
+            if team_name.lower() not in text_l:
+                return False, "Team not found on My Bets tab"
+
+            if stake is not None:
+                team_idx = text_l.find(team_name.lower())
+                team_section = text[team_idx:team_idx + 120] if team_idx >= 0 else text
+                stake_variants = (
+                    f"{stake:.2f}",
+                    f"{stake:.0f}",
+                    f"${stake:.2f}",
+                    f"${stake:.0f}",
+                )
+                if any(variant in team_section for variant in stake_variants):
+                    return True, "Open bet confirmed on My Bets tab"
+                if any(variant in text for variant in stake_variants):
+                    return True, "Open bet confirmed on My Bets tab (stake matched)"
+                if "risk" in text_l or "to win" in text_l or "/" in team_section:
+                    return True, "Open bet confirmed on My Bets tab (team matched)"
+                return False, "Team on My Bets but stake not verified"
+
+            return True, "Open bet confirmed on My Bets tab"
+        except Exception as e:
+            return False, str(e)
+
+
     def _scan_rejection_ui(self):
         reject_markers = (
             "error", "rejected", "not accepted", "another user has taken",
@@ -2088,11 +2320,16 @@ class BetWarController:
         return accepted
 
     def _confirm_bet_accepted(self, team_name: str, team_1: str, team_2: str, stake: float, timeout: int = 25):
+        """
+        Confirm BetWar wagers by checking the My Bets tab after Place Bets is clicked.
+        """
         deadline = time.time() + timeout
         success_markers = (
             "wager accepted", "bet accepted", "ticket accepted",
             "successfully placed", "your wager has been accepted",
         )
+
+        self.logger.info("Confirming wager via My Bets tab")
 
         while time.time() < deadline:
             rejected, reject_msg = self._scan_rejection_ui()
@@ -2102,40 +2339,48 @@ class BetWarController:
                 self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
                 return False, reject_msg
 
+            confirmed, message = self._verify_open_bet_on_my_bets(
+                team_name, stake=stake, team_1=team_1, team_2=team_2
+            )
+            if confirmed:
+                return True, message
+
             page_l = (self.driver.page_source or "").lower()
             for marker in success_markers:
                 if marker in page_l:
-                    return True, marker
+                    confirmed, message = self._verify_open_bet_on_my_bets(
+                        team_name, stake=stake, team_1=team_1, team_2=team_2
+                    )
+                    if confirmed:
+                        return True, message
 
             for entry in self._get_wager_network_log():
-                body_l = (entry.get("body") or "").lower()
                 url = entry.get("url") or ""
-                if any(m in body_l for m in ("rejected", "declined", "error", "another user")):
-                    self.logger.error(f"Wager API rejection ({url}): {entry.get('body', '')[:500]}")
+                body = entry.get("body") or ""
+                if not self._is_wager_submission_response(url, body):
+                    continue
+                body_l = body.lower()
+                if any(m in body_l for m in ("rejected", "declined", "another user")):
+                    self.logger.error(f"Wager API rejection ({url}): {body[:500]}")
                     return False, f"Wager API rejected: {url}"
-                if any(m in body_l for m in ("accepted", "confirmed", "success", "ticket")):
-                    self.logger.info(f"Wager API success ({url}): {entry.get('body', '')[:300]}")
-                    return True, "Wager API confirmed"
-
-            for pick in self._fetch_open_wagers_via_api():
-                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
-                    return True, "Open wager found via GetWagerPicks"
 
             time.sleep(1)
 
         self.logger.warning(
-            f"Bet not confirmed within {timeout}s; final GetWagerPicks retries"
+            f"Bet not confirmed within {timeout}s; final My Bets retries"
         )
         for attempt in range(1, 4):
-            for pick in self._fetch_open_wagers_via_api():
-                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
-                    return True, "Open wager found via GetWagerPicks (retry)"
+            confirmed, message = self._verify_open_bet_on_my_bets(
+                team_name, stake=stake, team_1=team_1, team_2=team_2
+            )
+            if confirmed:
+                return True, f"{message} (retry)"
             if attempt < 3:
                 time.sleep(5)
-        return False, "Bet not confirmed by bookmaker"
+        return False, "Bet not confirmed on My Bets tab"
 
     # --------------------------------------------------------
-    # Execute Bet (adapted for BetWar /sports#/ SPA + betSlipDiv)
+    # Execute Bet (BetWar Player portal main.aspx + bet slip)
     # --------------------------------------------------------
     def __execute_bet(
         self,
@@ -2197,8 +2442,10 @@ class BetWarController:
             if not self.__ensure_sport_offering_loaded():
                 raise Exception(f"{self.sport_name} lines not loaded before bet placement")
 
+            game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
+
             moneyline_elem = self._find_moneyline_element(
-                game_id, team_name, moneyline_odd
+                game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
             )
 
             if not moneyline_elem:
@@ -2206,8 +2453,9 @@ class BetWarController:
                     f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, re-navigating"
                 )
                 self.__ensure_sport_offering_loaded()
+                game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
                 moneyline_elem = self._find_moneyline_element(
-                    game_id, team_name, moneyline_odd
+                    game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
                 )
 
             if not moneyline_elem:
@@ -2231,58 +2479,11 @@ class BetWarController:
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
 
-            # ENTER STAKE - look for common risk/stake inputs (TicoSports style often uses input[id^=risk_] or ng-model risk)
-            stake_input = None
-            for selector in [
-                "input[id^='risk_']",
-                "input[name*='risk']",
-                "input[ng-model*='risk']",
-                "input[ng-model*='stake']",
-                "#div-betSlip input[type='text']",
-                "#div-betSlip input[type='number']",
-                "#betSlipDiv input[type='text']",
-                "#betSlipDiv input[type='number']",
-            ]:
-                try:
-                    elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if elems:
-                        stake_input = elems[0]
-                        break
-                except:
-                    continue
-
-            if not stake_input:
-                # Fallback: any visible text input in the bet slip area
-                for inp in self.driver.find_elements(
-                    By.CSS_SELECTOR, "#div-betSlip input, #betSlipDiv input"
-                ):
-                    if inp.is_displayed():
-                        stake_input = inp
-                        break
-
-            if stake_input:
-                stake_input.clear()
-                stake_input.send_keys(f"{stake:.2f}")
-                self.logger.info(f"Stake entered: {stake:.2f}")
-            else:
-                self.logger.warning("Could not locate stake input - bet may use default")
+            if not self._enter_betslip_stake(stake):
+                raise Exception("Could not locate interactable risk amount input in bet slip")
 
             self._accept_line_changes()
-
-            # Click Place Bet (ng-click=ProcessTicket() or text)
-            place_btn = None
-            for b in self.driver.find_elements(
-                By.CSS_SELECTOR,
-                "#div-betSlip button, #div-betSlip a, #btnBetSlipCart, #betSlipDiv button, #betSlipDiv a",
-            ):
-                btn_text = (b.text or "").lower()
-                ng_click = (b.get_attribute("ng-click") or "").lower()
-                if "place bet" in btn_text or "place wager" in btn_text or "process" in ng_click:
-                    place_btn = b
-                    break
-
-            if not place_btn:
-                raise Exception("Place Bet button not found")
+            self._fill_wager_password_if_required()
 
             if self._page_has_login_required_marker():
                 self._invalidate_wager_session()
@@ -2290,13 +2491,11 @@ class BetWarController:
 
             self._install_wager_network_hook()
             self._accept_line_changes()
-            self.driver.execute_script("arguments[0].click();", place_btn)
-            self.logger.info("Place Bet clicked")
-            network_log = self._get_wager_network_log()
-            if network_log:
-                self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
-            else:
-                self.logger.warning("No wager network activity detected immediately after Place Bet click")
+            if not self._click_place_bets_button():
+                raise Exception("Place Bets button not found")
+
+            self.logger.info("Place Bets clicked; confirming on My Bets tab")
+            time.sleep(2)
 
             matchup_1 = team_1 or ""
             matchup_2 = team_2 or ""
@@ -2530,6 +2729,13 @@ class BetWarController:
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
 
+                if not is_active_arb_pair(book_1, book_2):
+                    self.logger.info(
+                        f"Skipping arb — inactive book pair {book_1} x {book_2} | "
+                        f"{team_1} vs {team_2}"
+                    )
+                    continue
+
                 if self.cache.is_arb_stale(arb):
                     age = self.cache.arb_age_seconds(arb)
                     self.logger.info(
@@ -2547,16 +2753,42 @@ class BetWarController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
+                first_leg_book = required_first_leg_book(book_1, book_2, self.bookmaker)
+                if first_leg_book:
+                    first_leg_game_id = (
+                        arb["team_1_game_id"]
+                        if book_1 == first_leg_book
+                        else arb["team_2_game_id"]
+                    )
+                    if not self.cache.is_leg_placed(
+                        first_leg_book, bet_type, first_leg_game_id
+                    ):
+                        self.logger.info(
+                            f"Waiting for {first_leg_book} confirmation before betting on "
+                            f"{self.bookmaker} | {team_1} vs {team_2}"
+                        )
+                        continue
+
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
-                        f"Open wager detected via API for {team_name} on {self.bookmaker}; "
-                        f"skipping duplicate placement (arb scan lock requires bookmaker confirmation)"
+                        f"Open wager detected on My Bets for {team_name} on {self.bookmaker}; "
+                        f"skipping duplicate placement"
                     )
                     continue
 
                 bet_placed, stake = self.__execute_bet(
                     game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
                 )
+                if not bet_placed:
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        self._last_bet_error or "Bet not accepted by bookmaker",
+                        TELEGRAM,
+                    )
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
                     finalize_confirmed_bet(

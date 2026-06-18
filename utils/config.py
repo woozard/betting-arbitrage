@@ -62,7 +62,8 @@ ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager",
+        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
+        "sports411:betwar,betamapola:betwar,paradisewager:betwar",
     ).split(",")
     if part.strip() and ":" in part
 )
@@ -70,7 +71,8 @@ ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
     (parts[0].strip().lower(), parts[1].strip().lower())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager",
+        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
+        "sports411:betwar,betamapola:betwar,paradisewager:betwar",
     ).split(",")
     if part.strip() and ":" in part
     for parts in [part.strip().split(":", 1)]

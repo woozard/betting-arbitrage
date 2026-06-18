@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import traceback
 import requests
@@ -675,6 +676,42 @@ def odds_equal(odds1, odds2, tolerance=1e-6):
     p2 = implied_probability(odds2)
 
     return abs(p1 - p2) <= tolerance
+
+
+def normalize_team(name: str) -> str:
+    """Strip book-specific abbrev prefixes (e.g. SEA Mariners -> mariners)."""
+    name = (name or "").strip()
+    name = re.sub(r"^[A-Z]{2,4}\s+", "", name)
+    return name.strip().lower()
+
+
+def teams_same(a: str, b: str) -> bool:
+    a_n, b_n = normalize_team(a), normalize_team(b)
+    if not a_n or not b_n:
+        return False
+    return a_n == b_n or a_n in b_n or b_n in a_n
+
+
+def align_cross_book_moneylines(o1: dict, o2: dict):
+    """
+    Return moneylines on o1's team_1/team_2 orientation:
+    (o1_t1_ml, o1_t2_ml, o2_t1_ml, o2_t2_ml) or None if teams do not match.
+    """
+    if teams_same(o1["team_1"], o2["team_1"]) and teams_same(o1["team_2"], o2["team_2"]):
+        return (
+            o1["moneyline_team_1"],
+            o1["moneyline_team_2"],
+            o2["moneyline_team_1"],
+            o2["moneyline_team_2"],
+        )
+    if teams_same(o1["team_1"], o2["team_2"]) and teams_same(o1["team_2"], o2["team_1"]):
+        return (
+            o1["moneyline_team_1"],
+            o1["moneyline_team_2"],
+            o2["moneyline_team_2"],
+            o2["moneyline_team_1"],
+        )
+    return None
 
 
 def is_plausible_moneyline_pair(ml_1, ml_2) -> bool:

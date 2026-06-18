@@ -19,6 +19,8 @@ from utils.helpers import (
     parse_game_datetime,
     format_utc_timestamp,
     is_plausible_moneyline_pair,
+    normalize_team,
+    align_cross_book_moneylines,
 )
 from utils.timing import time_it
 from cache.arbitrage_cache import ArbitrageCache
@@ -80,7 +82,7 @@ class ArbitrageController:
     @staticmethod
     def _odds_dedup_key(row: dict) -> tuple:
         team_a, team_b = sorted(
-            [(row.get("team_1") or "").strip().lower(), (row.get("team_2") or "").strip().lower()]
+            [normalize_team(row.get("team_1") or ""), normalize_team(row.get("team_2") or "")]
         )
         dt = row.get("game_datetime") or ""
         date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
@@ -175,15 +177,17 @@ class ArbitrageController:
 
             if all_odds:
                 for o in all_odds:
-                    # Include date portion so that (if ever) same team names on different days don't cross
                     dt = o.get("game_datetime") or ""
                     date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-                    key = (o["team_1"], o["team_2"], date_key)
+                    key = (
+                        tuple(sorted([normalize_team(o["team_1"]), normalize_team(o["team_2"])])),
+                        date_key,
+                    )
                     matches.setdefault(key, []).append(o)
 
                 best_arb = None
                 best_match = None
-                for (team_1, team_2, date_key), odds_group in matches.items():
+                for (norm_teams, date_key), odds_group in matches.items():
                     for i in range(len(odds_group)):
                         for j in range(i + 1, len(odds_group)):
                             o1 = odds_group[i]
@@ -197,10 +201,13 @@ class ArbitrageController:
                             ):
                                 continue
 
+                            aligned = align_cross_book_moneylines(o1, o2)
+                            if not aligned:
+                                continue
+                            a_t1, a_t2, b_t1, b_t2 = aligned
+
                             # Case 1: bet team_1 on o1's book, team_2 on o2's book
-                            arb_total = self.__calc_arb_total(
-                                o1["moneyline_team_1"], o2["moneyline_team_2"]
-                            )
+                            arb_total = self.__calc_arb_total(a_t1, b_t2)
                             if arb_total:
                                 if best_arb is None or arb_total < best_arb:
                                     best_arb = arb_total
@@ -208,18 +215,19 @@ class ArbitrageController:
                                         "team_1": o1["team_1"],
                                         "team_2": o1["team_2"],
                                         "book_1": o1["bookmaker"],
-                                        "odds_1": o1["moneyline_team_1"],
+                                        "odds_1": a_t1,
                                         "book_2": o2["bookmaker"],
-                                        "odds_2": o2["moneyline_team_2"],
+                                        "odds_2": b_t2,
                                     }
                                 if arb_total < Decimal(str(ARB_MAX_TOTAL_PROB)):
                                     arb_found += 1
-                                    self.__insert_arbitrage(o1, o2, "o1", "o2", arb_total)
+                                    self.__insert_arbitrage(
+                                        o1, o2, "o1", "o2", arb_total,
+                                        team_1_odds=a_t1, team_2_odds=b_t2,
+                                    )
 
                             # Case 2: bet team_1 on o2's book, team_2 on o1's book
-                            arb_total = self.__calc_arb_total(
-                                o2["moneyline_team_1"], o1["moneyline_team_2"]
-                            )
+                            arb_total = self.__calc_arb_total(b_t1, a_t2)
                             if arb_total:
                                 if best_arb is None or arb_total < best_arb:
                                     best_arb = arb_total
@@ -227,13 +235,16 @@ class ArbitrageController:
                                         "team_1": o1["team_1"],
                                         "team_2": o1["team_2"],
                                         "book_1": o2["bookmaker"],
-                                        "odds_1": o2["moneyline_team_1"],
+                                        "odds_1": b_t1,
                                         "book_2": o1["bookmaker"],
-                                        "odds_2": o1["moneyline_team_2"],
+                                        "odds_2": a_t2,
                                     }
                                 if arb_total < Decimal(str(ARB_MAX_TOTAL_PROB)):
                                     arb_found += 1
-                                    self.__insert_arbitrage(o1, o2, "o2", "o1", arb_total)
+                                    self.__insert_arbitrage(
+                                        o1, o2, "o2", "o1", arb_total,
+                                        team_1_odds=b_t1, team_2_odds=a_t2,
+                                    )
 
                 msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
                 if arb_found == 0 and best_arb is not None:
@@ -277,7 +288,7 @@ class ArbitrageController:
         t2 = o1 if t2_from == "o1" else o2
         return t1, t2
 
-    def __build_arb_data(self, o1, o2, t1_from, t2_from, arb_total):
+    def __build_arb_data(self, o1, o2, t1_from, t2_from, arb_total, team_1_odds=None, team_2_odds=None):
         t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
         game_dt = parse_game_datetime(o1.get("game_datetime"))
         game_date = game_dt.date() if game_dt else datetime.utcnow().date()
@@ -291,12 +302,16 @@ class ArbitrageController:
             "team_1": o1["team_1"],
             "team_1_bookmaker": t1["bookmaker"],
             "team_1_game_id": t1["game_id"],
-            "team_1_odds": float(t1["moneyline_team_1"]),
+            "team_1_odds": float(
+                team_1_odds if team_1_odds is not None else t1["moneyline_team_1"]
+            ),
 
             "team_2": o1["team_2"],
             "team_2_bookmaker": t2["bookmaker"],
             "team_2_game_id": t2["game_id"],
-            "team_2_odds": float(t2["moneyline_team_2"]),
+            "team_2_odds": float(
+                team_2_odds if team_2_odds is not None else t2["moneyline_team_2"]
+            ),
 
             "bet_type": "moneyline",
             "arb_total_prob": float(arb_total),
@@ -313,7 +328,7 @@ class ArbitrageController:
             arb_data["team_2_bookmaker"], "moneyline", arb_data["team_2_game_id"], arb_data
         )
 
-    def __insert_arbitrage(self, new_odds, existing, t1_from, t2_from, arb_total):
+    def __insert_arbitrage(self, new_odds, existing, t1_from, t2_from, arb_total, team_1_odds=None, team_2_odds=None):
         o1 = new_odds
         o2 = existing
         t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
@@ -336,11 +351,18 @@ class ArbitrageController:
             )
             return None
 
-        arb_data = self.__build_arb_data(o1, o2, t1_from, t2_from, arb_total)
+        arb_data = self.__build_arb_data(
+            o1, o2, t1_from, t2_from, arb_total,
+            team_1_odds=team_1_odds, team_2_odds=team_2_odds,
+        )
 
         try:
-            t1_odds = Decimal(t1["moneyline_team_1"])
-            t2_odds = Decimal(t2["moneyline_team_2"])
+            t1_odds = Decimal(
+                team_1_odds if team_1_odds is not None else t1["moneyline_team_1"]
+            )
+            t2_odds = Decimal(
+                team_2_odds if team_2_odds is not None else t2["moneyline_team_2"]
+            )
             profit_pct = round((Decimal(1) - arb_total) * 100, 2)
             game_dt = parse_game_datetime(o1.get("game_datetime"))
 

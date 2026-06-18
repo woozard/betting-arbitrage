@@ -19,6 +19,11 @@ jobs:
     interval_seconds: 20
     start_offset_seconds: 7
 
+  - name: betwar_odds
+    script: betwar_odds.py
+    interval_seconds: 20
+    start_offset_seconds: 10
+
   - name: sports411_betting
     script: sports411_betting.py
     interval_seconds: 30
@@ -33,6 +38,11 @@ jobs:
     script: betamapola_betting.py
     interval_seconds: 30
     start_offset_seconds: 30
+
+  - name: betwar_betting
+    script: betwar_betting.py
+    interval_seconds: 30
+    start_offset_seconds: 35
 
   - name: telegram_ops_bot
     script: telegram_ops_bot.py
