@@ -6,6 +6,7 @@ from utils.config import (
     PARADIESWAGER_ACCOUNT,
     PARADIESWAGER_PASSWORD,
     PARADIESWAGER_LABEL,
+    BET_STAKE,
 )
 
 db = __get_db1_session__()
@@ -22,7 +23,7 @@ def main():
     )
 
     controller = ParadiseWagerController(account, PARADISEWAGER, sport="baseball")
-    controller.betting(stake=25)
+    controller.betting(stake=BET_STAKE)
 
 
 if __name__ == "__main__":

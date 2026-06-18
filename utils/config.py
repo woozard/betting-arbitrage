@@ -51,11 +51,25 @@ BET_STAKE = float(os.getenv('BET_STAKE', '20'))
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'true').lower() in (
     '1', 'true', 'yes',
 )
-ACTIVE_ARB_BOOKMAKERS = frozenset(
-    b.strip().lower()
-    for b in os.getenv('ACTIVE_ARB_BOOKMAKERS', 'sports411,betamapola').split(',')
-    if b.strip()
+ACTIVE_ARB_BOOK_PAIRS = frozenset(
+    frozenset(b.strip().lower() for b in part.split(":") if b.strip())
+    for part in os.getenv(
+        "ACTIVE_ARB_BOOK_PAIRS",
+        "sports411:betamapola,paradisewager:betamapola",
+    ).split(",")
+    if part.strip() and ":" in part
 )
+ACTIVE_ARB_BOOKMAKERS = frozenset(
+    book for pair in ACTIVE_ARB_BOOK_PAIRS for book in pair
+)
+
+
+def is_active_arb_pair(book_1: str, book_2: str) -> bool:
+    b1 = (book_1 or "").strip().lower()
+    b2 = (book_2 or "").strip().lower()
+    if not b1 or not b2 or b1 == b2:
+        return False
+    return frozenset({b1, b2}) in ACTIVE_ARB_BOOK_PAIRS
 
 # 2Captcha
 TWOCAPTCHA_API_URL = os.getenv('TWOCAPTCHA_API_URL')

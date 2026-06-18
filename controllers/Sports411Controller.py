@@ -19,7 +19,7 @@ from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc   # ← NEW: for explicit table-missing error handling
 import undetected_chromedriver as uc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, ACTIVE_ARB_BOOKMAKERS
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
@@ -2500,7 +2500,7 @@ class Sports411Controller:
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
 
-                if not {book_1, book_2}.issubset(ACTIVE_ARB_BOOKMAKERS):
+                if not is_active_arb_pair(book_1, book_2):
                     self.logger.info(
                         f"Skipping arb — inactive book pair {book_1} x {book_2} | "
                         f"{team_1} vs {team_2}"

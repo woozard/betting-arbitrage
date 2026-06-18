@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from database.config import __get_db1_session__
 from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
-from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, ACTIVE_ARB_BOOKMAKERS
+from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, is_active_arb_pair
 from utils.logger import Logger
 from utils.helpers import (
     send_telegram_alert,
@@ -47,11 +47,7 @@ class ArbitrageController:
 
     @staticmethod
     def _allowed_arb_book_pair(book_1: str, book_2: str) -> bool:
-        b1 = (book_1 or "").strip().lower()
-        b2 = (book_2 or "").strip().lower()
-        if b1 == b2:
-            return False
-        return b1 in ACTIVE_ARB_BOOKMAKERS and b2 in ACTIVE_ARB_BOOKMAKERS
+        return is_active_arb_pair(book_1, book_2)
 
     # --------------------------------------------------------
     # Calculate total arbitrage probability

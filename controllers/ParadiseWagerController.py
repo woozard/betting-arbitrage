@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from utils.config import TELEGRAM, ZENROWS_API_KEY
+from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import (
@@ -673,6 +673,14 @@ class ParadiseWagerController:
         return None, None
 
     @staticmethod
+    def _risk_stake_to_paradise_win_amount(risk: float, american_odds) -> float:
+        """Paradise SaveBet Amount uses to-win when AmountCalculation is 'A'."""
+        odds = int(float(american_odds))
+        if odds > 0:
+            return round(float(risk) * odds / 100.0, 2)
+        return round(float(risk) * 100.0 / abs(odds), 2)
+
+    @staticmethod
     def _build_straight_wager_payload(line_id, stake: float):
         return [{
             "BetType": BET_TYPE_STRAIGHT,
@@ -752,8 +760,13 @@ class ParadiseWagerController:
                 unique.append(err)
         return unique
 
-    def _place_bet_via_api(self, line_id, stake: float, timeout: int = 45):
-        details = self._build_straight_wager_payload(line_id, stake)
+    def _place_bet_via_api(self, line_id, stake: float, american_odds=None, timeout: int = 45):
+        win_amount = self._risk_stake_to_paradise_win_amount(stake, american_odds or -110)
+        self.logger.info(
+            f"Paradise wager API | risk=${stake:.2f} | to-win=${win_amount:.2f} "
+            f"(odds={american_odds})"
+        )
+        details = self._build_straight_wager_payload(line_id, win_amount)
 
         add_result = self._api_call("POST", "/api/wager/AddBet/", details)
         if not add_result or not add_result.get("ok"):
@@ -774,7 +787,7 @@ class ParadiseWagerController:
             "DelayKey": delay_key,
             "DelaySeconds": 0,
             "Details": details,
-            "PasswordConfirmation": "",
+            "PasswordConfirmation": self.password or "",
         }
 
         deadline = time.time() + timeout
@@ -1054,7 +1067,7 @@ class ParadiseWagerController:
                 f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
             )
 
-        confirmed, message = self._place_bet_via_api(line_id, stake)
+        confirmed, message = self._place_bet_via_api(line_id, stake, american_odds=moneyline_odd)
         if not confirmed:
             raise Exception(message or "Bet not accepted by bookmaker")
 
@@ -1239,6 +1252,14 @@ class ParadiseWagerController:
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
+
+                if not is_active_arb_pair(book_1, book_2):
+                    self.logger.info(
+                        f"Skipping arb — inactive book pair {book_1} x {book_2} | "
+                        f"{team_1} vs {team_2}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
 
                 if self.cache.is_arb_stale(arb):
                     age = self.cache.arb_age_seconds(arb)
