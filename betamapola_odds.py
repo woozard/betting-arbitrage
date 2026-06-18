@@ -16,16 +16,10 @@ def main():
         label='Reader-30K',
     )
 
-    # === FETCH BOTH NBA AND MLB MONEYLINE ===
-    print("=== Fetching NBA Moneyline ===")
-    controller_nba = BetamapolaController(account, BETAMAPOLA, sport="basketball")
-    controller_nba.fetch_odds()
-
-    print("\n=== Fetching MLB Moneyline ===")
-    controller_mlb = BetamapolaController(account, BETAMAPOLA, sport="baseball")
-    controller_mlb.fetch_odds()
-
-    print("\n✅ Finished fetching NBA + MLB moneyline odds")
+    print("=== Fetching MLB Moneyline ===")
+    controller = BetamapolaController(account, BETAMAPOLA, sport="baseball")
+    controller.fetch_odds()
+    print("\n✅ Finished fetching MLB moneyline odds")
 
 
 if __name__ == "__main__":

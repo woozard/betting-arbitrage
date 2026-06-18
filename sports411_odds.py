@@ -13,16 +13,10 @@ def main():
         label='Reader',
     )
 
-    # One browser session for all sports — login once per odds cycle, not per sport.
-    sports = ["baseball", "basketball"]
-    controller = Sports411Controller(account, SPORTS411, sport=sports[0])
-
-    for i, sport in enumerate(sports):
-        print(f"=== Fetching {sport.upper()} Moneyline ===")
-        controller._set_sport(sport)
-        controller.fetch_odds(quit_driver=(i == len(sports) - 1))
-
-    print("\n✅ Finished fetching NBA + MLB moneyline odds")
+    controller = Sports411Controller(account, SPORTS411, sport="baseball")
+    print("=== Fetching MLB Moneyline ===")
+    controller.fetch_odds()
+    print("\n✅ Finished fetching MLB moneyline odds")
 
 
 if __name__ == "__main__":

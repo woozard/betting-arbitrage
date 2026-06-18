@@ -21,15 +21,10 @@ def main():
         label=PARADIESWAGER_LABEL,
     )
 
-    sports = ["baseball", "basketball"]
-    controller = ParadiseWagerController(account, PARADISEWAGER, sport=sports[0])
-
-    for i, sport in enumerate(sports):
-        print(f"=== Fetching {sport.upper()} Moneyline ===")
-        controller._set_sport(sport)
-        controller.fetch_odds(quit_driver=(i == len(sports) - 1))
-
-    print("\nFinished fetching NBA + MLB moneyline odds from ParadiseWager")
+    print("=== Fetching MLB Moneyline ===")
+    controller = ParadiseWagerController(account, PARADISEWAGER, sport="baseball")
+    controller.fetch_odds()
+    print("\nFinished fetching MLB moneyline odds from ParadiseWager")
 
 
 if __name__ == "__main__":

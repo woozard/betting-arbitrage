@@ -1082,20 +1082,20 @@ class Sports411Controller:
             except Exception:
                 self.logger.warning("Schedule component not found quickly.")
 
-            # Wait for the loading spinner to disappear (up to 25 seconds)
+            # Wait for the loading spinner to disappear (up to 15 seconds)
             try:
                 spinner_locator = (By.CSS_SELECTOR, "div.component-loader, .fa-spinner-third")
-                WebDriverWait(self.driver, 25).until(
+                WebDriverWait(self.driver, 15).until(
                     EC.invisibility_of_element_located(spinner_locator)
                 )
                 self.logger.info("Loading spinner disappeared.")
             except Exception:
-                self.logger.warning("Spinner did not disappear within 25s timeout.")
+                self.logger.warning("Spinner did not disappear within 15s timeout.")
 
-            # Additional patient wait for actual game data to populate (up to ~20s)
+            # Additional patient wait for actual game data to populate (up to ~12s)
             self.logger.info("Waiting for game data to load into the DOM...")
             game_content_found = False
-            for _ in range(20):
+            for _ in range(12):
                 time.sleep(1)
                 page_text = self.driver.page_source
                 # Look for rotation numbers + team names (very common pattern in this book)
