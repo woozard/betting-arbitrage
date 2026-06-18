@@ -5,6 +5,7 @@ import re
 import tempfile
 import os
 import requests
+from decimal import Decimal, InvalidOperation
 from bs4 import BeautifulSoup
 from datetime import datetime
 import pytz
@@ -1026,14 +1027,97 @@ class BetWarController:
 
     @staticmethod
     def _normalize_ml_odds(value) -> str:
+        """Normalize BetWar moneyline values to Decimal-parseable American odds."""
         if value is None:
             return None
+
+        if isinstance(value, dict):
+            for key in ("odds", "line", "display", "value", "american"):
+                nested = value.get(key)
+                if nested not in (None, ""):
+                    normalized = BetWarController._normalize_ml_odds(nested)
+                    if normalized is not None:
+                        return normalized
+            return None
+
         text = str(value).strip()
         if not text:
             return None
-        if text.lower() == "even":
-            return "+100"
-        return text
+
+        text = (
+            text.replace("\u00a0", " ")
+            .replace("\u2212", "-")
+            .replace("\u2013", "-")
+            .replace("\u2014", "-")
+            .strip()
+        )
+
+        lowered = re.sub(r"[^a-z]", "", text.lower())
+        if lowered in ("even", "ev", "pk", "pick", "pickem"):
+            return BetWarController._normalize_us_odds(100)
+
+        if lowered in ("off", "na", "none", "closed", "unavailable"):
+            return None
+
+        paren = re.match(r"^\(\s*([-+]?\d+(?:\.\d+)?)\s*\)$", text)
+        if paren:
+            text = f"-{paren.group(1).lstrip('+-')}"
+
+        try:
+            return BetWarController._normalize_us_odds(int(float(text)))
+        except (TypeError, ValueError):
+            pass
+
+        num_match = re.search(r"[-+]?\d+", text)
+        if num_match:
+            try:
+                return BetWarController._normalize_us_odds(int(num_match.group(0)))
+            except (TypeError, ValueError):
+                pass
+
+        return None
+
+    def _get_side_moneyline_odds(self, side: dict) -> str:
+        """Extract moneyline odds from a GetLines side object."""
+        ml_obj = side.get("moneyline") or {}
+        for key in ("odds", "line", "display", "value", "american"):
+            val = ml_obj.get(key)
+            if val not in (None, ""):
+                normalized = self._normalize_ml_odds(val)
+                if normalized is not None:
+                    return normalized
+
+        for key in ("moneyline", "ml", "MoneyLine"):
+            val = side.get(key)
+            if val not in (None, ""):
+                normalized = self._normalize_ml_odds(val)
+                if normalized is not None:
+                    return normalized
+        return None
+
+    def _filter_games_with_valid_moneylines(self, games: list) -> list:
+        """Drop games whose moneyline values cannot be stored as DECIMAL odds."""
+        valid = []
+        for match in games:
+            ml = match.get("moneyline") or {}
+            t1, t2 = ml.get("team_1"), ml.get("team_2")
+            if not t1 or not t2:
+                self.logger.warning(
+                    f"Dropping game {match.get('game_id')}: missing moneyline ({t1!r} / {t2!r})"
+                )
+                continue
+            try:
+                Decimal(str(t1))
+                Decimal(str(t2))
+            except InvalidOperation:
+                self.logger.warning(
+                    f"Dropping game {match.get('game_id')} "
+                    f"({match.get('team_1')} vs {match.get('team_2')}): "
+                    f"unparseable ML {t1!r} / {t2!r}"
+                )
+                continue
+            valid.append(match)
+        return valid
 
     def _parse_betwar_game_datetime(self, raw: str) -> str:
         raw = (raw or "").strip()
@@ -1233,8 +1317,8 @@ class BetWarController:
             rot2 = str(s2.get("rotation") or "").strip()
             team1 = (s1.get("name") or "").strip()
             team2 = (s2.get("name") or "").strip()
-            ml1 = self._normalize_ml_odds((s1.get("moneyline") or {}).get("odds"))
-            ml2 = self._normalize_ml_odds((s2.get("moneyline") or {}).get("odds"))
+            ml1 = self._get_side_moneyline_odds(s1)
+            ml2 = self._get_side_moneyline_odds(s2)
 
             if not rot1 or not rot2 or not team1 or not team2 or not ml1 or not ml2:
                 continue
@@ -1439,8 +1523,8 @@ class BetWarController:
                 "team_1": team1,
                 "team_2": team2,
                 "moneyline": {
-                    "team_1": str(ml1) if ml1 is not None else None,
-                    "team_2": str(ml2) if ml2 is not None else None
+                    "team_1": self._normalize_ml_odds(ml1),
+                    "team_2": self._normalize_ml_odds(ml2),
                 },
                 "spread": {
                     "team_1_spread": spread_val,
@@ -1513,13 +1597,16 @@ class BetWarController:
             self._ensure_odds_session()
             self.__ensure_sport_offering_loaded()
 
+            odds_source = "unknown"
             games = self._fetch_lines_via_getlines_api()
             if games:
+                odds_source = "GetLines API"
                 self.logger.info(f"Using GetLines API: {len(games)} full-game lines")
             else:
                 api_lines = self._fetch_game_lines_via_api()
                 if api_lines:
                     games = self._parse_api_game_lines(api_lines)
+                    odds_source = "GetSportOffering API"
                     self.logger.info(
                         f"Using GetSportOffering API: {len(games)} full-game lines"
                     )
@@ -1532,10 +1619,19 @@ class BetWarController:
                     time.sleep(2)
 
                 games = self._parse_player_portal_dom(self.driver.page_source)
+                odds_source = "Player portal DOM"
                 if not games:
                     self.logger.warning(
                         "Player portal scrape returned no games; "
                         "account may not offer this league or lines are still loading"
+                    )
+
+            if games:
+                before = len(games)
+                games = self._filter_games_with_valid_moneylines(games)
+                if len(games) < before:
+                    self.logger.warning(
+                        f"Filtered {before - len(games)} games with invalid moneyline odds"
                     )
 
             # Capture network requests made during the load (useful for both paths)
@@ -1584,8 +1680,9 @@ class BetWarController:
                 f.write(self.driver.page_source)
             self.logger.info(f"💾 Saved debug HTML: {debug_file}")
 
-            source = "Player portal DOM"
-            self.logger.info(f"Extracted {len(games)} {self.sport_name} matches via {source}")
+            self.logger.info(
+                f"Extracted {len(games)} {self.sport_name} matches via {odds_source}"
+            )
 
             if len(games) == 0:
                 self.logger.warning(
