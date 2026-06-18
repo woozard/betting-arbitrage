@@ -4,6 +4,8 @@ import asyncio
 import re
 import tempfile
 import os
+import subprocess
+import random
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -15,6 +17,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc   # ← NEW: for explicit table-missing error handling
+import undetected_chromedriver as uc
 
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
 from utils.logger import Logger
@@ -35,21 +38,36 @@ class Sports411Controller:
         "unauthorized",
         '"error_code":"401"',
     )
-    MAX_WAGER_ATTEMPTS_PER_ARB = 2
+    MAX_WAGER_ATTEMPTS_PER_ARB = 1
     PENDING_CHECK_CACHE_TTL = 45
-    CONFIRM_TIMEOUT_SECONDS = 25
+    CONFIRM_TIMEOUT_SECONDS = 15
+    OPEN_BETS_POLL_TIMEOUT_SECONDS = 45
     PLACE_BET_READY_TIMEOUT = 20
     MAX_SOFT_NAV_FAILURES = 3
 
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
     # ===================================================================
-    def __init__(self, account, site, sport="basketball"):
+    def __init__(self, account, site, sport="basketball", use_proxy=True, headless=True, use_stealth=False, attach_browser=False):
 
         # Credentials
         self.account_id = account.account
         self.password = account.password
         self.label = account.label if account.label else "N/A"
+        self.use_proxy = use_proxy
+        self.headless = headless
+        self.use_stealth = use_stealth
+        self.attach_browser = attach_browser
+        xdotool_env = os.environ.get("SPORTS411_USE_XDOTOOL")
+        if xdotool_env is None:
+            self.use_xdotool = attach_browser
+        else:
+            self.use_xdotool = xdotool_env.strip().lower() in ("1", "true", "yes")
+        # Login/navigation can stay on Selenium; xdotool is most critical for wager clicks.
+        bet_only_env = os.environ.get("SPORTS411_XDOTOOL_BET_ONLY", "1")
+        self.xdotool_bet_only = bet_only_env.strip().lower() in ("1", "true", "yes")
+        self._debug_chrome_proc = None
+        self._debug_port = None
         self._force_wager_relogin = False
         self._last_bet_error = None
         self._pending_check_cache = {}
@@ -110,22 +128,27 @@ class Sports411Controller:
             self.user_data_dir = None
             self.proxy_extension_dir = None
 
-    def _create_driver(self):
-        """Build ChromeOptions + BrightData MV2 proxy extension and launch webdriver.Chrome
-        with a 3-attempt retry. Used from __init__ and from _recover_driver.
-        """
-        # === BrightData Proxy Extension (same as Web5) ===
-        proxy_host = "brd.superproxy.io"
-        proxy_port = 33335
-        proxy_user = "brd-customer-hl_70fad530-zone-arbitrage_bot"
-        proxy_pass = "truzviha7wip"
+    @staticmethod
+    def _chrome_major_version() -> int:
+        for binary in ("google-chrome-stable", "google-chrome", "chromium-browser"):
+            try:
+                out = subprocess.check_output([binary, "--version"], text=True).strip()
+                # e.g. "Google Chrome 148.0.7778.96"
+                return int(out.split()[2].split(".")[0])
+            except Exception:
+                continue
+        return 148
 
-        self.proxy_extension_dir = self._create_proxy_extension(
-            proxy_host, proxy_port, proxy_user, proxy_pass
-        )
+    def _build_chrome_options(self):
+        """Build a fresh ChromeOptions instance (uc cannot reuse the same object)."""
+        if self.use_stealth:
+            options = uc.ChromeOptions()
+            options.headless = self.headless
+        else:
+            options = webdriver.ChromeOptions()
+            if self.headless:
+                options.add_argument("--headless=new")
 
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
@@ -136,44 +159,550 @@ class Sports411Controller:
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-setuid-sandbox")
-        options.add_argument("--disable-accelerated-2d-canvas")
-        options.add_argument(f'--load-extension={self.proxy_extension_dir}')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--disable-extensions-except=' + self.proxy_extension_dir)
-        options.add_argument(
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
+        options.add_argument(f"--user-data-dir={self.user_data_dir}")
+
+        if self.use_proxy and self.proxy_extension_dir:
+            options.add_argument(f"--load-extension={self.proxy_extension_dir}")
+            options.add_argument("--disable-extensions-except=" + self.proxy_extension_dir)
+
+        if not self.use_stealth:
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+            )
+        return options
+
+    def _apply_cdp_stealth(self):
+        """Reduce automation fingerprints before Sports411 loads (attach mode)."""
+        patches = (
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});",
+            "window.chrome = { runtime: {} };",
+            "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});",
+        )
+        for source in patches:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument", {"source": source}
+                )
+            except Exception as e:
+                self.logger.warning(f"CDP stealth patch failed: {e}")
+
+    def _human_type(self, element, text: str, force_xdotool: bool = False):
+        """Type like a user — xdotool keyboard in attach mode."""
+        use_xdotool = self.use_xdotool and (force_xdotool or not self.xdotool_bet_only)
+        if use_xdotool:
+            self._xdotool_type(element, text)
+            return
+        element.click()
+        element.clear()
+        for ch in str(text):
+            element.send_keys(ch)
+            time.sleep(0.05 + (0.03 * (ord(ch) % 3)))
+
+    def _wait_for_debug_port(self, port: int, timeout: float = 20) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+                if resp.ok:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def _launch_debug_chrome(self) -> int:
+        """Launch plain Chrome with remote debugging (matches successful manual VNC bets)."""
+        port = int(os.environ.get("SPORTS411_CHROME_DEBUG_PORT", "9222"))
+        profile = os.environ.get("SPORTS411_CHROME_USER_DATA_DIR")
+        if profile:
+            self.user_data_dir = profile
+            os.makedirs(profile, exist_ok=True)
+        else:
+            self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+
+        if self._wait_for_debug_port(port, timeout=1):
+            self.logger.info(f"Reusing existing Chrome on debug port {port}")
+            self._debug_port = port
+            self._debug_chrome_proc = None
+            return port
+        chrome_bin = "google-chrome-stable"
+        for candidate in ("google-chrome-stable", "google-chrome", "chromium-browser"):
+            try:
+                subprocess.check_output([candidate, "--version"])
+                chrome_bin = candidate
+                break
+            except Exception:
+                continue
+
+        cmd = [
+            chrome_bin,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={self.user_data_dir}",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--window-size=1920,1080",
+            "--window-position=0,0",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+            "about:blank",
+        ]
+        self._debug_port = port
+        self._debug_chrome_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if not self._wait_for_debug_port(port):
+            raise RuntimeError(f"Chrome debug port {port} did not become ready")
+        return port
+
+    def _create_attached_driver(self):
+        """Attach Selenium to a real Chrome instance (not automation-launched)."""
+        port = self._launch_debug_chrome()
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+        self.logger.info(f"Attaching to plain Chrome on debug port {port}")
+        try:
+            self.driver = webdriver.Chrome(options=options)
+        except Exception as e:
+            self.logger.warning(f"Plain Selenium attach failed ({e}); retrying with uc")
+            options = uc.ChromeOptions()
+            options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+            self.driver = uc.Chrome(
+                options=options,
+                use_subprocess=True,
+                version_main=self._chrome_major_version(),
+            )
+        self._apply_cdp_stealth()
+        self.wait = WebDriverWait(self.driver, 30)
+        if self.use_xdotool and not self._xdotool_available():
+            self.logger.warning(
+                "xdotool or DISPLAY unavailable; falling back to Selenium clicks"
+            )
+            self.use_xdotool = False
+        elif self.use_xdotool:
+            self.logger.info(
+                f"xdotool trusted input enabled (DISPLAY={os.environ.get('DISPLAY')})"
+            )
+        time.sleep(1)
+
+    def _create_driver(self):
+        """Launch Chrome (attach / undetected-chromedriver / plain Selenium)."""
+        if self.attach_browser:
+            self._create_attached_driver()
+            return
+
+        if self.use_proxy:
+            proxy_host = "brd.superproxy.io"
+            proxy_port = 33335
+            proxy_user = "brd-customer-hl_70fad530-zone-arbitrage_bot"
+            proxy_pass = "truzviha7wip"
+            self.proxy_extension_dir = self._create_proxy_extension(
+                proxy_host, proxy_port, proxy_user, proxy_pass
+            )
+        else:
+            self.proxy_extension_dir = None
+
+        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+
+        driver_label = "undetected-chromedriver" if self.use_stealth else "selenium"
+        proxy_label = "proxy" if self.use_proxy else "direct"
+        self.logger.info(
+            f"Starting Chrome ({driver_label}, {proxy_label}, headless={self.headless})"
         )
 
-        # Use a unique user data dir to avoid profile conflicts in service restarts
-        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
-        options.add_argument(f'--user-data-dir={self.user_data_dir}')
-
-        # Retry driver creation - Chrome + extension is flaky under systemd
         max_retries = 3
+        last_error = None
         for attempt in range(max_retries):
+            options = self._build_chrome_options()
             try:
-                self.driver = webdriver.Chrome(options=options)
+                if self.use_stealth:
+                    self.driver = uc.Chrome(
+                        options=options,
+                        use_subprocess=True,
+                        version_main=self._chrome_major_version(),
+                    )
+                else:
+                    self.driver = webdriver.Chrome(options=options)
 
-                # Smoke test: the webdriver object was returned but the actual browser
-                # process can die immediately (common with proxy extensions). Verify it responds.
                 try:
                     _ = self.driver.current_url
                 except Exception as ve:
-                    self.logger.warning(f"Chrome created on attempt {attempt+1} but session is dead: {ve}")
+                    self.logger.warning(
+                        f"Chrome created on attempt {attempt + 1} but session is dead: {ve}"
+                    )
+                    last_error = ve
+                    self._quit_driver()
                     if attempt == max_retries - 1:
                         raise
                     time.sleep(5)
                     continue
-
                 break
             except Exception as e:
-                self.logger.warning(f"Chrome driver start attempt {attempt+1}/{max_retries} failed: {e}")
+                last_error = e
+                self.logger.warning(
+                    f"Chrome driver start attempt {attempt + 1}/{max_retries} failed: {e}"
+                )
+                self._quit_driver()
                 if attempt == max_retries - 1:
                     raise
                 time.sleep(5)
+        else:
+            raise last_error or RuntimeError("Chrome driver creation failed")
 
         self.wait = WebDriverWait(self.driver, 30)
-        time.sleep(2)  # brief stabilization
+        time.sleep(2)
+
+    def _xdotool_available(self) -> bool:
+        if not os.environ.get("DISPLAY"):
+            return False
+        try:
+            subprocess.run(
+                ["xdotool", "version"],
+                capture_output=True,
+                check=True,
+                env=os.environ,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _xdotool_run(self, *args, check: bool = True):
+        return subprocess.run(
+            ["xdotool", *args],
+            capture_output=True,
+            text=True,
+            check=check,
+            env=os.environ,
+        )
+
+    def _chrome_pids(self) -> list:
+        pids = []
+        proc = getattr(self, "_debug_chrome_proc", None)
+        if proc and proc.poll() is None:
+            pids.append(str(proc.pid))
+        if self.user_data_dir:
+            result = subprocess.run(
+                ["pgrep", "-f", f"--user-data-dir={self.user_data_dir}"],
+                capture_output=True,
+                text=True,
+            )
+            pids.extend(wid for wid in result.stdout.strip().split("\n") if wid)
+        return list(dict.fromkeys(pids))
+
+    def _xdotool_window_ids_for_chrome(self) -> list:
+        wids = []
+        for pid in self._chrome_pids():
+            result = self._xdotool_run("search", "--pid", pid, check=False)
+            wids.extend(wid for wid in (result.stdout or "").strip().split("\n") if wid)
+
+        if wids:
+            return self._sort_chrome_windows_by_area(list(dict.fromkeys(wids)))
+
+        try:
+            title = (self.driver.title or "").strip()
+            if title:
+                result = self._xdotool_run("search", "--onlyvisible", "--name", title[:40], check=False)
+                wids = [wid for wid in (result.stdout or "").strip().split("\n") if wid]
+                if wids:
+                    return self._sort_chrome_windows_by_area(wids)
+        except Exception:
+            pass
+
+        for pattern in ("sports411", "MLB"):
+            result = self._xdotool_run("search", "--onlyvisible", "--name", pattern, check=False)
+            wids = [wid for wid in (result.stdout or "").strip().split("\n") if wid]
+            if wids:
+                return self._sort_chrome_windows_by_area(wids)
+
+        result = self._xdotool_run(
+            "search", "--onlyvisible", "--class", "google-chrome", check=False
+        )
+        wids = [wid for wid in (result.stdout or "").strip().split("\n") if wid]
+        return self._sort_chrome_windows_by_area(wids)
+
+    def _sort_chrome_windows_by_area(self, wids: list) -> list:
+        scored = []
+        for wid in wids:
+            result = self._xdotool_run("getwindowgeometry", wid, check=False)
+            width = height = 0
+            for line in (result.stdout or "").splitlines():
+                if line.startswith("Width:"):
+                    width = int(line.split(":", 1)[1].strip())
+                elif line.startswith("Height:"):
+                    height = int(line.split(":", 1)[1].strip())
+            scored.append((width * height, wid))
+        scored.sort(reverse=True)
+        return [wid for _, wid in scored]
+
+    def _element_window_center(self, element) -> dict:
+        """Center of element in xdotool --window coordinates (includes browser chrome)."""
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
+        )
+        time.sleep(0.35)
+        return self.driver.execute_script(
+            """
+            const rect = arguments[0].getBoundingClientRect();
+            const borderLeft = (window.outerWidth - window.innerWidth) / 2;
+            const borderTop = window.outerHeight - window.innerHeight;
+            const jitterX = (Math.random() - 0.5) * Math.min(8, rect.width * 0.2);
+            const jitterY = (Math.random() - 0.5) * Math.min(8, rect.height * 0.2);
+            return {
+                x: Math.round(borderLeft + rect.left + rect.width / 2 + jitterX),
+                y: Math.round(borderTop + rect.top + rect.height / 2 + jitterY),
+            };
+            """,
+            element,
+        )
+
+    def _xdotool_focus_chrome(self):
+        """Activate the Sports411 Chrome window on the X display (best effort)."""
+        wids = self._xdotool_window_ids_for_chrome()
+        if not wids:
+            self.logger.warning("xdotool could not find a Chrome window to focus")
+            return None
+
+        for wid in reversed(wids):
+            self._xdotool_run("windowmap", wid, check=False)
+            self._xdotool_run("windowraise", wid, check=False)
+            focused = self._xdotool_run("windowfocus", "--sync", wid, check=False)
+            if focused.returncode == 0:
+                return wid
+            activated = self._xdotool_run("windowactivate", "--sync", wid, check=False)
+            if activated.returncode == 0:
+                self._xdotool_run("windowfocus", "--sync", wid, check=False)
+                return wid
+
+        self.logger.warning(
+            f"xdotool found Chrome windows {wids} but could not focus; using largest"
+        )
+        return wids[-1]
+
+    def _element_viewport_center(self, element) -> dict:
+        """Center of element in viewport coordinates (for xdotool --window)."""
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
+        )
+        time.sleep(0.35)
+        return self.driver.execute_script(
+            """
+            const rect = arguments[0].getBoundingClientRect();
+            const jitterX = (Math.random() - 0.5) * Math.min(8, rect.width * 0.2);
+            const jitterY = (Math.random() - 0.5) * Math.min(8, rect.height * 0.2);
+            return {
+                x: Math.round(rect.left + rect.width / 2 + jitterX),
+                y: Math.round(rect.top + rect.height / 2 + jitterY),
+            };
+            """,
+            element,
+        )
+
+    def _element_screen_center(self, element) -> dict:
+        """Map a DOM element to absolute screen coordinates for xdotool."""
+        coords = self._element_viewport_center(element)
+        offset = self.driver.execute_script(
+            """
+            const borderLeft = (window.outerWidth - window.innerWidth) / 2;
+            const borderTop = window.outerHeight - window.innerHeight;
+            return {
+                x: Math.round(window.screenX + borderLeft),
+                y: Math.round(window.screenY + borderTop),
+            };
+            """
+        )
+        return {
+            "x": offset["x"] + coords["x"],
+            "y": offset["y"] + coords["y"],
+        }
+
+    def _xdotool_window_origin(self, wid: str) -> dict:
+        result = self._xdotool_run("getwindowgeometry", "--shell", wid, check=False)
+        origin = {"x": 0, "y": 0}
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("X="):
+                origin["x"] = int(line.split("=", 1)[1])
+            elif line.startswith("Y="):
+                origin["y"] = int(line.split("=", 1)[1])
+        return origin
+
+    def _element_screen_coords_for_xdotool(self, element) -> dict:
+        """Absolute screen coords for xdotool; verifies elementFromPoint when possible."""
+        coords = self._element_screen_center_selenium(element)
+        if not self.driver:
+            return {"x": coords["x"], "y": coords["y"], "wid": None}
+        try:
+            win = self.driver.get_window_rect()
+            offsets = self.driver.execute_script(
+                """
+                return {
+                    left: (window.outerWidth - window.innerWidth) / 2,
+                    top: window.outerHeight - window.innerHeight,
+                };
+                """
+            )
+            vp_x = coords["x"] - win["x"] - offsets["left"]
+            vp_y = coords["y"] - win["y"] - offsets["top"]
+            hit = self.driver.execute_script(
+                """
+                const el = arguments[0];
+                const x = arguments[1], y = arguments[2];
+                const hit = document.elementFromPoint(x, y);
+                return !!(hit && (hit === el || el.contains(hit)));
+                """,
+                element,
+                vp_x,
+                vp_y,
+            )
+            if not hit:
+                self.logger.warning(
+                    f"elementFromPoint miss at viewport ({vp_x}, {vp_y}); "
+                    f"screen ({coords['x']}, {coords['y']})"
+                )
+        except Exception as e:
+            self.logger.warning(f"Could not verify xdotool coords: {e}")
+        return {"x": coords["x"], "y": coords["y"], "wid": None}
+
+    def _xdotool_click_screen(self, x: int, y: int):
+        self._xdotool_run("mousemove", "--sync", str(x), str(y))
+        time.sleep(0.12 + random.random() * 0.08)
+        self._xdotool_run("click", "1")
+
+    def _xdotool_click_coords(self, x: int, y: int, window_id: str = None, use_screen: bool = False):
+        """Click at coordinates. use_screen=True for absolute X11 coords."""
+        if use_screen:
+            self._xdotool_click_screen(x, y)
+            return
+        wid = window_id or self._xdotool_focus_chrome()
+        if wid:
+            self._xdotool_run("windowmap", wid, check=False)
+            self._xdotool_run("windowraise", wid, check=False)
+            self._xdotool_run("windowactivate", "--sync", wid, check=False)
+            self._xdotool_run("windowfocus", "--sync", wid, check=False)
+            self._xdotool_run("mousemove", "--window", wid, "--sync", str(x), str(y))
+        else:
+            self._xdotool_run("mousemove", "--sync", str(x), str(y))
+        time.sleep(0.12 + random.random() * 0.08)
+        self._xdotool_run("click", "1")
+
+    def _xdotool_click_element(self, element, isolated: bool = False):
+        """Click element via xdotool using screen coordinates (reliable on xvfb)."""
+        coords = self._element_screen_coords_for_xdotool(element)
+        self.logger.info(
+            f"xdotool click at screen ({coords['x']}, {coords['y']})"
+            f"{', isolated' if isolated else ''}"
+        )
+        if isolated and self.attach_browser:
+            self._detach_driver_keep_chrome()
+            try:
+                self._xdotool_click_screen(coords["x"], coords["y"])
+                time.sleep(6)
+            finally:
+                self._reattach_driver()
+        else:
+            self._xdotool_click_screen(coords["x"], coords["y"])
+        return coords
+
+    def _element_screen_center_selenium(self, element) -> dict:
+        """Screen coords using Selenium window rect + element location."""
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
+        )
+        time.sleep(0.35)
+        win = self.driver.get_window_rect()
+        loc = element.location
+        size = element.size
+        offsets = self.driver.execute_script(
+            """
+            return {
+                left: (window.outerWidth - window.innerWidth) / 2,
+                top: window.outerHeight - window.innerHeight,
+            };
+            """
+        )
+        jitter_x = random.uniform(-3, 3)
+        jitter_y = random.uniform(-3, 3)
+        return {
+            "x": int(win["x"] + offsets["left"] + loc["x"] + size["width"] / 2 + jitter_x),
+            "y": int(win["y"] + offsets["top"] + loc["y"] + size["height"] / 2 + jitter_y),
+        }
+
+    def _wager_sendbets_seen(self) -> bool:
+        for entry in self._get_wager_network_log():
+            if "sendbets" in (entry.get("url") or "").lower():
+                return True
+        return False
+
+    def _detach_driver_keep_chrome(self):
+        """Stop chromedriver control but leave the Chrome process running (attach mode)."""
+        driver = getattr(self, "driver", None)
+        if not driver:
+            return
+        try:
+            service = getattr(driver, "service", None)
+            if service:
+                service.stop()
+        except Exception:
+            pass
+        self.driver = None
+        self.wait = None
+        subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True)
+        time.sleep(0.3)
+
+    def _reattach_driver(self):
+        if not self.attach_browser:
+            return
+        port = self._debug_port or int(os.environ.get("SPORTS411_CHROME_DEBUG_PORT", "9222"))
+        if not self._wait_for_debug_port(port, timeout=10):
+            raise RuntimeError(f"Chrome debug port {port} unavailable for reattach")
+        options = uc.ChromeOptions()
+        options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+        self.driver = uc.Chrome(
+            options=options,
+            use_subprocess=True,
+            version_main=self._chrome_major_version(),
+        )
+        self.wait = WebDriverWait(self.driver, 30)
+
+    def _xdotool_click_isolated(self, element) -> dict:
+        """xdotool click while chromedriver stays detached through SendBets."""
+        return self._xdotool_click_element(element, isolated=True)
+
+    def _xdotool_type(self, element, text: str):
+        coords = self._element_screen_coords_for_xdotool(element)
+        self._xdotool_click_screen(coords["x"], coords["y"])
+        time.sleep(0.2)
+        self._xdotool_run("key", "--clearmodifiers", "ctrl+a")
+        time.sleep(0.05)
+        self._xdotool_run("key", "--clearmodifiers", "BackSpace")
+        time.sleep(0.1)
+        self._xdotool_run("type", "--delay", "75", "--", str(text))
+        time.sleep(0.15)
+
+    def _human_click(self, element, force_xdotool: bool = False):
+        """Real user input via xdotool (attach mode) or Selenium click."""
+        use_xdotool = self.use_xdotool and (force_xdotool or not self.xdotool_bet_only)
+        if use_xdotool and self.attach_browser and force_xdotool:
+            self._xdotool_click_element(element, isolated=True)
+            return
+        if use_xdotool:
+            self._xdotool_click_element(element, isolated=False)
+            return
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", element
+        )
+        time.sleep(0.35)
+        for _ in range(12):
+            try:
+                if element.is_displayed() and element.is_enabled():
+                    element.click()
+                    return
+            except Exception:
+                pass
+            time.sleep(0.25)
+        self.driver.execute_script("arguments[0].click();", element)
 
     def _relogin_after_recovery(self) -> bool:
         """After _recover_driver() has given us a brand-new Chrome instance (unlogged),
@@ -324,14 +853,18 @@ class Sports411Controller:
             )
 
             account_input.clear()
-            account_input.send_keys(self.account_id)
             password_input.clear()
-            password_input.send_keys(self.password)
+            if self.attach_browser:
+                self._human_type(account_input, self.account_id)
+                self._human_type(password_input, self.password)
+            else:
+                account_input.send_keys(self.account_id)
+                password_input.send_keys(self.password)
 
             login_btn = self.driver.find_element(
                 By.CSS_SELECTOR, "input[type='submit'].login"
             )
-            login_btn.click()
+            self._human_click(login_btn)
 
             self.wait.until(EC.url_contains("/en/sports/"))
             self._force_wager_relogin = False
@@ -772,7 +1305,8 @@ class Sports411Controller:
         if self.game_lines_path in url_l:
             return False
         soft_markers = (
-            "/account/pending",
+            "/en/open-bets",
+            "/open-bets",
             "/account/",
             "/logout",
             "/en/sports/",
@@ -782,18 +1316,28 @@ class Sports411Controller:
         )
         return any(marker in url_l for marker in soft_markers)
 
+    def _open_bets_url(self) -> str:
+        return f"https://be.{self.website}/en/open-bets/"
+
     def _fetch_pending_page_text(self) -> str:
-        """Fetch pending wagers HTML in-browser without navigating away from the sport page."""
-        script = """
-            return fetch('/en/account/pending', {
-                credentials: 'include',
-                headers: {'Accept': 'text/html,application/xhtml+xml'}
-            }).then(r => r.text()).catch(() => '');
-        """
+        """Fetch open-bets HTML in-browser without navigating away from the sport page."""
         try:
-            return self.driver.execute_script(script) or ""
+            return self.driver.execute_async_script(
+                """
+                const done = arguments[arguments.length - 1];
+                const path = arguments[0];
+                fetch(path, {
+                    credentials: 'include',
+                    headers: {'Accept': 'text/html,application/xhtml+xml'}
+                })
+                .then(r => r.text())
+                .then(t => done(t || ''))
+                .catch(() => done(''));
+                """,
+                "/en/open-bets/",
+            ) or ""
         except Exception as e:
-            self.logger.warning(f"Pending-page fetch failed: {e}")
+            self.logger.warning(f"Open-bets fetch failed: {e}")
             return ""
 
     @staticmethod
@@ -824,17 +1368,11 @@ class Sports411Controller:
 
         found = False
         try:
-            page = self._fetch_pending_page_text()
-            if page:
-                found = self._page_text_has_open_wager(page, team_name, team_1, team_2)
-            else:
-                pending_url = f"https://be.{self.website}/en/account/pending"
-                self.driver.get(pending_url)
-                time.sleep(1)
-                found = self._page_text_has_open_wager(
-                    self.driver.page_source, team_name, team_1, team_2
-                )
-                self._return_to_sport_page()
+            self.driver.get(self._open_bets_url())
+            time.sleep(2.5)
+            page = self.driver.page_source
+            found = self._page_text_has_open_wager(page, team_name, team_1, team_2)
+            self._return_to_sport_page()
         except Exception as e:
             self.logger.warning(f"Could not check existing open bets: {e}")
             return False
@@ -905,7 +1443,16 @@ class Sports411Controller:
         body_l = body.lower()
         try:
             data = json.loads(body)
+            if not isinstance(data, dict):
+                return None, ""
             if data.get("WagerResult") is False:
+                wagers = data.get("Wagers") or []
+                if wagers:
+                    details = ", ".join(
+                        f"Result={w.get('Result')} Ttw={w.get('Ttw')}"
+                        for w in wagers
+                    )
+                    return "rejected", f"SendBets WagerResult:false ({details})"
                 return "rejected", "SendBets WagerResult:false"
             if data.get("WagerResult") is True:
                 return "accepted", "SendBets confirmed"
@@ -1118,19 +1665,24 @@ class Sports411Controller:
             window.__wagerResponses = [];
             if (window.__wagerHookInstalled) return;
             window.__wagerHookInstalled = true;
-            const capture = (url, body) => {
+            const capture = (url, body, request) => {
                 if (!url) return;
                 const u = String(url).toLowerCase();
                 if (u.includes('wager') || u.includes('bet') || u.includes('ticket')
-                    || u.includes('place') || u.includes('pending')) {
-                    window.__wagerResponses.push({url: String(url), body: String(body || '').slice(0, 4000)});
+                    || u.includes('place') || u.includes('pending') || u.includes('sendbets')) {
+                    window.__wagerResponses.push({
+                        url: String(url),
+                        request: String(request || '').slice(0, 8000),
+                        body: String(body || '').slice(0, 4000)
+                    });
                 }
             };
             const origFetch = window.fetch;
             window.fetch = function(...args) {
                 const reqUrl = args[0];
+                const reqBody = args[1] && args[1].body ? args[1].body : '';
                 return origFetch.apply(this, args).then(resp => {
-                    resp.clone().text().then(t => capture(reqUrl, t)).catch(() => {});
+                    resp.clone().text().then(t => capture(reqUrl, t, reqBody)).catch(() => {});
                     return resp;
                 });
             };
@@ -1141,8 +1693,9 @@ class Sports411Controller:
                 return origOpen.call(this, method, url, ...rest);
             };
             XMLHttpRequest.prototype.send = function(...args) {
+                const reqBody = args[0];
                 this.addEventListener('load', function() {
-                    capture(this.__arbUrl, this.responseText);
+                    capture(this.__arbUrl, this.responseText, reqBody);
                 });
                 return origSend.apply(this, args);
             };
@@ -1194,12 +1747,43 @@ class Sports411Controller:
             pass
         return False, ""
 
+    def _prefer_accept_all_line_changes(self):
+        """Select 'Accept all line changes' on the betslip (automation is slower than manual)."""
+        try:
+            for elem in self.driver.find_elements(
+                By.CSS_SELECTOR, "#betslip label, #betslip span, #betslip div"
+            ):
+                text = (elem.text or "").strip().lower()
+                if "accept all line change" in text:
+                    self._human_click(elem)
+                    self.logger.info("Selected 'Accept all line changes' on betslip")
+                    return True
+        except Exception:
+            pass
+        for radio in self.driver.find_elements(
+            By.CSS_SELECTOR, "#betslip input[type='radio']"
+        ):
+            try:
+                label_id = radio.get_attribute("id")
+                label_text = ""
+                if label_id:
+                    labels = self.driver.find_elements(By.CSS_SELECTOR, f"label[for='{label_id}']")
+                    if labels:
+                        label_text = (labels[0].text or "").lower()
+                if "accept all" in label_text and not radio.is_selected():
+                    self._human_click(radio)
+                    self.logger.info("Selected 'Accept all line changes' radio on betslip")
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _accept_line_changes(self):
         accepted = False
         try:
             accept_all = self.driver.find_element(By.ID, "accept_all")
             if not accept_all.is_selected():
-                self.driver.execute_script("arguments[0].click();", accept_all)
+                self._human_click(accept_all)
                 accepted = True
         except Exception:
             pass
@@ -1212,7 +1796,7 @@ class Sports411Controller:
             try:
                 for elem in self.driver.find_elements(By.CSS_SELECTOR, selector):
                     if elem.tag_name.lower() == "input" and not elem.is_selected():
-                        self.driver.execute_script("arguments[0].click();", elem)
+                        self._human_click(elem)
                         accepted = True
             except Exception:
                 continue
@@ -1221,7 +1805,7 @@ class Sports411Controller:
             try:
                 text = (btn.text or "").strip().lower()
                 if text in ("accept", "accept changes", "ok", "continue"):
-                    self.driver.execute_script("arguments[0].click();", btn)
+                    self._human_click(btn)
                     accepted = True
                     time.sleep(0.5)
             except Exception:
@@ -1285,30 +1869,63 @@ class Sports411Controller:
             )
         return btn
 
+    def _stake_on_open_bets_page(self, page: str, stake: float) -> bool:
+        page_l = page or ""
+        patterns = (
+            f"risk:${stake:.2f}",
+            f"risk: ${stake:.2f}",
+            f"risk:${stake:.0f}",
+            f"risk: ${stake:.0f}",
+            f"${stake:.2f}",
+            f"${stake:.0f}",
+            f"{stake:.2f}",
+        )
+        page_compact = page_l.lower().replace(" ", "")
+        return any(p.replace(" ", "").lower() in page_compact for p in patterns)
+
     def _verify_open_bet_on_pending(self, team_name: str, stake: float):
         try:
             page = self._fetch_pending_page_text()
-            if not page:
-                pending_url = f"https://be.{self.website}/en/account/pending"
-                self.driver.get(pending_url)
-                time.sleep(1)
+            if not page or team_name.lower() not in (page or "").lower():
+                self.driver.get(self._open_bets_url())
+                time.sleep(2.5)
                 page = self.driver.page_source
                 self._return_to_sport_page()
 
             page_l = (page or "").lower()
             team_l = team_name.lower()
             if team_l not in page_l:
-                return False, "Bet not found on pending page"
-            stake_hits = (
-                f"{stake:.2f}" in page_l
-                or f"${stake:.0f}" in page_l
-                or f"risk: ${stake:.2f}" in page_l
-            )
-            if stake_hits:
-                return True, "Open bet found on pending page"
-            return False, "Team found on pending page but stake not verified"
+                return False, "Bet not found on open bets page"
+            if self._stake_on_open_bets_page(page, stake):
+                return True, "Open bet found on open bets page"
+            return False, "Team found on open bets page but stake not verified"
         except Exception as e:
             return False, f"Could not verify open bet: {e}"
+
+    def _poll_open_bet_on_pending(
+        self, team_name: str, stake: float, timeout: int = None
+    ):
+        """SendBets uses asyncPost — wager may appear on open-bets after WagerResult:false."""
+        timeout = timeout or self.OPEN_BETS_POLL_TIMEOUT_SECONDS
+        deadline = time.time() + timeout
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
+            if confirmed:
+                self.logger.info(
+                    f"Open bet confirmed (poll {attempt}): {message}"
+                )
+                return True, message
+            self.logger.info(
+                f"Open-bets poll {attempt}: not found yet ({message})"
+            )
+            time.sleep(2)
+        return False, "Bet not found on open bets page after polling"
+
+    def _recover_bet_from_open_bets(self, team_name: str, stake: float) -> tuple:
+        """True when the book accepted the wager even if SendBets/confirm failed."""
+        return self._poll_open_bet_on_pending(team_name, stake)
 
     def _confirm_bet_accepted(
         self,
@@ -1355,6 +1972,17 @@ class Sports411Controller:
                 if verdict == "rejected":
                     if self._message_requires_relogin(body):
                         self._invalidate_wager_session()
+                    req = entry.get("request") or ""
+                    if req and "sendbets" in url.lower():
+                        self.logger.info(f"SendBets request: {req[:1200]}")
+                    self.logger.warning(
+                        f"SendBets API rejected ({detail}); checking open bets (asyncPost)"
+                    )
+                    confirmed, open_msg = self._recover_bet_from_open_bets(
+                        team_name, stake
+                    )
+                    if confirmed:
+                        return True, f"Open bet confirmed ({open_msg})"
                     self.logger.error(f"Wager API rejection ({url}): {body[:800]}")
                     return False, f"Wager API rejected: {detail}"
                 if verdict == "accepted":
@@ -1365,6 +1993,11 @@ class Sports411Controller:
                 if any(m in body_l for m in ("rejected", "declined", "failed")):
                     if self._message_requires_relogin(body):
                         self._invalidate_wager_session()
+                    confirmed, open_msg = self._recover_bet_from_open_bets(
+                        team_name, stake
+                    )
+                    if confirmed:
+                        return True, f"Open bet confirmed ({open_msg})"
                     self.logger.error(f"Wager API rejection ({url}): {body[:800]}")
                     snippet = body[:200].replace("\n", " ").strip()
                     msg = f"{url} | {snippet}" if snippet else url
@@ -1376,10 +2009,16 @@ class Sports411Controller:
             time.sleep(0.4)
 
         if sendbets_seen:
-            return False, "SendBets returned no acceptance within timeout"
+            self.logger.warning(
+                "SendBets seen without acceptance; polling open bets page"
+            )
+            confirmed, message = self._recover_bet_from_open_bets(team_name, stake)
+            if confirmed:
+                return True, message
+            return False, "SendBets returned no acceptance and bet not on open bets"
 
         self.logger.warning(
-            f"No confirmation within {timeout}s; checking pending wagers once"
+            f"No API confirmation within {timeout}s; checking open bets page"
         )
         confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
         if confirmed:
@@ -1407,6 +2046,14 @@ class Sports411Controller:
                         game_id, team_name, moneyline_odd, stake
                     )
                 except Exception as e:
+                    confirmed, open_msg = self._verify_open_bet_on_pending(
+                        team_name, stake
+                    )
+                    if confirmed:
+                        self.logger.info(
+                            f"Bet on open bets despite error '{e}': {open_msg}"
+                        )
+                        return True, stake
                     if attempt == 1 and self._message_requires_relogin(str(e)):
                         self.logger.warning(
                             f"Wager blocked by expired session ({e}); forcing re-login and retry"
@@ -1420,6 +2067,12 @@ class Sports411Controller:
 
         except Exception as e:
             self._last_bet_error = str(e)
+            confirmed, pending_msg = self._recover_bet_from_open_bets(team_name, stake)
+            if confirmed:
+                self.logger.info(
+                    f"Place Bet raised '{e}' but bet is on open bets: {pending_msg}"
+                )
+                return True, stake
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
             return False, stake
@@ -1436,6 +2089,13 @@ class Sports411Controller:
         self.logger.info(
             f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
         )
+
+        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake)
+        if already_open:
+            self.logger.info(
+                f"Skipping placement — bet already on open bets: {open_msg}"
+            )
+            return True, stake
 
         self._refresh_session_before_wager()
 
@@ -1479,11 +2139,7 @@ class Sports411Controller:
         self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
         self._clear_betslip()
 
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center'});", moneyline_label
-        )
-        time.sleep(0.4)
-        self.driver.execute_script("arguments[0].click();", moneyline_label)
+        self._human_click(moneyline_label, force_xdotool=self.use_xdotool and not self.xdotool_bet_only)
         self.logger.info("Moneyline label clicked")
 
         betslip_team = self._wait_for_betslip_team(team_name, timeout=8)
@@ -1491,7 +2147,7 @@ class Sports411Controller:
             self.logger.warning(
                 f"Betslip still shows '{betslip_team}' after first click; retrying moneyline click"
             )
-            self.driver.execute_script("arguments[0].click();", moneyline_label)
+            self._human_click(moneyline_label, force_xdotool=self.use_xdotool and not self.xdotool_bet_only)
             betslip_team = self._wait_for_betslip_team(team_name, timeout=6)
 
         if betslip_team.lower() != team_name.lower():
@@ -1522,9 +2178,12 @@ class Sports411Controller:
         stake_input = self.wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[id^='risk_']"))
         )
-        stake_input.clear()
-        stake_input.send_keys(f"{stake:.2f}")
-        self._dispatch_stake_input_events(stake_input)
+        if self.use_xdotool and not self.xdotool_bet_only:
+            self._human_type(stake_input, f"{stake:.2f}", force_xdotool=True)
+        else:
+            stake_input.clear()
+            stake_input.send_keys(f"{stake:.2f}")
+            self._dispatch_stake_input_events(stake_input)
         self.logger.info(f"Stake entered: {stake:.2f}")
 
         place_bet_btn = self._require_place_bet_ready(moneyline_odd)
@@ -1533,14 +2192,28 @@ class Sports411Controller:
             self._invalidate_wager_session()
             raise Exception("Rejection marker on page: please log in")
 
+        self._prefer_accept_all_line_changes()
+        self._accept_line_changes()
         self._install_wager_network_hook()
-        self.driver.execute_script("arguments[0].click();", place_bet_btn)
-        self.logger.info("Place Bet button clicked")
+
+        # Production path: one Selenium Place Bet click (no retries — avoids duplicates).
+        if self.attach_browser and self.use_xdotool:
+            coords = self._element_screen_coords_for_xdotool(place_bet_btn)
+            self.logger.info(
+                f"xdotool Place Bet at screen ({coords['x']}, {coords['y']})"
+            )
+            self._xdotool_click_screen(coords["x"], coords["y"])
+        else:
+            self._human_click(place_bet_btn, force_xdotool=False)
+        self.logger.info("Place Bet button clicked (single attempt)")
+
         network_log = self._get_wager_network_log()
         if network_log:
             self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
         else:
-            self.logger.warning("No wager network activity detected immediately after Place Bet click")
+            self.logger.warning(
+                "No wager network activity detected immediately after Place Bet click"
+            )
 
         confirmed, message = self._confirm_bet_accepted(team_name, stake)
         if not confirmed:
@@ -1552,14 +2225,25 @@ class Sports411Controller:
     def _quit_driver(self):
         """Safely terminate only this controller's WebDriver session."""
         driver = getattr(self, "driver", None)
-        if not driver:
-            return
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
         self.driver = None
         self.wait = None
+
+        proc = getattr(self, "_debug_chrome_proc", None)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._debug_chrome_proc = None
 
     def _cleanup_owned_chrome(self):
         """Kill only Chrome/chromedriver processes owned by this controller instance."""
@@ -1835,12 +2519,24 @@ class Sports411Controller:
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
-                        f"Open wager detected on pending page for {team_name} on {self.bookmaker}; "
-                        f"skipping duplicate placement (arb scan lock requires bookmaker confirmation)"
+                        f"Open wager already on open-bets for {team_name} on {self.bookmaker}; "
+                        f"skipping duplicate placement"
                     )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
                 bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+
+                if not bet_placed:
+                    recovered, open_msg = self._recover_bet_from_open_bets(
+                        team_name, stake
+                    )
+                    if recovered:
+                        self.logger.info(
+                            f"Recovered placement from open bets after failed confirm: "
+                            f"{open_msg}"
+                        )
+                        bet_placed = True
                 if (
                     not bet_placed
                     and self._last_bet_error

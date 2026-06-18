@@ -14,7 +14,11 @@ def run_betting(sport: str):
         password='eqr0mjx-MXY*rcn1ana',
         label='Bettor'
     )
-    controller = Sports411Controller(account, SPORTS411, sport=sport)
+    controller = Sports411Controller(
+        account,
+        SPORTS411,
+        sport=sport,
+    )
     controller.betting(stake=25)
 
 
