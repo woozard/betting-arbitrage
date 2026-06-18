@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
+from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import (
@@ -1252,6 +1252,7 @@ class ParadiseWagerController:
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
+                bet_type = arb.get("bet_type", "moneyline")
 
                 if not is_active_arb_pair(book_1, book_2):
                     self.logger.info(
@@ -1277,6 +1278,22 @@ class ParadiseWagerController:
                     )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
+
+                first_leg_book = required_first_leg_book(book_1, book_2, self.bookmaker)
+                if first_leg_book:
+                    first_leg_game_id = (
+                        arb["team_1_game_id"]
+                        if book_1 == first_leg_book
+                        else arb["team_2_game_id"]
+                    )
+                    if not self.cache.is_leg_placed(
+                        first_leg_book, bet_type, first_leg_game_id
+                    ):
+                        self.logger.info(
+                            f"Waiting for {first_leg_book} confirmation before betting on "
+                            f"{self.bookmaker} | {team_1} vs {team_2}"
+                        )
+                        continue
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(

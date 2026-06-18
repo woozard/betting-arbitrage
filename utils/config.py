@@ -54,7 +54,7 @@ SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'true').lower() in 
 MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '0'))
 if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
     ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))
-elif MIN_ARB_PROFIT_PCT > 0:
+elif MIN_ARB_PROFIT_PCT != 0:
     ARB_MAX_TOTAL_PROB = 1.0 - (MIN_ARB_PROFIT_PCT / 100.0)
 else:
     ARB_MAX_TOTAL_PROB = 1.0
@@ -62,9 +62,19 @@ ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola",
+        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager",
     ).split(",")
     if part.strip() and ":" in part
+)
+ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
+    (parts[0].strip().lower(), parts[1].strip().lower())
+    for part in os.getenv(
+        "ACTIVE_ARB_BOOK_PAIRS",
+        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager",
+    ).split(",")
+    if part.strip() and ":" in part
+    for parts in [part.strip().split(":", 1)]
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip()
 )
 ACTIVE_ARB_BOOKMAKERS = frozenset(
     book for pair in ACTIVE_ARB_BOOK_PAIRS for book in pair
@@ -77,6 +87,29 @@ def is_active_arb_pair(book_1: str, book_2: str) -> bool:
     if not b1 or not b2 or b1 == b2:
         return False
     return frozenset({b1, b2}) in ACTIVE_ARB_BOOK_PAIRS
+
+
+def arb_pair_legs(book_1: str, book_2: str) -> tuple[str, str] | None:
+    """Return (first_leg, second_leg) for an active pair, preserving env order."""
+    b1 = (book_1 or "").strip().lower()
+    b2 = (book_2 or "").strip().lower()
+    pair = frozenset({b1, b2})
+    for first, second in ACTIVE_ARB_BOOK_PAIR_ORDER:
+        if frozenset({first, second}) == pair:
+            return first, second
+    return None
+
+
+def required_first_leg_book(book_1: str, book_2: str, bookmaker: str) -> str | None:
+    """When bookmaker is the configured second leg, return the first leg book to wait for."""
+    legs = arb_pair_legs(book_1, book_2)
+    if not legs:
+        return None
+    first, second = legs
+    bm = (bookmaker or "").strip().lower()
+    if bm == second:
+        return first
+    return None
 
 # 2Captcha
 TWOCAPTCHA_API_URL = os.getenv('TWOCAPTCHA_API_URL')

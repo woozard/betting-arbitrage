@@ -14,7 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, BETAMAPOLA, is_active_arb_pair
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
@@ -1860,12 +1860,7 @@ class BetamapolaController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                betamapola_book = BETAMAPOLA["bookmaker"]
-                first_leg_book = None
-                if book_1 == betamapola_book and book_2 != betamapola_book:
-                    first_leg_book = book_2
-                elif book_2 == betamapola_book and book_1 != betamapola_book:
-                    first_leg_book = book_1
+                first_leg_book = required_first_leg_book(book_1, book_2, self.bookmaker)
 
                 if first_leg_book:
                     first_leg_game_id = (
