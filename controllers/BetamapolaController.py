@@ -14,11 +14,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, SPORTS411, ACTIVE_ARB_BOOKMAKERS
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
-from utils.bet_placement import finalize_confirmed_bet
+from utils.bet_placement import finalize_confirmed_bet, maybe_notify_partial_arb_exposure
 from utils.betting_watchdog import BettingLoopWatchdog
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -1826,11 +1826,28 @@ class BetamapolaController:
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
 
+                if not {book_1, book_2}.issubset(ACTIVE_ARB_BOOKMAKERS):
+                    self.logger.info(
+                        f"Skipping arb — inactive book pair {book_1} x {book_2} | "
+                        f"{team_1} vs {team_2}"
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
                 if self.cache.is_arb_stale(arb):
                     age = self.cache.arb_age_seconds(arb)
                     self.logger.info(
                         f"Skipping dead arb (identified {age:.0f}s ago, max {self.cache.arb_ttl}s) | "
                         f"{team_1} vs {team_2}"
+                    )
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        f"Arb expired after {age:.0f}s without {self.bookmaker} leg",
+                        TELEGRAM,
                     )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
@@ -1843,6 +1860,20 @@ class BetamapolaController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
+                s411_book = SPORTS411["bookmaker"]
+                if s411_book in (book_1, book_2):
+                    s411_game_id = (
+                        arb["team_1_game_id"]
+                        if book_1 == s411_book
+                        else arb["team_2_game_id"]
+                    )
+                    if not self.cache.is_leg_placed(s411_book, bet_type, s411_game_id):
+                        self.logger.info(
+                            f"Waiting for {s411_book} confirmation before betting on "
+                            f"{self.bookmaker} | {team_1} vs {team_2}"
+                        )
+                        continue
+
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
                         f"Open wager detected via API for {team_name} on {self.bookmaker}; "
@@ -1854,6 +1885,15 @@ class BetamapolaController:
                     game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
                 )
                 if not bet_placed:
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        self._last_bet_error or "Bet not accepted by bookmaker",
+                        TELEGRAM,
+                    )
                     err = (self._last_bet_error or "").lower()
                     if "not found in live" in err and "api offering" in err:
                         self.logger.warning(

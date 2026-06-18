@@ -1,6 +1,178 @@
 import asyncio
 
+from utils.config import SEQUENTIAL_ARB_BETTING
 from utils.helpers import send_telegram_alert, format_utc_timestamp
+
+
+def _ops_telegram_chat(telegram_config: dict):
+    return telegram_config.get("ops")
+
+
+def _send_ops_alert(logger, alert: str, ops_chat, label: str = "Alert") -> bool:
+    if not ops_chat:
+        logger.warning("TELEGRAM_CHAT_OPS not set — skipping Telegram alert")
+        return False
+    logger.info(f"========== {label} ==========")
+    logger.info(alert)
+    logger.info(f"========== {label} ==========")
+    asyncio.run(send_telegram_alert(alert, ops_chat))
+    return True
+
+
+def _build_leg_confirmed_alert(
+    arb: dict,
+    bookmaker: str,
+    team_no: int,
+    team_name: str,
+    stake: float,
+    moneyline_odd,
+    other_book: str,
+    other_leg_placed: bool,
+) -> str:
+    identified_at = arb.get("identified_at")
+    sport = arb.get("sport")
+    league = arb.get("league")
+    game_date = arb.get("game_date")
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    bet_type = arb.get("bet_type", "moneyline")
+
+    if other_leg_placed:
+        status = "Both legs now confirmed"
+    else:
+        status = f"Real money placed — waiting for {other_book} leg"
+
+    return (
+        f"===== Leg Confirmed (Real Money) =====\n"
+        f"Identified At: {format_utc_timestamp(identified_at)}\n"
+        f"Sport: {sport}\n"
+        f"League: {league}\n"
+        f"Date: {game_date}\n"
+        f"Match: {team_1} vs {team_2}\n"
+        f"Bet Type: {bet_type}\n"
+        f"Team No: {team_no}\n"
+        f"Team: {team_name}\n"
+        f"Bookmaker: {bookmaker}\n"
+        f"Odds: {moneyline_odd}\n"
+        f"Stake: ${stake:.2f}\n"
+        f"Status: {status}\n"
+    )
+
+
+def _build_arb_complete_alert(arb: dict, stake: float) -> str:
+    identified_at = arb.get("identified_at")
+    sport = arb.get("sport")
+    league = arb.get("league")
+    game_date = arb.get("game_date")
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    odds_1 = arb.get("team_1_odds")
+    odds_2 = arb.get("team_2_odds")
+    profit_pct = arb.get("profit_pct")
+
+    profit_line = f"Estimated Profit: {profit_pct}%\n" if profit_pct is not None else ""
+    return (
+        f"===== Arbitrage Complete =====\n"
+        f"Identified At: {format_utc_timestamp(identified_at)}\n"
+        f"Sport: {sport}\n"
+        f"League: {league}\n"
+        f"Date: {game_date}\n"
+        f"Match: {team_1} vs {team_2}\n"
+        f"Bet Type: {bet_type}\n\n"
+        f"Leg 1: {team_1}\n"
+        f"Bookmaker: {book_1}\n"
+        f"Odds: {odds_1}\n"
+        f"Stake: ${stake:.2f}\n\n"
+        f"Leg 2: {team_2}\n"
+        f"Bookmaker: {book_2}\n"
+        f"Odds: {odds_2}\n"
+        f"Stake: ${stake:.2f}\n\n"
+        f"{profit_line}"
+        f"Status: Both legs confirmed\n"
+    )
+
+
+def _build_partial_arb_alert(
+    arb: dict,
+    confirmed_book: str,
+    failed_book: str,
+    stake: float,
+    reason: str,
+) -> str:
+    identified_at = arb.get("identified_at")
+    sport = arb.get("sport")
+    league = arb.get("league")
+    game_date = arb.get("game_date")
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+
+    if confirmed_book == book_1:
+        confirmed_team, confirmed_odds = team_1, arb.get("team_1_odds")
+    else:
+        confirmed_team, confirmed_odds = team_2, arb.get("team_2_odds")
+
+    reason_line = f"Reason: {reason}\n" if reason else ""
+    return (
+        f"===== Partial Arb (One Leg Only) =====\n"
+        f"Identified At: {format_utc_timestamp(identified_at)}\n"
+        f"Sport: {sport}\n"
+        f"League: {league}\n"
+        f"Date: {game_date}\n"
+        f"Match: {team_1} vs {team_2}\n"
+        f"Bet Type: {bet_type}\n\n"
+        f"CONFIRMED: {confirmed_team} on {confirmed_book}\n"
+        f"Odds: {confirmed_odds}\n"
+        f"Stake: ${stake:.2f}\n\n"
+        f"FAILED: second leg on {failed_book}\n"
+        f"{reason_line}"
+        f"Status: Exposed — only one side placed; check books manually\n"
+    )
+
+
+def maybe_notify_partial_arb_exposure(
+    cache,
+    logger,
+    arb: dict,
+    failed_bookmaker: str,
+    stake: float,
+    reason: str,
+    telegram_config: dict,
+):
+    """Alert once when one leg is confirmed but the other book failed to place."""
+    bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    game_date = arb.get("game_date")
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+
+    if cache.partial_arb_alert_already_sent(pair_key):
+        return
+
+    other_book = book_2 if failed_bookmaker == book_1 else book_1
+    other_game_id = (
+        arb["team_1_game_id"] if other_book == book_1 else arb["team_2_game_id"]
+    )
+    failed_game_id = (
+        arb["team_1_game_id"] if failed_bookmaker == book_1 else arb["team_2_game_id"]
+    )
+
+    if not cache.is_leg_placed(other_book, bet_type, other_game_id):
+        return
+    if cache.is_leg_placed(failed_bookmaker, bet_type, failed_game_id):
+        return
+
+    ops_chat = _ops_telegram_chat(telegram_config)
+    alert = _build_partial_arb_alert(arb, other_book, failed_bookmaker, stake, reason)
+    if _send_ops_alert(logger, alert, ops_chat, label="Partial Arb Alert"):
+        cache.mark_partial_arb_alert_sent(pair_key)
 
 
 def finalize_confirmed_bet(
@@ -44,8 +216,7 @@ def finalize_confirmed_bet(
     else:
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
-            f"arb scan locked; {other_book} leg remains actionable in cache "
-            f"(simultaneous placement — not waiting for other book)"
+            f"waiting for {other_book} leg before arb is complete"
         )
 
     bet_data = {
@@ -67,12 +238,42 @@ def finalize_confirmed_bet(
     else:
         logger.warning("DB - Bet Not Saved")
 
-    if cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
+    ops_chat = _ops_telegram_chat(telegram_config)
+    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+
+    if not cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
+        leg_alert = _build_leg_confirmed_alert(
+            arb,
+            bookmaker,
+            team_no,
+            team_name,
+            stake,
+            moneyline_odd,
+            other_book,
+            other_leg_placed,
+        )
+        if _send_ops_alert(logger, leg_alert, ops_chat, label="Leg Confirmed Alert"):
+            cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
+    else:
         logger.info(
-            f"Skipping duplicate bet-confirmed Telegram alert - {bookmaker}/{team_name} | "
+            f"Skipping duplicate leg-confirmed Telegram alert - {bookmaker}/{team_name} | "
             f"{team_1} vs {team_2} | game_id={game_id}"
         )
-    else:
+
+    if other_leg_placed:
+        if cache.arb_complete_alert_already_sent(pair_key):
+            logger.info(
+                f"Skipping duplicate arb-complete Telegram alert | {team_1} vs {team_2}"
+            )
+        else:
+            complete_alert = _build_arb_complete_alert(arb, stake)
+            if _send_ops_alert(logger, complete_alert, ops_chat, label="Arb Complete Alert"):
+                cache.mark_arb_complete_alert_sent(pair_key)
+        return
+
+    if not SEQUENTIAL_ARB_BETTING:
+        if cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
+            return
         identified_at = arb.get("identified_at")
         alert = (
             f"===== Moneyline Bet =====\n"
@@ -89,9 +290,6 @@ def finalize_confirmed_bet(
             f"Stake: {stake}\n"
             f"Status: Confirmed by bookmaker\n"
         )
-        logger.info("========== Alert ==========")
-        logger.info(alert)
-        logger.info("========== Alert ==========")
         betting_chat = telegram_config.get("betting") or telegram_config.get("arbitrage")
         asyncio.run(send_telegram_alert(alert, betting_chat))
         cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)

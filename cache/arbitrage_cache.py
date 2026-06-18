@@ -186,6 +186,32 @@ class ArbitrageCache:
             ttl=self.lock_ttl,
         )
 
+    def _arb_complete_alert_key(self, pair_key):
+        return f"arb_complete_alert_sent:{pair_key}"
+
+    def arb_complete_alert_already_sent(self, pair_key):
+        return bool(self.redis.get(self._arb_complete_alert_key(pair_key)))
+
+    def mark_arb_complete_alert_sent(self, pair_key):
+        self.redis.set(
+            self._arb_complete_alert_key(pair_key),
+            {"sent_at": "now"},
+            ttl=self.lock_ttl,
+        )
+
+    def _partial_arb_alert_key(self, pair_key):
+        return f"partial_arb_alert_sent:{pair_key}"
+
+    def partial_arb_alert_already_sent(self, pair_key):
+        return bool(self.redis.get(self._partial_arb_alert_key(pair_key)))
+
+    def mark_partial_arb_alert_sent(self, pair_key):
+        self.redis.set(
+            self._partial_arb_alert_key(pair_key),
+            {"sent_at": "now"},
+            ttl=self.lock_ttl,
+        )
+
     def remove_arbitrage_for_bookmaker(self, arb_data, bookmaker):
         """Remove only the confirming bookmaker's cache entry; keep the other leg actionable."""
         bet_type = arb_data.get("bet_type", "moneyline")

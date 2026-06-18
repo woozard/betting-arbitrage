@@ -43,7 +43,19 @@ TELEGRAM = {
     'arbitrage': os.getenv('TELEGRAM_CHAT_ARBITRAGE'),
     'betting': os.getenv('TELEGRAM_CHAT_BETTING'),
     'arbitrage_monitoring': os.getenv('TELEGRAM_CHAT_ARBITRAGE_MONITORING'),
+    'ops': os.getenv('TELEGRAM_CHAT_OPS'),
 }
+
+# Betting
+BET_STAKE = float(os.getenv('BET_STAKE', '20'))
+SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'true').lower() in (
+    '1', 'true', 'yes',
+)
+ACTIVE_ARB_BOOKMAKERS = frozenset(
+    b.strip().lower()
+    for b in os.getenv('ACTIVE_ARB_BOOKMAKERS', 'sports411,betamapola').split(',')
+    if b.strip()
+)
 
 # 2Captcha
 TWOCAPTCHA_API_URL = os.getenv('TWOCAPTCHA_API_URL')
