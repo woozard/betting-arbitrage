@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from decimal import Decimal
 from datetime import datetime, timedelta
@@ -9,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from database.config import __get_db1_session__
 from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
-from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, is_active_arb_pair, ARB_MAX_TOTAL_PROB
+from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, is_active_arb_pair, ARB_MAX_TOTAL_PROB, TELEGRAM_ALERTS_ASYNC
 from utils.logger import Logger
 from utils.helpers import (
     send_telegram_alert,
@@ -490,14 +491,18 @@ class ArbitrageController:
             self.logger.info(alert)
             self.logger.info(f"========== Alert ==========")
 
-            asyncio.run(
-                send_telegram_alert(
-                    alert,
-                    TELEGRAM.get("ops")
-                    if SEQUENTIAL_ARB_BETTING
-                    else TELEGRAM.get("arbitrage"),
-                )
+            alert_chat = (
+                TELEGRAM.get("ops")
+                if SEQUENTIAL_ARB_BETTING
+                else TELEGRAM.get("arbitrage")
             )
+            if TELEGRAM_ALERTS_ASYNC:
+                threading.Thread(
+                    target=lambda: asyncio.run(send_telegram_alert(alert, alert_chat)),
+                    daemon=True,
+                ).start()
+            else:
+                asyncio.run(send_telegram_alert(alert, alert_chat))
             
 
         except Exception as e:

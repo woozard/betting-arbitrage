@@ -22,8 +22,14 @@ import undetected_chromedriver as uc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
-from utils.bet_placement import finalize_confirmed_bet
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable
+from utils.bet_placement import (
+    finalize_confirmed_bet,
+    maybe_notify_partial_arb_exposure,
+    should_defer_for_sequential_first_leg,
+    should_pause_first_leg_for_exposure,
+    odds_tolerance_for_placement,
+)
 from utils.betting_watchdog import BettingLoopWatchdog
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -1524,15 +1530,28 @@ class Sports411Controller:
         return int(float(moneyline_odd))
 
     def _arb_odds_match(self, cached_odd, live_odd) -> bool:
-        if live_odd in (None, ""):
-            return False
-        return self._cached_odd_int(cached_odd) == self._cached_odd_int(live_odd)
+        tolerance = getattr(self, "_odds_tolerance", 0) or 0
+        return arb_live_odds_acceptable(cached_odd, live_odd, tolerance)
 
     def _reject_if_line_moved(self, cached_odd, live_odd, where: str):
+        tolerance = getattr(self, "_odds_tolerance", 0) or 0
         if self._arb_odds_match(cached_odd, live_odd):
+            if tolerance > 0:
+                try:
+                    from utils.helpers import american_odds_to_int
+                    exp = american_odds_to_int(cached_odd)
+                    liv = american_odds_to_int(live_odd)
+                    if exp != liv:
+                        self.logger.info(
+                            f"Accepting line within ±{tolerance} at {where}: "
+                            f"arb {cached_odd} vs live {live_odd}"
+                        )
+                except (TypeError, ValueError):
+                    pass
             return
         raise Exception(
             f"Line moved ({where}): live odds {live_odd} differ from arb odds {cached_odd}"
+            + (f" (tolerance ±{tolerance})" if tolerance > 0 else "")
         )
 
     def _find_moneyline_label(self, game_container, team_name: str, moneyline_odd):
@@ -2499,6 +2518,7 @@ class Sports411Controller:
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
+                bet_type = arb.get("bet_type", "moneyline")
 
                 if not is_active_arb_pair(book_1, book_2):
                     self.logger.info(
@@ -2514,6 +2534,15 @@ class Sports411Controller:
                         f"Skipping dead arb (identified {age:.0f}s ago, max {self.cache.arb_ttl}s) | "
                         f"{team_1} vs {team_2}"
                     )
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        f"Arb expired after {age:.0f}s without {self.bookmaker} leg",
+                        TELEGRAM,
+                    )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
@@ -2525,6 +2554,22 @@ class Sports411Controller:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
+                if should_pause_first_leg_for_exposure(self.cache, book_1, book_2, self.bookmaker):
+                    self.logger.info(
+                        f"Skipping arb — open partial exposure; pausing new first legs | "
+                        f"{team_1} vs {team_2}"
+                    )
+                    continue
+
+                if should_defer_for_sequential_first_leg(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                ):
+                    self.logger.info(
+                        f"Waiting for first-leg confirmation before betting on "
+                        f"{self.bookmaker} | {team_1} vs {team_2}"
+                    )
+                    continue
+
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
                         f"Open wager already on open-bets for {team_name} on {self.bookmaker}; "
@@ -2532,6 +2577,14 @@ class Sports411Controller:
                     )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
+
+                self._odds_tolerance = odds_tolerance_for_placement(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                )
+                if self._odds_tolerance:
+                    self.logger.info(
+                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
+                    )
 
                 bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
 
@@ -2545,6 +2598,16 @@ class Sports411Controller:
                             f"{open_msg}"
                         )
                         bet_placed = True
+                    else:
+                        maybe_notify_partial_arb_exposure(
+                            self.cache,
+                            self.logger,
+                            arb,
+                            self.bookmaker,
+                            stake,
+                            self._last_bet_error or "Bet not accepted by bookmaker",
+                            TELEGRAM,
+                        )
                 if (
                     not bet_placed
                     and self._last_bet_error

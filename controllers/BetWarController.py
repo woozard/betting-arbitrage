@@ -18,11 +18,17 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
-from utils.bet_placement import finalize_confirmed_bet, maybe_notify_partial_arb_exposure
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable
+from utils.bet_placement import (
+    finalize_confirmed_bet,
+    maybe_notify_partial_arb_exposure,
+    should_defer_for_sequential_first_leg,
+    should_pause_first_leg_for_exposure,
+    odds_tolerance_for_placement,
+)
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -589,6 +595,9 @@ class BetWarController:
             return text if text.startswith(("+", "-")) else f"+{text}"
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
+        tolerance = getattr(self, "_odds_tolerance", 0) or 0
+        if tolerance > 0 and arb_live_odds_acceptable(expected, displayed, tolerance):
+            return True
         disp = self._normalize_us_odds((displayed or "").strip())
         exp = self._normalize_us_odds(expected)
         if disp == exp:
@@ -2742,6 +2751,15 @@ class BetWarController:
                         f"Skipping dead arb (identified {age:.0f}s ago, max {self.cache.arb_ttl}s) | "
                         f"{team_1} vs {team_2}"
                     )
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        f"Arb expired after {age:.0f}s without {self.bookmaker} leg",
+                        TELEGRAM,
+                    )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
@@ -2753,21 +2771,29 @@ class BetWarController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                first_leg_book = required_first_leg_book(book_1, book_2, self.bookmaker)
-                if first_leg_book:
-                    first_leg_game_id = (
-                        arb["team_1_game_id"]
-                        if book_1 == first_leg_book
-                        else arb["team_2_game_id"]
+                if should_pause_first_leg_for_exposure(self.cache, book_1, book_2, self.bookmaker):
+                    self.logger.info(
+                        f"Skipping arb — open partial exposure; pausing new first legs | "
+                        f"{team_1} vs {team_2}"
                     )
-                    if not self.cache.is_leg_placed(
-                        first_leg_book, bet_type, first_leg_game_id
-                    ):
-                        self.logger.info(
-                            f"Waiting for {first_leg_book} confirmation before betting on "
-                            f"{self.bookmaker} | {team_1} vs {team_2}"
-                        )
-                        continue
+                    continue
+
+                if should_defer_for_sequential_first_leg(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                ):
+                    self.logger.info(
+                        f"Waiting for first-leg confirmation before betting on "
+                        f"{self.bookmaker} | {team_1} vs {team_2}"
+                    )
+                    continue
+
+                self._odds_tolerance = odds_tolerance_for_placement(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                )
+                if self._odds_tolerance:
+                    self.logger.info(
+                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
+                    )
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(

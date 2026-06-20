@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
+from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import (
@@ -21,8 +21,16 @@ from utils.helpers import (
     is_game_pregame,
     debug_filepath,
     prune_debug_files,
+    teams_same,
+    arb_live_odds_acceptable,
 )
-from utils.bet_placement import finalize_confirmed_bet
+from utils.bet_placement import (
+    finalize_confirmed_bet,
+    maybe_notify_partial_arb_exposure,
+    should_defer_for_sequential_first_leg,
+    should_pause_first_leg_for_exposure,
+    odds_tolerance_for_placement,
+)
 from utils.betting_watchdog import BettingLoopWatchdog
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -246,15 +254,58 @@ class ParadiseWagerController:
         return exp in raw or raw == str(expected).strip()
 
     def _arb_odds_exact_match(self, displayed, expected) -> bool:
-        return self._normalize_us_odds(displayed) == self._normalize_us_odds(expected)
+        tolerance = getattr(self, "_odds_tolerance", 0) or 0
+        return arb_live_odds_acceptable(expected, displayed, tolerance)
 
     @staticmethod
     def _team_name_matches(candidate: str, expected: str) -> bool:
-        cand = (candidate or "").strip().lower()
-        exp = (expected or "").strip().lower()
-        if not cand or not exp:
-            return False
-        return cand == exp or exp in cand or cand in exp
+        return teams_same(candidate, expected)
+
+    def _find_game_by_teams(self, schedule, team_name: str, team_1: str = None, team_2: str = None):
+        for game in schedule or []:
+            for team_no, field in ((1, "team_1"), (2, "team_2")):
+                if self._team_name_matches(game.get(field), team_name):
+                    self.logger.info(
+                        f"Resolved schedule row by team name fallback: {game.get(field)} "
+                        f"(game_id={game.get('game_id')})"
+                    )
+                    return game, team_no
+            if team_1 and team_2:
+                g1, g2 = game.get("team_1"), game.get("team_2")
+                if (teams_same(g1, team_1) and teams_same(g2, team_2)) or (
+                    teams_same(g1, team_2) and teams_same(g2, team_1)
+                ):
+                    if self._team_name_matches(g1, team_name):
+                        return game, 1
+                    if self._team_name_matches(g2, team_name):
+                        return game, 2
+        return None, None
+
+    def _lookup_line_from_schedule(
+        self, game_id: str, team_name: str, team_1: str = None, team_2: str = None
+    ):
+        self._refresh_schedule_cache()
+
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        if len(rotations) >= 2:
+            rot1, rot2 = rotations[0], rotations[1]
+            for game in self._schedule_cache:
+                gid = game.get("game_id") or ""
+                parts = [p.strip() for p in gid.split("-") if p.strip()]
+                if len(parts) < 2 or parts[0] != rot1 or parts[1] != rot2:
+                    continue
+
+                if self._team_name_matches(game.get("team_1"), team_name):
+                    return game, 1
+                if self._team_name_matches(game.get("team_2"), team_name):
+                    return game, 2
+
+        found = self._find_game_by_teams(self._schedule_cache, team_name, team_1, team_2)
+        if found != (None, None):
+            return found
+
+        refreshed = self._refresh_schedule_cache()
+        return self._find_game_by_teams(refreshed, team_name, team_1, team_2)
 
     def _api_call(self, method: str, path: str, body=None, auth: bool = True):
         """Execute player-api request inside the authenticated browser context."""
@@ -637,41 +688,6 @@ class ParadiseWagerController:
         raw = self._fetch_schedule_raw()
         return self._parse_schedule_response(raw)
 
-    def _lookup_line_from_schedule(self, game_id: str, team_name: str):
-        if not self._schedule_cache:
-            self._refresh_schedule_cache()
-
-        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
-        if len(rotations) < 2:
-            return None, None
-
-        rot1, rot2 = rotations[0], rotations[1]
-        for game in self._schedule_cache:
-            gid = game.get("game_id") or ""
-            parts = [p.strip() for p in gid.split("-") if p.strip()]
-            if len(parts) < 2:
-                continue
-            if parts[0] != rot1 or parts[1] != rot2:
-                continue
-
-            if self._team_name_matches(game.get("team_1"), team_name):
-                return game, 1
-            if self._team_name_matches(game.get("team_2"), team_name):
-                return game, 2
-
-        refreshed = self._refresh_schedule_cache()
-        for game in refreshed:
-            gid = game.get("game_id") or ""
-            parts = [p.strip() for p in gid.split("-") if p.strip()]
-            if len(parts) < 2 or parts[0] != rot1 or parts[1] != rot2:
-                continue
-            if self._team_name_matches(game.get("team_1"), team_name):
-                return game, 1
-            if self._team_name_matches(game.get("team_2"), team_name):
-                return game, 2
-
-        return None, None
-
     @staticmethod
     def _risk_stake_to_paradise_win_amount(risk: float, american_odds) -> float:
         """Paradise SaveBet Amount uses to-win when AmountCalculation is 'A'."""
@@ -1050,7 +1066,9 @@ class ParadiseWagerController:
 
         self._refresh_session_before_wager()
 
-        game_row, team_no = self._lookup_line_from_schedule(game_id, team_name)
+        game_row, team_no = self._lookup_line_from_schedule(
+            game_id, team_name, team_1=team_1, team_2=team_2
+        )
         if not game_row or not team_no:
             raise Exception(
                 f"Game {game_id} ({team_name}) not found in live {self.sport_name} schedule"
@@ -1062,10 +1080,23 @@ class ParadiseWagerController:
             raise Exception(f"No moneyline line Id for {team_name} on game {game_id}")
 
         live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
-        if live_odds is not None and not self._arb_odds_exact_match(str(live_odds), moneyline_odd):
-            raise Exception(
-                f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
-            )
+        if live_odds is not None:
+            if not self._arb_odds_exact_match(str(live_odds), moneyline_odd):
+                tol = getattr(self, "_odds_tolerance", 0) or 0
+                raise Exception(
+                    f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
+                    + (f" (tolerance ±{tol})" if tol > 0 else "")
+                )
+            if getattr(self, "_odds_tolerance", 0):
+                try:
+                    from utils.helpers import american_odds_to_int
+                    if american_odds_to_int(live_odds) != american_odds_to_int(moneyline_odd):
+                        self.logger.info(
+                            f"Accepting line within ±{self._odds_tolerance}: "
+                            f"arb {moneyline_odd} vs live {live_odds}"
+                        )
+                except (TypeError, ValueError):
+                    pass
 
         confirmed, message = self._place_bet_via_api(line_id, stake, american_odds=moneyline_odd)
         if not confirmed:
@@ -1268,6 +1299,15 @@ class ParadiseWagerController:
                         f"Skipping dead arb (identified {age:.0f}s ago, max {self.cache.arb_ttl}s) | "
                         f"{team_1} vs {team_2}"
                     )
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        f"Arb expired after {age:.0f}s without {self.bookmaker} leg",
+                        TELEGRAM,
+                    )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
@@ -1279,21 +1319,29 @@ class ParadiseWagerController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                first_leg_book = required_first_leg_book(book_1, book_2, self.bookmaker)
-                if first_leg_book:
-                    first_leg_game_id = (
-                        arb["team_1_game_id"]
-                        if book_1 == first_leg_book
-                        else arb["team_2_game_id"]
+                if should_pause_first_leg_for_exposure(self.cache, book_1, book_2, self.bookmaker):
+                    self.logger.info(
+                        f"Skipping arb — open partial exposure; pausing new first legs | "
+                        f"{team_1} vs {team_2}"
                     )
-                    if not self.cache.is_leg_placed(
-                        first_leg_book, bet_type, first_leg_game_id
-                    ):
-                        self.logger.info(
-                            f"Waiting for {first_leg_book} confirmation before betting on "
-                            f"{self.bookmaker} | {team_1} vs {team_2}"
-                        )
-                        continue
+                    continue
+
+                if should_defer_for_sequential_first_leg(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                ):
+                    self.logger.info(
+                        f"Waiting for first-leg confirmation before betting on "
+                        f"{self.bookmaker} | {team_1} vs {team_2}"
+                    )
+                    continue
+
+                self._odds_tolerance = odds_tolerance_for_placement(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                )
+                if self._odds_tolerance:
+                    self.logger.info(
+                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
+                    )
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(
@@ -1305,6 +1353,16 @@ class ParadiseWagerController:
                 bet_placed, stake = self.__execute_bet(
                     game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
                 )
+                if not bet_placed:
+                    maybe_notify_partial_arb_exposure(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        stake,
+                        self._last_bet_error or "Bet not accepted by bookmaker",
+                        TELEGRAM,
+                    )
                 if (
                     not bet_placed
                     and self._last_bet_error

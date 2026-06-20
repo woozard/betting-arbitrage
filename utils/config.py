@@ -48,9 +48,14 @@ TELEGRAM = {
 
 # Betting
 BET_STAKE = float(os.getenv('BET_STAKE', '20'))
-SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'true').lower() in (
+SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in (
     '1', 'true', 'yes',
 )
+ARB_TTL_SECONDS = int(os.getenv('ARB_TTL_SECONDS', '300'))
+TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
+    '1', 'true', 'yes',
+)
+SECOND_LEG_ODDS_TOLERANCE = int(os.getenv('SECOND_LEG_ODDS_TOLERANCE', '2'))
 MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '0'))
 if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
     ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))

@@ -14,11 +14,17 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir
-from utils.bet_placement import finalize_confirmed_bet, maybe_notify_partial_arb_exposure
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable
+from utils.bet_placement import (
+    finalize_confirmed_bet,
+    maybe_notify_partial_arb_exposure,
+    should_defer_for_sequential_first_leg,
+    should_pause_first_leg_for_exposure,
+    odds_tolerance_for_placement,
+)
 from utils.betting_watchdog import BettingLoopWatchdog
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -365,6 +371,9 @@ class BetamapolaController:
             return text if text.startswith(("+", "-")) else f"+{text}"
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
+        tolerance = getattr(self, "_odds_tolerance", 0) or 0
+        if tolerance > 0 and arb_live_odds_acceptable(expected, displayed, tolerance):
+            return True
         disp = self._normalize_us_odds((displayed or "").strip())
         exp = self._normalize_us_odds(expected)
         if disp == exp:
@@ -374,42 +383,60 @@ class BetamapolaController:
 
     @staticmethod
     def _team_name_matches(candidate: str, expected: str) -> bool:
-        cand = (candidate or "").strip().lower()
-        exp = (expected or "").strip().lower()
-        if not cand or not exp:
-            return False
-        return cand == exp or exp in cand or cand in exp
+        return teams_same(candidate, expected)
 
-    def _lookup_game_line_from_api(self, game_id: str, team_name: str):
-        """Resolve a live API game line by rotation game_id + team name."""
-        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
-        if len(rotations) < 2:
-            return None, None
+    def _find_game_line_by_teams(self, api_lines, team_name: str, team_1: str = None, team_2: str = None):
+        for gl in api_lines or []:
+            if gl.get("PeriodNumber") != 0:
+                continue
+            for team_no, field in ((1, "Team1ID"), (2, "Team2ID")):
+                if self._team_name_matches(gl.get(field), team_name):
+                    self.logger.info(
+                        f"Resolved game by team name fallback: {gl.get(field)} "
+                        f"(GameNum={gl.get('GameNum')}, rot={gl.get('Team1RotNum')}-{gl.get('Team2RotNum')})"
+                    )
+                    return gl, team_no
+            if team_1 and team_2:
+                gl_t1 = gl.get("Team1ID")
+                gl_t2 = gl.get("Team2ID")
+                aligned = teams_same(gl_t1, team_1) and teams_same(gl_t2, team_2)
+                flipped = teams_same(gl_t1, team_2) and teams_same(gl_t2, team_1)
+                if aligned or flipped:
+                    if self._team_name_matches(gl_t1, team_name):
+                        return gl, 1
+                    if self._team_name_matches(gl_t2, team_name):
+                        return gl, 2
+        return None, None
 
-        rot1, rot2 = rotations[0], rotations[1]
+    def _lookup_game_line_from_api(
+        self, game_id: str, team_name: str, team_1: str = None, team_2: str = None
+    ):
+        """Resolve a live API game line by rotation id, then team-name fallback."""
         api_lines = self._fetch_game_lines_via_api()
         if not api_lines:
             return None, None
 
-        for gl in api_lines:
-            if gl.get("PeriodNumber") != 0:
-                continue
-            gl_rot1 = str(gl.get("Team1RotNum") or "").strip()
-            gl_rot2 = str(gl.get("Team2RotNum") or "").strip()
-            if gl_rot1 != rot1 or gl_rot2 != rot2:
-                continue
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        if len(rotations) >= 2:
+            rot1, rot2 = rotations[0], rotations[1]
+            for gl in api_lines:
+                if gl.get("PeriodNumber") != 0:
+                    continue
+                gl_rot1 = str(gl.get("Team1RotNum") or "").strip()
+                gl_rot2 = str(gl.get("Team2RotNum") or "").strip()
+                if gl_rot1 != rot1 or gl_rot2 != rot2:
+                    continue
 
-            team_no = None
-            if self._team_name_matches(gl.get("Team1ID"), team_name):
-                team_no = 1
-            elif self._team_name_matches(gl.get("Team2ID"), team_name):
-                team_no = 2
+                team_no = None
+                if self._team_name_matches(gl.get("Team1ID"), team_name):
+                    team_no = 1
+                elif self._team_name_matches(gl.get("Team2ID"), team_name):
+                    team_no = 2
 
-            if team_no is None:
-                continue
-            return gl, team_no
+                if team_no is not None:
+                    return gl, team_no
 
-        return None, None
+        return self._find_game_line_by_teams(api_lines, team_name, team_1=team_1, team_2=team_2)
 
     def _trigger_angular_offering_select(self) -> bool:
         """Select the active sport/league in the Angular SPA (same UI path users take)."""
@@ -579,8 +606,19 @@ class BetamapolaController:
             "requestMode": None,
         }
 
-    def __ensure_sport_offering_loaded(self, game_num=None, team_no: int = None) -> bool:
+    def __ensure_sport_offering_loaded(self, game_num=None, team_no: int = None, fast: bool = False) -> bool:
         """Navigate the SPA to the active sport (MLB/NBA) so game lines are in the DOM."""
+        if fast and self._is_on_sport_page_with_games():
+            api_lines = self._fetch_game_lines_via_api()
+            if api_lines:
+                if game_num and team_no and self._wait_for_moneyline_button(game_num, team_no, timeout=8):
+                    self.logger.info(
+                        f"Fast path: target moneyline M{team_no}_{game_num}_0 already in DOM"
+                    )
+                    return True
+                self.logger.info(f"Fast path: API has {len(api_lines)} lines; skipping full reload")
+                return True
+
         self.logger.info(f"Ensuring {self.sport_name} offering is loaded in the SPA...")
 
         self.driver.get(self.sport_url)
@@ -1486,15 +1524,18 @@ class BetamapolaController:
             )
 
             self._refresh_session_before_wager()
-            self.__ensure_sport_offering_loaded()
 
-            game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
+            game_line, team_no = self._lookup_game_line_from_api(
+                game_id, team_name, team_1=team_1, team_2=team_2
+            )
             if not game_line:
                 self.logger.warning(
                     f"Game {game_id} not found in live API on first pass; refreshing offering"
                 )
-                self.__ensure_sport_offering_loaded()
-                game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
+                self.__ensure_sport_offering_loaded(fast=True)
+                game_line, team_no = self._lookup_game_line_from_api(
+                    game_id, team_name, team_1=team_1, team_2=team_2
+                )
             if not game_line:
                 raise Exception(
                     f"Game {game_id} ({team_name}) not found in live {self.sport_name} API offering"
@@ -1506,8 +1547,10 @@ class BetamapolaController:
                 f"rot={game_line.get('Team1RotNum')}-{game_line.get('Team2RotNum')}"
             )
 
-            if not self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no):
-                raise Exception(f"{self.sport_name} lines not loaded before bet placement")
+            if not self.__ensure_sport_offering_loaded(
+                game_num=game_num, team_no=team_no, fast=True
+            ):
+                self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
 
             moneyline_elem = self._find_moneyline_element(
                 game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
@@ -1860,22 +1903,29 @@ class BetamapolaController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                first_leg_book = required_first_leg_book(book_1, book_2, self.bookmaker)
-
-                if first_leg_book:
-                    first_leg_game_id = (
-                        arb["team_1_game_id"]
-                        if book_1 == first_leg_book
-                        else arb["team_2_game_id"]
+                if should_pause_first_leg_for_exposure(self.cache, book_1, book_2, self.bookmaker):
+                    self.logger.info(
+                        f"Skipping arb — open partial exposure; pausing new first legs | "
+                        f"{team_1} vs {team_2}"
                     )
-                    if not self.cache.is_leg_placed(
-                        first_leg_book, bet_type, first_leg_game_id
-                    ):
-                        self.logger.info(
-                            f"Waiting for {first_leg_book} confirmation before betting on "
-                            f"{self.bookmaker} | {team_1} vs {team_2}"
-                        )
-                        continue
+                    continue
+
+                if should_defer_for_sequential_first_leg(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                ):
+                    self.logger.info(
+                        f"Waiting for first-leg confirmation before betting on "
+                        f"{self.bookmaker} | {team_1} vs {team_2}"
+                    )
+                    continue
+
+                self._odds_tolerance = odds_tolerance_for_placement(
+                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                )
+                if self._odds_tolerance:
+                    self.logger.info(
+                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
+                    )
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(

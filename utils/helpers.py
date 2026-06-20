@@ -678,6 +678,28 @@ def odds_equal(odds1, odds2, tolerance=1e-6):
     return abs(p1 - p2) <= tolerance
 
 
+def american_odds_to_int(odds) -> int:
+    """Normalize American odds to a signed integer (e.g. '+150' -> 150, '-110' -> -110)."""
+    text = str(odds).strip().replace("−", "-")
+    if not text:
+        raise ValueError(f"Invalid American odds: {odds!r}")
+    return int(float(text))
+
+
+def arb_live_odds_acceptable(expected, live, tolerance: int = 0) -> bool:
+    """True when live American odds match expected exactly, or within ±tolerance."""
+    if live in (None, ""):
+        return False
+    try:
+        exp = american_odds_to_int(expected)
+        liv = american_odds_to_int(live)
+    except (TypeError, ValueError):
+        return False
+    if tolerance <= 0:
+        return exp == liv
+    return abs(exp - liv) <= tolerance
+
+
 def normalize_team(name: str) -> str:
     """Strip book-specific abbrev prefixes (e.g. SEA Mariners -> mariners)."""
     name = (name or "").strip()

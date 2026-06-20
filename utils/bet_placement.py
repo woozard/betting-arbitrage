@@ -1,6 +1,7 @@
 import asyncio
+import threading
 
-from utils.config import SEQUENTIAL_ARB_BETTING
+from utils.config import SEQUENTIAL_ARB_BETTING, TELEGRAM_ALERTS_ASYNC, SECOND_LEG_ODDS_TOLERANCE, arb_pair_legs, required_first_leg_book
 from utils.helpers import send_telegram_alert, format_utc_timestamp
 
 
@@ -17,6 +18,66 @@ def _send_ops_alert(logger, alert: str, ops_chat, label: str = "Alert") -> bool:
     logger.info(f"========== {label} ==========")
     asyncio.run(send_telegram_alert(alert, ops_chat))
     return True
+
+
+def _dispatch_ops_alert(logger, alert: str, ops_chat, label: str = "Alert") -> bool:
+    if not ops_chat:
+        logger.warning("TELEGRAM_CHAT_OPS not set — skipping Telegram alert")
+        return False
+    logger.info(f"========== {label} ==========")
+    logger.info(alert)
+    logger.info(f"========== {label} ==========")
+    if TELEGRAM_ALERTS_ASYNC:
+        threading.Thread(
+            target=_send_ops_alert,
+            args=(logger, alert, ops_chat, label),
+            daemon=True,
+        ).start()
+        return True
+    return _send_ops_alert(logger, alert, ops_chat, label)
+
+
+def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
+    legs = arb_pair_legs(book_1, book_2)
+    if not legs:
+        return False
+    return legs[0] == (bookmaker or "").strip().lower()
+
+
+def odds_tolerance_for_placement(
+    cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
+) -> int:
+    """±tolerance on configured second-leg books, or when the other leg is already confirmed."""
+    if SECOND_LEG_ODDS_TOLERANCE <= 0:
+        return 0
+    bm = (bookmaker or "").strip().lower()
+    if not is_first_leg_bookmaker(book_1, book_2, bm):
+        return SECOND_LEG_ODDS_TOLERANCE
+    other_book = book_2 if bm == (book_1 or "").strip().lower() else book_1
+    other_game_id = (
+        arb["team_1_game_id"] if other_book == book_1 else arb["team_2_game_id"]
+    )
+    if cache.is_leg_placed(other_book, bet_type, other_game_id):
+        return SECOND_LEG_ODDS_TOLERANCE
+    return 0
+
+
+def should_defer_for_sequential_first_leg(
+    cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
+) -> bool:
+    if not SEQUENTIAL_ARB_BETTING:
+        return False
+    first_leg_book = required_first_leg_book(book_1, book_2, bookmaker)
+    if not first_leg_book:
+        return False
+    first_leg_game_id = (
+        arb["team_1_game_id"] if book_1 == first_leg_book else arb["team_2_game_id"]
+    )
+    return not cache.is_leg_placed(first_leg_book, bet_type, first_leg_game_id)
+
+
+def should_pause_first_leg_for_exposure(cache, book_1: str, book_2: str, bookmaker: str) -> bool:
+    return is_first_leg_bookmaker(book_1, book_2, bookmaker) and cache.has_partial_exposure()
 
 
 def _build_leg_confirmed_alert(
@@ -171,7 +232,7 @@ def maybe_notify_partial_arb_exposure(
 
     ops_chat = _ops_telegram_chat(telegram_config)
     alert = _build_partial_arb_alert(arb, other_book, failed_bookmaker, stake, reason)
-    if _send_ops_alert(logger, alert, ops_chat, label="Partial Arb Alert"):
+    if _dispatch_ops_alert(logger, alert, ops_chat, label="Partial Arb Alert"):
         cache.mark_partial_arb_alert_sent(pair_key)
 
 
@@ -197,6 +258,7 @@ def finalize_confirmed_bet(
     bet_type = arb.get("bet_type", "moneyline")
     book_1 = arb.get("team_1_bookmaker")
     book_2 = arb.get("team_2_bookmaker")
+    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
 
     cache.mark_leg_placed(bookmaker, bet_type, game_id)
     cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
@@ -209,11 +271,13 @@ def finalize_confirmed_bet(
 
     if other_leg_placed:
         cache.remove_arbitrage_pair(arb)
+        cache.clear_partial_exposure(pair_key)
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
             f"both legs confirmed; arb scan locked and cache cleared"
         )
     else:
+        cache.mark_partial_exposure(pair_key)
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
             f"waiting for {other_book} leg before arb is complete"
@@ -239,7 +303,6 @@ def finalize_confirmed_bet(
         logger.warning("DB - Bet Not Saved")
 
     ops_chat = _ops_telegram_chat(telegram_config)
-    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
 
     if not cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
         leg_alert = _build_leg_confirmed_alert(
@@ -252,7 +315,7 @@ def finalize_confirmed_bet(
             other_book,
             other_leg_placed,
         )
-        if _send_ops_alert(logger, leg_alert, ops_chat, label="Leg Confirmed Alert"):
+        if _dispatch_ops_alert(logger, leg_alert, ops_chat, label="Leg Confirmed Alert"):
             cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
     else:
         logger.info(
@@ -267,7 +330,7 @@ def finalize_confirmed_bet(
             )
         else:
             complete_alert = _build_arb_complete_alert(arb, stake)
-            if _send_ops_alert(logger, complete_alert, ops_chat, label="Arb Complete Alert"):
+            if _dispatch_ops_alert(logger, complete_alert, ops_chat, label="Arb Complete Alert"):
                 cache.mark_arb_complete_alert_sent(pair_key)
         return
 
@@ -291,5 +354,11 @@ def finalize_confirmed_bet(
             f"Status: Confirmed by bookmaker\n"
         )
         betting_chat = telegram_config.get("betting") or telegram_config.get("arbitrage")
-        asyncio.run(send_telegram_alert(alert, betting_chat))
+        if TELEGRAM_ALERTS_ASYNC:
+            threading.Thread(
+                target=lambda: asyncio.run(send_telegram_alert(alert, betting_chat)),
+                daemon=True,
+            ).start()
+        else:
+            asyncio.run(send_telegram_alert(alert, betting_chat))
         cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)

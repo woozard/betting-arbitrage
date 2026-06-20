@@ -1,14 +1,14 @@
 import time
 
 from cache.redis_cache import RedisCache
-from utils.config import REDIS
+from utils.config import REDIS, ARB_TTL_SECONDS
 
 
 class ArbitrageCache:
-    def __init__(self, ttl=30, arb_ttl=180, lock_ttl=86400):
+    def __init__(self, ttl=30, arb_ttl=None, lock_ttl=86400):
         self.redis = RedisCache(REDIS['host'], REDIS['port'])
         self.ttl = ttl
-        self.arb_ttl = arb_ttl
+        self.arb_ttl = ARB_TTL_SECONDS if arb_ttl is None else arb_ttl
         self.lock_ttl = lock_ttl
 
     # ---------------- Key format ----------------
@@ -211,6 +211,22 @@ class ArbitrageCache:
             {"sent_at": "now"},
             ttl=self.lock_ttl,
         )
+
+    def _partial_exposure_key(self, pair_key):
+        return f"partial_exposure:{pair_key}"
+
+    def mark_partial_exposure(self, pair_key):
+        self.redis.set(
+            self._partial_exposure_key(pair_key),
+            {"marked_at": time.time()},
+            ttl=self.lock_ttl,
+        )
+
+    def clear_partial_exposure(self, pair_key):
+        self.redis.delete(self._partial_exposure_key(pair_key))
+
+    def has_partial_exposure(self):
+        return bool(self.redis.scan("partial_exposure:*"))
 
     def remove_arbitrage_for_bookmaker(self, arb_data, bookmaker):
         """Remove only the confirming bookmaker's cache entry; keep the other leg actionable."""
