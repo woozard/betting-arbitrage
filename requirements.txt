@@ -25,3 +25,4 @@ pyyaml
 zenrows
 playwright
 redis
+py-clob-client-v2>=1.0.1

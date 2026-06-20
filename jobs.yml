@@ -24,6 +24,11 @@ jobs:
     interval_seconds: 20
     start_offset_seconds: 10
 
+  - name: polymarket_odds
+    script: polymarket_odds.py
+    interval_seconds: 20
+    start_offset_seconds: 13
+
   - name: sports411_betting
     script: sports411_betting.py
     interval_seconds: 30

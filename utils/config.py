@@ -212,43 +212,37 @@ PINNACLE = {
 
 POLYMARKET = {
     'website': 'polymarket.com',
-    'url': 'https://data-api.polymarket.com',
+    'url': 'https://polymarket.com',
     'bookmaker': 'polymarket',
     'telegram': {
         'default': '-5148480944',
         '10K': '-1003723757640',
     },
     'users': [
-        {
-            'label': 'ST',
-            'user': '0x492442eab586f242b53bda933fd5de859c8a3782',
-        },
-        {
-            'label': 'AP',
-            'user': '0x37c1874a60d348903594a96703e0507c518fc53a',
-        },
-        {
-            'label': 'BeachBoy',
-            'user': '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',
-        },
-        {
-            'label': 'Moon',
-            'user': '0xbddf61af533ff524d27154e589d2d7a81510c684',
-        },
-        {
-            'label': 'Moon2',
-            'user': '0x8a3aB8120807bD64a3De48695110e390fa2ceB9a',
-        },
-        {
-            'label': 'Gator',
-            'user': '0x93abbc022ce98d6f45d4444b594791cc4b7a9723',
-        },
-        {
-            'label': 'Talvez',
-            'user': '0xa71093cafc0c099b4ccab24c3cb8018d817923c4',
-        },
-    ]
+        {'label': 'ST', 'user': '0x492442eab586f242b53bda933fd5de859c8a3782'},
+        {'label': 'AP', 'user': '0x37c1874a60d348903594a96703e0507c518fc53a'},
+        {'label': 'BeachBoy', 'user': '0xc2e7800b5af46e6093872b177b7a5e7f0563be51'},
+        {'label': 'Moon', 'user': '0xbddf61af533ff524d27154e589d2d7a81510c684'},
+        {'label': 'Moon2', 'user': '0x8a3aB8120807bD64a3De48695110e390fa2ceB9a'},
+        {'label': 'Gator', 'user': '0x93abbc022ce98d6f45d4444b594791cc4b7a9723'},
+        {'label': 'Talvez', 'user': '0xa71093cafc0c099b4ccab24c3cb8018d817923c4'},
+    ],
 }
+POLYMARKET_GAMMA_API_URL = os.getenv(
+    'POLYMARKET_GAMMA_API_URL', 'https://gamma-api.polymarket.com'
+)
+POLYMARKET_CLOB_HOST = os.getenv('POLYMARKET_CLOB_HOST', 'https://clob.polymarket.com')
+POLYMARKET_CHAIN_ID = int(os.getenv('POLYMARKET_CHAIN_ID', '137'))
+POLYMARKET_MLB_TAG_ID = int(os.getenv('POLYMARKET_MLB_TAG_ID', '100381'))
+POLYMARKET_PRIVATE_KEY = os.getenv('POLYMARKET_PRIVATE_KEY')
+POLYMARKET_FUNDER_ADDRESS = os.getenv('POLYMARKET_FUNDER_ADDRESS')
+POLYMARKET_SIGNATURE_TYPE = int(os.getenv('POLYMARKET_SIGNATURE_TYPE', '3'))
+POLYMARKET_RELAYER_API_KEY = os.getenv('POLYMARKET_RELAYER_API_KEY')
+POLYMARKET_RELAYER_API_KEY_ADDRESS = os.getenv(
+    'POLYMARKET_RELAYER_API_KEY_ADDRESS',
+    '0x35C8180822f948F2b7Cf9e78514F5bA8F1A21B51',
+)
+POLYMARKET_MAX_HOURS_AHEAD = int(os.getenv('POLYMARKET_MAX_HOURS_AHEAD', '48'))
 
 # Web1
 IMRUINED = {

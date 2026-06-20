@@ -614,6 +614,16 @@ def detect_odds_type(odds):
 
     raise ValueError(f"Cannot detect odds type: {odds}")
 
+
+def probability_to_american(probability, precision=0):
+    """Convert a Polymarket-style implied probability (0-1) to American odds."""
+    p = float(probability)
+    if p <= 0 or p >= 1:
+        raise ValueError(f"Probability must be between 0 and 1: {probability}")
+    decimal_odds = 1.0 / p
+    return decimal_to_american(decimal_odds, precision)
+
+
 def decimal_to_american(decimal_odds, precision=0):
     """
     Convert Decimal odds to American odds
