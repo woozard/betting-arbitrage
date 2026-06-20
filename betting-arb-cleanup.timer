@@ -1,10 +1,10 @@
 [Unit]
-Description=Run betting-arbitrage disk cleanup every 2 hours
+Description=Run betting-arbitrage server maintenance every hour
 
 [Timer]
-OnBootSec=15min
-OnUnitActiveSec=2h
-AccuracySec=5min
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=2min
 Persistent=true
 
 [Install]
