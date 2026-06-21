@@ -224,7 +224,14 @@ def format_pair_section(book_a: str, book_b: str, rows: List[dict]) -> str:
 
 
 def build_scan_report(minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> str:
-    ctrl = ArbitrageController()
+    from database.config import db1_session_scope
+
+    with db1_session_scope() as db:
+        return _build_scan_report_with_db(db, minutes=minutes)
+
+
+def _build_scan_report_with_db(db, minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> str:
+    ctrl = ArbitrageController(db=db)
     odds = ctrl.get_recent_moneyline_odds_from_db(
         minutes=minutes,
         keep_created_at=True,

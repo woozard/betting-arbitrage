@@ -28,9 +28,9 @@ from cache.arbitrage_cache import ArbitrageCache
 
 
 class ArbitrageController:
-    def __init__(self):
-        # DB
-        self.db: Session = __get_db1_session__()
+    def __init__(self, db: Session = None):
+        # DB — pass a fresh session for long-lived callers (e.g. Telegram /scan).
+        self.db: Session = db if db is not None else __get_db1_session__()
         
         # Logger
         self.logger = Logger.get_logger("arbitrage")

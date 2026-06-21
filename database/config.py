@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
@@ -27,14 +29,39 @@ DB1_URL = (
     f"@{DB1['host']}:{DB1['port']}/{DB1['database']}"
 )
 
-engine1 = create_engine(DB1_URL)
-Session1 = sessionmaker(bind=engine1)
+engine1 = create_engine(
+    DB1_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    pool_size=5,
+    max_overflow=10,
+)
+Session1 = sessionmaker(bind=engine1, autoflush=False, autocommit=False)
 session1 = Session1()
 
 Base.metadata.create_all(bind=engine1)
 
+
 def __get_db1_session__():
     return session1
+
+
+def new_db1_session():
+    """Return a new DB session (caller must close). Prefer db1_session_scope()."""
+    return Session1()
+
+
+@contextmanager
+def db1_session_scope():
+    """Short-lived session with rollback on error and guaranteed close."""
+    session = Session1()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 # ---------- DB2 ----------
 # DB2_URL = (
