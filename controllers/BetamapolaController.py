@@ -26,6 +26,7 @@ from utils.bet_placement import (
     odds_tolerance_for_placement,
 )
 from utils.betting_watchdog import BettingLoopWatchdog
+from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -37,6 +38,9 @@ class BetamapolaController:
         "session expired",
         "logged out",
     )
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_POLL_SEC", "1.5"))
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("BETAMAPOLA_ODDS_FORCE_SCAN_SEC", "5"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_IDLE_POLL_SEC", "2"))
 
     # ===================================================================
     # Betamapola.com - uses identical browser/scraping stack as Sports411
@@ -848,6 +852,182 @@ class BetamapolaController:
         return games
 
     # ===================================================================
+    # Odds watch (persistent session + GetSportOffering API poll)
+    # ===================================================================
+    def _fetch_games_for_odds(self, allow_dom_fallback: bool = False):
+        api_lines = self._fetch_game_lines_via_api()
+        if api_lines:
+            games = self._parse_api_game_lines(api_lines)
+            if games:
+                return games, "api"
+
+        if allow_dom_fallback and self._sport_games_present():
+            html = self.driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+            games = []
+            for game in soup.select("div.sports-league-game"):
+                try:
+                    game_id = game.get("idgame")
+                    if not game_id:
+                        continue
+                    mline1 = game.select_one(".mline-1 label.bet-indicator")
+                    mline2 = game.select_one(".mline-2 label.bet-indicator")
+                    if not mline1 or not mline2:
+                        continue
+                    team_1, ml1 = self._extract_team_odds_from_dom_label(mline1)
+                    team_2, ml2 = self._extract_team_odds_from_dom_label(mline2)
+                    if not team_1 or not team_2 or not ml1 or not ml2:
+                        continue
+                    games.append({
+                        "bookmaker": self.bookmaker,
+                        "sport": self.sport_name,
+                        "league": self.league,
+                        "game_id": game_id,
+                        "game_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "match": f"{team_1} vs {team_2}",
+                        "team_1": team_1,
+                        "team_2": team_2,
+                        "moneyline": {"team_1": ml1, "team_2": ml2},
+                        "spread": {"team_1_spread": None, "team_2_spread": None,
+                                    "team_1_odds": None, "team_2_odds": None},
+                        "total": {"over_total": None, "under_total": None,
+                                  "over_odds": None, "under_odds": None},
+                    })
+                except Exception:
+                    continue
+            if games:
+                return games, "dom"
+
+        return [], "none"
+
+    @staticmethod
+    def _extract_team_odds_from_dom_label(label):
+        title = (label.get("title") or label.text or "").strip()
+        match = re.match(r"^(.+?)\s+([+-]?\d+)", title)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        text = label.text.strip()
+        match = re.match(r"^(.+?)\s+([+-]?\d+)", text)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        return None, None
+
+    def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch") -> int:
+        if not hasattr(self, "_last_saved_ml"):
+            self._last_saved_ml = {}
+        games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
+        label = f"{source}/{src}" if src != "none" else source
+        if not games and force_scan:
+            self.logger.warning(f"No {self.sport_name} lines from API or DOM on force scan")
+        return persist_moneyline_games(
+            self.cache,
+            self.storage,
+            self.logger,
+            games,
+            self.sport_name,
+            self.league,
+            self._last_saved_ml,
+            source=label,
+        )
+
+    def _maybe_poll_odds_while_idle(self):
+        """Same-browser odds poll while betting loop waits (avoids second login session)."""
+        if not hasattr(self, "_last_idle_odds_poll"):
+            self._last_idle_odds_poll = 0.0
+        now = time.monotonic()
+        if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
+            return
+        self._last_idle_odds_poll = now
+        if not self._is_session_valid():
+            return
+        try:
+            self._poll_odds_watch_once(source="betting-idle")
+        except Exception as e:
+            self.logger.warning(f"Idle odds poll failed: {e}")
+
+    def watch_odds(
+        self,
+        poll_interval: float = None,
+        force_scan_interval: int = None,
+    ):
+        poll_interval = poll_interval or self.ODDS_WATCH_POLL_SECONDS
+        force_scan_interval = force_scan_interval or self.ODDS_WATCH_FORCE_SCAN_SECONDS
+
+        self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
+        self.storage = Storage(self.logger)
+        self._last_saved_ml = {}
+
+        self.logger.info(
+            f"========== Odds Watch ({self.sport_name}) (START) — "
+            f"API poll {poll_interval}s, force scan {force_scan_interval}s =========="
+        )
+
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+        self._cleanup_stale_temp_dirs()
+
+        setup_ok = False
+        for attempt in range(1, 6):
+            watchdog.beat()
+            try:
+                self._ensure_betting_session()
+                setup_ok = True
+                break
+            except Exception as e:
+                self.logger.error(f"Odds watch setup failed (attempt {attempt}/5): {e}")
+                self._recover_driver()
+                time.sleep(5)
+
+        if not setup_ok:
+            self.logger.error("Could not start Betamapola odds watch")
+            return
+
+        last_force_scan = 0.0
+        consecutive_recoveries = 0
+
+        try:
+            while True:
+                watchdog.beat()
+                try:
+                    current_url = self.driver.current_url
+                except Exception as e:
+                    self.logger.error(f"Odds watch driver error: {e}")
+                    self._recover_driver()
+                    if self._relogin_after_recovery():
+                        self._ensure_betting_session()
+                    time.sleep(5)
+                    continue
+
+                if "/sports" not in (current_url or ""):
+                    self.logger.warning(f"Odds watch off sport page ({current_url}); recovering")
+                    self._recover_driver()
+                    if self._relogin_after_recovery():
+                        self._ensure_betting_session()
+                    time.sleep(3)
+                    continue
+
+                consecutive_recoveries = 0
+                now = time.monotonic()
+                force_scan = (
+                    last_force_scan == 0.0
+                    or (now - last_force_scan) >= force_scan_interval
+                )
+                if force_scan:
+                    self.logger.info("Odds watch — force scan")
+                    last_force_scan = now
+
+                self._poll_odds_watch_once(force_scan=force_scan, source="watch")
+                time.sleep(poll_interval)
+
+        except KeyboardInterrupt:
+            self.logger.info("Betamapola odds watch stopped by user")
+        except Exception as e:
+            self.logger.error(f"Fatal Betamapola odds watch error: {e}", exc_info=True)
+            self._safe_send_monitoring_alert(e)
+        finally:
+            self.logger.info(f"========== Odds Watch ({self.sport_name}) (END) ==========")
+
+    # ===================================================================
     # Selenium fetch_odds (now prefers the direct GetSportOffering API)
     # ===================================================================
     @time_it
@@ -1057,19 +1237,17 @@ class BetamapolaController:
                 "matches": games,
                 "timestamp": datetime.now().isoformat()
             }
-            parsed_odds = parse_odds(odds_data)
-
-            for odd_row in parsed_odds:
-                if odd_row.get('bet_type') == 'moneyline':
-                    self.cache.add_odds(odd_row)
-                try:
-                    self.storage.save_odds(odd_row)
-                except Exception as db_err:
-                    error_str = str(db_err).lower()
-                    if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
-                        self.logger.warning("[WARN] Table 'arbitrage_odds' issue - continuing")
-                    else:
-                        self.logger.warning(f"DB save failed: {db_err}")
+            self._last_saved_ml = {}
+            persist_moneyline_games(
+                self.cache,
+                self.storage,
+                self.logger,
+                games,
+                self.sport_name,
+                self.league,
+                self._last_saved_ml,
+                source=source,
+            )
 
         except Exception as e:
             self.logger.error(f"Selenium fetch_odds failed: {e}", exc_info=True)
@@ -1827,6 +2005,7 @@ class BetamapolaController:
             consecutive_recoveries = 0
             arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
             if not arbs:
+                self._maybe_poll_odds_while_idle()
                 self.logger.info("Waiting for Arbitrage")
                 continue
 

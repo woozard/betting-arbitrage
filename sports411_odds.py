@@ -14,9 +14,9 @@ def main():
     )
 
     controller = Sports411Controller(account, SPORTS411, sport="baseball")
-    print("=== Fetching MLB Moneyline ===")
-    controller.fetch_odds()
-    print("\n✅ Finished fetching MLB moneyline odds")
+    print("=== Watching MLB moneyline (persistent session + MutationObserver) ===")
+    controller.watch_odds()
+    print("\n✅ S411 odds watch ended")
 
 
 if __name__ == "__main__":

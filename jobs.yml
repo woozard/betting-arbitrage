@@ -9,20 +9,8 @@ jobs:
     interval_seconds: 20
     start_offset_seconds: 0
 
-  - name: betamapola_odds
-    script: betamapola_odds.py
-    interval_seconds: 20
-    start_offset_seconds: 4
-
-  - name: paradisewager_odds
-    script: paradisewager_odds.py
-    interval_seconds: 20
-    start_offset_seconds: 7
-
-  - name: betwar_odds
-    script: betwar_odds.py
-    interval_seconds: 20
-    start_offset_seconds: 10
+  # Betamapola/BetWar/Paradise odds polled from each book's betting loop (same session).
+  # Standalone watch_odds() remains in *_odds.py for manual runs.
 
   - name: polymarket_odds
     script: polymarket_odds.py

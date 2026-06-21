@@ -16,10 +16,10 @@ def main():
         label='Reader-30K',
     )
 
-    print("=== Fetching MLB Moneyline ===")
+    print("=== Watching MLB moneyline (persistent session + GetSportOffering API) ===")
     controller = BetamapolaController(account, BETAMAPOLA, sport="baseball")
-    controller.fetch_odds()
-    print("\n✅ Finished fetching MLB moneyline odds")
+    controller.watch_odds()
+    print("\n✅ Betamapola odds watch ended")
 
 
 if __name__ == "__main__":

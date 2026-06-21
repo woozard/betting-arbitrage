@@ -32,6 +32,7 @@ from utils.bet_placement import (
     odds_tolerance_for_placement,
 )
 from utils.betting_watchdog import BettingLoopWatchdog
+from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -51,6 +52,9 @@ class ParadiseWagerController:
         "invalid token",
         "http 401",
     )
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("PARADISE_ODDS_POLL_SEC", "2.5"))
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("PARADISE_ODDS_FORCE_SCAN_SEC", "5"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("PARADISE_ODDS_IDLE_POLL_SEC", "2.5"))
 
     def __init__(self, account, site, sport="baseball"):
         self.account_id = account.account
@@ -954,6 +958,121 @@ class ParadiseWagerController:
             return
         self.logger.info("Token present; skipping login refresh before wager")
 
+    def _poll_odds_watch_once(self, source: str = "watch", force_relogin: bool = False) -> int:
+        if not hasattr(self, "_last_saved_ml"):
+            self._last_saved_ml = {}
+        if force_relogin or self._force_wager_relogin or not self._access_token:
+            self.__login()
+        games = self._refresh_schedule_cache()
+        return persist_moneyline_games(
+            self.cache,
+            self.storage,
+            self.logger,
+            games,
+            self.sport_name,
+            self.league,
+            self._last_saved_ml,
+            source=source,
+        )
+
+    def _maybe_poll_odds_while_idle(self):
+        if not hasattr(self, "_last_idle_odds_poll"):
+            self._last_idle_odds_poll = 0.0
+        now = time.monotonic()
+        if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
+            return
+        self._last_idle_odds_poll = now
+        try:
+            self._poll_odds_watch_once(source="betting-idle")
+        except Exception as e:
+            msg = str(e).lower()
+            if "401" in msg or "unauthorized" in msg:
+                self._invalidate_wager_session()
+                try:
+                    self.__login()
+                    self._poll_odds_watch_once(source="betting-idle-relogin")
+                except Exception as relogin_err:
+                    self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
+            else:
+                self.logger.warning(f"Idle odds poll failed: {e}")
+
+    def watch_odds(
+        self,
+        poll_interval: float = None,
+        force_scan_interval: int = None,
+    ):
+        poll_interval = poll_interval or self.ODDS_WATCH_POLL_SECONDS
+        force_scan_interval = force_scan_interval or self.ODDS_WATCH_FORCE_SCAN_SECONDS
+
+        self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
+        self.storage = Storage(self.logger)
+        self._last_saved_ml = {}
+
+        self.logger.info(
+            f"========== Odds Watch ({self.sport_name}) (START) — "
+            f"player-api poll {poll_interval}s, refresh {force_scan_interval}s =========="
+        )
+
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+        self._cleanup_stale_temp_dirs()
+
+        setup_ok = False
+        for attempt in range(1, 6):
+            watchdog.beat()
+            try:
+                self.__login()
+                setup_ok = True
+                break
+            except Exception as e:
+                self.logger.error(f"Odds watch setup failed (attempt {attempt}/5): {e}")
+                self._recover_driver()
+                time.sleep(5)
+
+        if not setup_ok:
+            self.logger.error("Could not start Paradise odds watch")
+            return
+
+        last_force_scan = 0.0
+
+        try:
+            while True:
+                watchdog.beat()
+                now = time.monotonic()
+                force_scan = (
+                    last_force_scan == 0.0
+                    or (now - last_force_scan) >= force_scan_interval
+                )
+                if force_scan:
+                    self.logger.info("Odds watch — scheduled refresh")
+                    last_force_scan = now
+
+                try:
+                    self._poll_odds_watch_once(
+                        source="watch-refresh" if force_scan else "watch",
+                        force_relogin=force_scan,
+                    )
+                except Exception as e:
+                    msg = str(e).lower()
+                    self.logger.warning(f"Odds watch poll failed: {e}")
+                    if "401" in msg or "unauthorized" in msg:
+                        self._invalidate_wager_session()
+                        try:
+                            self.__login()
+                        except Exception as relogin_err:
+                            self.logger.error(f"Odds watch re-login failed: {relogin_err}")
+                            time.sleep(5)
+
+                time.sleep(poll_interval)
+
+        except KeyboardInterrupt:
+            self.logger.info("Paradise odds watch stopped by user")
+        except Exception as e:
+            self.logger.error(f"Fatal Paradise odds watch error: {e}", exc_info=True)
+            self._safe_send_monitoring_alert(e)
+        finally:
+            self.logger.info(f"========== Odds Watch ({self.sport_name}) (END) ==========")
+
     @time_it
     def fetch_odds(self, refresh_interval=10, quit_driver=True):
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
@@ -982,19 +1101,17 @@ class ParadiseWagerController:
                 "matches": games,
                 "timestamp": datetime.now().isoformat(),
             }
-            parsed_odds = parse_odds(odds_data)
-
-            for odd_row in parsed_odds:
-                if odd_row.get('bet_type') == 'moneyline':
-                    self.cache.add_odds(odd_row)
-                try:
-                    self.storage.save_odds(odd_row)
-                except Exception as db_err:
-                    error_str = str(db_err).lower()
-                    if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
-                        self.logger.warning("[WARN] Table 'arbitrage_odds' issue - continuing")
-                    else:
-                        self.logger.warning(f"DB save failed: {db_err}")
+            self._last_saved_ml = {}
+            persist_moneyline_games(
+                self.cache,
+                self.storage,
+                self.logger,
+                games,
+                self.sport_name,
+                self.league,
+                self._last_saved_ml,
+                source="fetch",
+            )
 
         except Exception as e:
             self.logger.error(f"fetch_odds failed: {e}", exc_info=True)
@@ -1243,6 +1360,7 @@ class ParadiseWagerController:
             consecutive_recoveries = 0
             arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
             if not arbs:
+                self._maybe_poll_odds_while_idle()
                 self.logger.info("Waiting for Arbitrage")
                 continue
 

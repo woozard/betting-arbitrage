@@ -16,15 +16,10 @@ def main():
         label=BETWAR_LABEL,
     )
 
-    sports = ["baseball"]
-    controller = BetWarController(account, BETWAR, sport=sports[0])
-
-    for i, sport in enumerate(sports):
-        print(f"=== Fetching {sport.upper()} Moneyline ===")
-        controller._set_sport(sport)
-        controller.fetch_odds(quit_driver=(i == len(sports) - 1))
-
-    print("\nFinished fetching MLB moneyline odds from BetWar")
+    print("=== Watching MLB moneyline (persistent session + GetLines API) ===")
+    controller = BetWarController(account, BETWAR, sport="baseball")
+    controller.watch_odds()
+    print("\n✅ BetWar odds watch ended")
 
 
 if __name__ == "__main__":

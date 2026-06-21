@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -27,6 +29,7 @@ from utils.helpers import (
     teams_same,
 )
 from utils.timing import time_it
+from utils.odds_watch import persist_moneyline_games
 from cache.arbitrage_cache import ArbitrageCache
 
 
@@ -37,6 +40,7 @@ class PolymarketController:
     MAX_PAGES = 10
     MIN_PRICE = 0.02
     MAX_PRICE = 0.98
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("POLYMARKET_ODDS_POLL_SEC", "3"))
 
     def __init__(self, site=None, sport="baseball"):
         self.site = site or POLYMARKET
@@ -181,6 +185,21 @@ class PolymarketController:
                 break
         return markets
 
+    def _build_games_from_gamma(self) -> list:
+        raw_markets = self._fetch_all_moneyline_markets()
+        games = []
+        seen_game_ids = set()
+        for market in raw_markets:
+            row = self._parse_moneyline_market(market)
+            if not row:
+                continue
+            if row["game_id"] in seen_game_ids:
+                continue
+            seen_game_ids.add(row["game_id"])
+            games.append(row)
+        games.sort(key=lambda g: g["game_datetime"])
+        return games
+
     @time_it
     def fetch_odds(self):
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
@@ -190,49 +209,19 @@ class PolymarketController:
         )
 
         try:
-            raw_markets = self._fetch_all_moneyline_markets()
-            self.logger.info(
-                f"Gamma API returned {len(raw_markets)} active MLB moneyline markets"
-            )
-
-            games = []
-            seen_game_ids = set()
-            for market in raw_markets:
-                row = self._parse_moneyline_market(market)
-                if not row:
-                    continue
-                if row["game_id"] in seen_game_ids:
-                    continue
-                seen_game_ids.add(row["game_id"])
-                games.append(row)
-
-            games.sort(key=lambda g: g["game_datetime"])
+            games = self._build_games_from_gamma()
             self.logger.info(f"Parsed {len(games)} pregame MLB moneyline games")
-
-            odds_data = {
-                "sport": self.sport_name,
-                "league": self.league,
-                "total_matches": len(games),
-                "matches": games,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            parsed_odds = parse_odds(odds_data)
-
-            saved = 0
-            for odd_row in parsed_odds:
-                if odd_row.get("bet_type") == "moneyline":
-                    self.cache.add_odds(odd_row)
-                try:
-                    if self.storage.save_odds(odd_row):
-                        saved += 1
-                except Exception as db_err:
-                    error_str = str(db_err).lower()
-                    if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
-                        self.logger.warning("[WARN] Table 'arbitrage_odds' issue - continuing")
-                    else:
-                        self.logger.warning(f"DB save failed: {db_err}")
-
-            self.logger.info(f"Saved {saved} moneyline rows to arbitrage_odds")
+            self._last_saved_ml = {}
+            persist_moneyline_games(
+                self.cache,
+                self.storage,
+                self.logger,
+                games,
+                self.sport_name,
+                self.league,
+                self._last_saved_ml,
+                source="fetch",
+            )
 
         except Exception as e:
             self.logger.error(f"fetch_odds failed: {e}", exc_info=True)
@@ -248,6 +237,41 @@ class PolymarketController:
         finally:
             self.logger.info(
                 f"========== Fetching Odds ({self.sport_name}) via Gamma API (END) =========="
+            )
+
+    def watch_odds(self, poll_interval: float = None):
+        poll_interval = poll_interval or self.ODDS_WATCH_POLL_SECONDS
+        self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
+        self.storage = Storage(self.logger)
+        self._last_saved_ml = {}
+
+        self.logger.info(
+            f"========== Odds Watch ({self.sport_name}) (START) — "
+            f"Gamma API poll {poll_interval}s =========="
+        )
+
+        try:
+            while True:
+                try:
+                    games = self._build_games_from_gamma()
+                    persist_moneyline_games(
+                        self.cache,
+                        self.storage,
+                        self.logger,
+                        games,
+                        self.sport_name,
+                        self.league,
+                        self._last_saved_ml,
+                        source="watch",
+                    )
+                except Exception as e:
+                    self.logger.error(f"Polymarket odds poll failed: {e}", exc_info=True)
+                time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            self.logger.info("Polymarket odds watch stopped by user")
+        finally:
+            self.logger.info(
+                f"========== Odds Watch ({self.sport_name}) (END) =========="
             )
 
     def _resolve_funder_address(self) -> str:

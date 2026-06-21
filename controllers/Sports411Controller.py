@@ -50,6 +50,8 @@ class Sports411Controller:
     OPEN_BETS_POLL_TIMEOUT_SECONDS = 45
     PLACE_BET_READY_TIMEOUT = 20
     MAX_SOFT_NAV_FAILURES = 3
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("SPORTS411_ODDS_FORCE_SCAN_SEC", "5"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("SPORTS411_ODDS_POLL_SEC", "0.5"))
 
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
@@ -886,35 +888,204 @@ class Sports411Controller:
 
 
     def __inject_mutation_observer(self):
-
-        self.logger.info(f"Injecting Mutation Observer (JS)")
+        self.logger.info("Injecting MutationObserver on schedule (JS)")
         script = """
-        if (!window.oddsObserverInstalled) {
-            window.oddsObserverInstalled = true;
-            window.oddsBuffer = [];
-            
-            const target = document.querySelector('app-american-schedule');
-            
-            if (!target) {
-                console.log("Observer: target not found");
+        window.oddsBuffer = window.oddsBuffer || [];
+        if (window.oddsObserverHandle) {
+            try { window.oddsObserverHandle.disconnect(); } catch (e) {}
+        }
+        window.oddsObserverInstalled = false;
+        const target = document.querySelector('app-american-schedule')
+            || document.querySelector('.sports-league-games')
+            || document.body;
+        if (!target) {
+            return false;
+        }
+        window.oddsObserverHandle = new MutationObserver(() => {
+            if (window.oddsFlushTimer) {
                 return;
             }
-
-            const observer = new MutationObserver((mutations) => {
-                // Push updated HTML snapshot
+            window.oddsFlushTimer = setTimeout(() => {
                 window.oddsBuffer.push(target.innerHTML);
-            });
-
-            observer.observe(target, {
-                childList: true,
-                subtree: true,
-                characterData: true
-            });
-
-            console.log("MutationObserver installed");
-        }
+                window.oddsFlushTimer = null;
+            }, 250);
+        });
+        window.oddsObserverHandle.observe(target, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributes: true,
+        });
+        window.oddsObserverInstalled = true;
+        return true;
         """
-        self.driver.execute_script(script)
+        return bool(self.driver.execute_script(script))
+
+    def _ensure_odds_mutation_observer(self) -> bool:
+        try:
+            installed = self.driver.execute_script("return !!window.oddsObserverInstalled")
+            if installed:
+                return True
+            return self.__inject_mutation_observer()
+        except Exception as e:
+            self.logger.warning(f"Could not install odds MutationObserver: {e}")
+            return False
+
+    def _drain_odds_mutation_buffer(self) -> list:
+        try:
+            updates = self.driver.execute_script("""
+                const data = window.oddsBuffer || [];
+                window.oddsBuffer = [];
+                return data;
+            """)
+            return updates or []
+        except Exception as e:
+            self.logger.warning(f"Could not drain odds buffer: {e}")
+            return []
+
+    def _wait_for_odds_schedule_ready(self):
+        try:
+            self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "app-american-schedule"))
+            )
+        except Exception:
+            self.logger.warning("Schedule component not found quickly.")
+
+        try:
+            spinner_locator = (By.CSS_SELECTOR, "div.component-loader, .fa-spinner-third")
+            WebDriverWait(self.driver, 15).until(
+                EC.invisibility_of_element_located(spinner_locator)
+            )
+        except Exception:
+            self.logger.warning("Spinner did not disappear within 15s timeout.")
+
+        for _ in range(12):
+            if self._sport_games_present():
+                return
+            time.sleep(0.5)
+
+        if not self._sport_games_present():
+            self.logger.warning("Game rows not visible after schedule wait.")
+
+    @staticmethod
+    def _extract_team_odds_from_label(label):
+        title = (label.get("title") or label.text or "").strip()
+        match = re.match(r"^(.+?)\s+([+-]?\d+)", title)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        text = label.text.strip()
+        match = re.match(r"^(.+?)\s+([+-]?\d+)", text)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        return None, None
+
+    def _parse_games_from_html(self, html: str) -> list:
+        soup = BeautifulSoup(html or "", "html.parser")
+        games = []
+        for game in soup.select("div.sports-league-game"):
+            try:
+                game_id = game.get("idgame")
+                if not game_id:
+                    continue
+                mline1 = game.select_one(".mline-1 label.bet-indicator")
+                mline2 = game.select_one(".mline-2 label.bet-indicator")
+                if not mline1 or not mline2:
+                    continue
+
+                team_1, team_1_ml = self._extract_team_odds_from_label(mline1)
+                team_2, team_2_ml = self._extract_team_odds_from_label(mline2)
+                if not team_1 or not team_2 or not team_1_ml or not team_2_ml:
+                    continue
+
+                game_datetime_str = self._extract_game_datetime(game)
+                if not game_datetime_str:
+                    game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                games.append({
+                    "bookmaker": self.bookmaker,
+                    "sport": self.sport_name,
+                    "league": self.league,
+                    "game_id": game_id,
+                    "game_datetime": game_datetime_str,
+                    "match": f"{team_1} vs {team_2}",
+                    "team_1": team_1,
+                    "team_2": team_2,
+                    "moneyline": {"team_1": team_1_ml, "team_2": team_2_ml},
+                    "spread": {
+                        "team_1_spread": None, "team_2_spread": None,
+                        "team_1_odds": None, "team_2_odds": None,
+                    },
+                    "total": {
+                        "over_total": None, "under_total": None,
+                        "over_odds": None, "under_odds": None,
+                    },
+                })
+            except Exception as e:
+                self.logger.error(f"Error parsing game: {e}", exc_info=True)
+        raw_count = len(games)
+        games = self._dedupe_games_by_matchup(games)
+        if raw_count != len(games):
+            self.logger.info(
+                f"Deduped S411 matchups: {raw_count} DOM nodes -> {len(games)} unique games"
+            )
+        return games
+
+    def _persist_games_odds(self, games: list, source: str = "scan") -> int:
+        if not games:
+            return 0
+
+        if not hasattr(self, "_last_saved_ml"):
+            self._last_saved_ml = {}
+
+        odds_data = {
+            "sport": self.sport_name,
+            "league": self.league,
+            "total_matches": len(games),
+            "matches": games,
+            "timestamp": datetime.now().isoformat(),
+        }
+        parsed_odds = parse_odds(odds_data)
+        saved = 0
+        for odd_row in parsed_odds:
+            if odd_row.get("bet_type") != "moneyline":
+                continue
+            sig = (
+                odd_row.get("moneyline_team_1"),
+                odd_row.get("moneyline_team_2"),
+            )
+            game_id = odd_row.get("game_id")
+            if self._last_saved_ml.get(game_id) == sig:
+                continue
+            self._last_saved_ml[game_id] = sig
+            self.cache.add_odds(odd_row)
+            try:
+                self.storage.save_odds(odd_row)
+            except Exception as db_err:
+                error_str = str(db_err).lower()
+                if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
+                    self.logger.warning("⚠️ Table 'arbitrage_odds' issue - continuing")
+                else:
+                    self.logger.warning(f"DB save failed: {db_err}")
+            saved += 1
+
+        if saved:
+            self.logger.info(
+                f"Published {saved} moneyline update(s) from {len(games)} games ({source})"
+            )
+        return saved
+
+    def _prepare_odds_watch_page(self) -> bool:
+        self._ensure_odds_session()
+        if not self._is_on_sport_page_with_games():
+            self.logger.info(f"Navigating to {self.sport_url}")
+            self.driver.get(self.sport_url)
+        self._wait_for_odds_schedule_ready()
+        if not self._sport_games_present():
+            self.logger.warning(f"No {self.sport_name} games visible on odds watch page")
+            return False
+        if not self._ensure_odds_mutation_observer():
+            self.logger.warning("MutationObserver not installed; force scans only")
+        return True
 
     # --------------------------------------------------------
     # Game datetime extraction (critical for cross-book matching on game_datetime)
@@ -1071,141 +1242,30 @@ class Sports411Controller:
     # ===================================================================
     @time_it
     def fetch_odds(self, refresh_interval=10, quit_driver=True):
+        """One-shot odds scrape (manual/tests). Production uses watch_odds()."""
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
         self.storage = Storage(self.logger)
         self.logger.info(f"========== Fetching Odds ({self.sport_name}) via Selenium (START) ==========")
         prune_debug_files()
 
         try:
-            self._ensure_odds_session()
+            if not self._prepare_odds_watch_page():
+                self.logger.warning("Could not prepare odds page for one-shot fetch")
+                return
 
-            self.logger.info(f"Navigating to {self.sport_url}")
-            self.driver.get(self.sport_url)
-
-            # Wait for the main schedule component
-            try:
-                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "app-american-schedule")))
-            except Exception:
-                self.logger.warning("Schedule component not found quickly.")
-
-            # Wait for the loading spinner to disappear (up to 15 seconds)
-            try:
-                spinner_locator = (By.CSS_SELECTOR, "div.component-loader, .fa-spinner-third")
-                WebDriverWait(self.driver, 15).until(
-                    EC.invisibility_of_element_located(spinner_locator)
-                )
-                self.logger.info("Loading spinner disappeared.")
-            except Exception:
-                self.logger.warning("Spinner did not disappear within 15s timeout.")
-
-            # Additional patient wait for actual game data to populate (up to ~12s)
-            self.logger.info("Waiting for game data to load into the DOM...")
-            game_content_found = False
-            for _ in range(12):
-                time.sleep(1)
-                page_text = self.driver.page_source
-                # Look for rotation numbers + team names (very common pattern in this book)
-                if re.search(r'\b[0-9]{3,4}\s+[A-Z][A-Za-z]', page_text):
-                    game_content_found = True
-                    break
-
-            if not game_content_found:
-                self.logger.warning("Game content may still be loading after waiting.")
-
-            # Save debug HTML after waiting attempts
-            debug_file = debug_filepath(f"debug_sports411_{self.sport_name.lower()}")
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(self.driver.page_source)
-            self.logger.info(f"💾 Saved debug HTML: {debug_file}")
-
-            html = self.driver.page_source
-            soup = BeautifulSoup(html, "html.parser")
-            games = []
-
-            for game in soup.select("div.sports-league-game"):
-                try:
-                    game_id = game.get("idgame")
-                    if not game_id:
-                        continue
-                    mline1 = game.select_one(".mline-1 label.bet-indicator")
-                    mline2 = game.select_one(".mline-2 label.bet-indicator")
-                    if not mline1 or not mline2:
-                        continue
-
-                    def extract_team_odds(label):
-                        title = (label.get("title") or label.text or "").strip()
-                        match = re.match(r"^(.+?)\s+([+-]?\d+)", title)
-                        if match:
-                            return match.group(1).strip(), match.group(2).strip()
-                        text = label.text.strip()
-                        match = re.match(r"^(.+?)\s+([+-]?\d+)", text)
-                        if match:
-                            return match.group(1).strip(), match.group(2).strip()
-                        return None, None
-
-                    team_1, team_1_ml = extract_team_odds(mline1)
-                    team_2, team_2_ml = extract_team_odds(mline2)
-                    if not team_1 or not team_2 or not team_1_ml or not team_2_ml:
-                        continue
-
-                    game_datetime_str = self._extract_game_datetime(game)
-                    if not game_datetime_str:
-                        game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                    games.append({
-                        "bookmaker": self.bookmaker,
-                        "sport": self.sport_name,
-                        "league": self.league,
-                        "game_id": game_id,
-                        "game_datetime": game_datetime_str,
-                        "match": f"{team_1} vs {team_2}",
-                        "team_1": team_1,
-                        "team_2": team_2,
-                        "moneyline": {"team_1": team_1_ml, "team_2": team_2_ml},
-                        "spread": {"team_1_spread": None, "team_2_spread": None, "team_1_odds": None,
-                                   "team_2_odds": None},
-                        "total": {"over_total": None, "under_total": None, "over_odds": None, "under_odds": None}
-                    })
-                except Exception as e:
-                    self.logger.error(f"Error parsing game: {e}", exc_info=True)
-                    continue
-
-            raw_count = len(games)
-            games = self._dedupe_games_by_matchup(games)
-            if raw_count != len(games):
-                self.logger.info(
-                    f"Deduped S411 matchups: {raw_count} DOM nodes -> {len(games)} unique games"
-                )
-
+            games = self._parse_games_from_html(self.driver.page_source)
             self.logger.info(f"Extracted {len(games)} {self.sport_name} matches via Selenium")
 
             if len(games) == 0:
+                debug_file = debug_filepath(f"debug_sports411_{self.sport_name.lower()}")
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    f.write(self.driver.page_source)
                 self.logger.warning(
-                    f"No games found for {self.sport_name}. "
-                    f"Inspect the debug file: {debug_file}. "
-                    "The site structure may have changed or additional waits/selectors are needed."
+                    f"No games found for {self.sport_name}. Inspect: {debug_file}"
                 )
 
-            odds_data = {
-                "sport": self.sport_name,
-                "league": self.league,
-                "total_matches": len(games),
-                "matches": games,
-                "timestamp": datetime.now().isoformat()
-            }
-            parsed_odds = parse_odds(odds_data)
-
-            for odd_row in parsed_odds:
-                if odd_row.get('bet_type') == 'moneyline':
-                    self.cache.add_odds(odd_row)
-                try:
-                    self.storage.save_odds(odd_row)
-                except Exception as db_err:
-                    error_str = str(db_err).lower()
-                    if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
-                        self.logger.warning("⚠️ Table 'arbitrage_odds' issue - continuing")
-                    else:
-                        self.logger.warning(f"DB save failed: {db_err}")
+            self._last_saved_ml = {}
+            self._persist_games_odds(games, source="fetch")
 
         except Exception as e:
             self.logger.error(f"Selenium fetch_odds failed: {e}", exc_info=True)
@@ -1214,6 +1274,129 @@ class Sports411Controller:
             if quit_driver:
                 self._quit_driver()
             self.logger.info(f"========= Fetching Odds ({self.sport_name}) via Selenium (END) ==========")
+
+    def watch_odds(
+        self,
+        force_scan_interval: int = None,
+        poll_interval: float = None,
+    ):
+        """Long-lived odds watcher: one login, stay on MLB/NBA page, push updates on DOM changes."""
+        force_scan_interval = force_scan_interval or self.ODDS_WATCH_FORCE_SCAN_SECONDS
+        poll_interval = poll_interval or self.ODDS_WATCH_POLL_SECONDS
+
+        self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
+        self.storage = Storage(self.logger)
+        self._last_saved_ml = {}
+
+        self.logger.info(
+            f"========== Odds Watch ({self.sport_name}) (START) — "
+            f"force scan every {force_scan_interval}s, poll {poll_interval}s =========="
+        )
+
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+        self._cleanup_stale_temp_dirs()
+
+        setup_ok = False
+        for attempt in range(1, 6):
+            watchdog.beat()
+            try:
+                setup_ok = self._prepare_odds_watch_page()
+                if setup_ok:
+                    break
+            except Exception as e:
+                self.logger.error(f"Odds watch setup failed (attempt {attempt}/5): {e}")
+            self._recover_driver()
+            time.sleep(5)
+
+        if not setup_ok:
+            self.logger.error("Could not start odds watch after recoveries")
+            self.logger.info(f"========== Odds Watch ({self.sport_name}) (END) ==========")
+            return
+
+        last_force_scan = 0.0
+        consecutive_recoveries = 0
+        consecutive_soft_nav_failures = 0
+
+        try:
+            while True:
+                watchdog.beat()
+
+                try:
+                    current_url = self.driver.current_url
+                except Exception as e:
+                    self.logger.error(f"Odds watch driver error: {e}")
+                    self._recover_driver()
+                    consecutive_recoveries += 1
+                    if self._relogin_after_recovery():
+                        self._prepare_odds_watch_page()
+                    time.sleep(5)
+                    continue
+
+                if self._is_off_sport_page(current_url):
+                    if self._should_soft_navigate_back(current_url):
+                        self.logger.warning(
+                            f"Odds watch off {self.sport_name} page ({current_url}); soft nav back"
+                        )
+                        self._return_to_sport_page()
+                        if self._is_on_sport_page_with_games():
+                            self._ensure_odds_mutation_observer()
+                            consecutive_soft_nav_failures = 0
+                            continue
+                        consecutive_soft_nav_failures += 1
+                        if consecutive_soft_nav_failures >= self.MAX_SOFT_NAV_FAILURES:
+                            self.logger.warning(
+                                "Odds watch soft nav failed repeatedly; recovering driver"
+                            )
+                            consecutive_soft_nav_failures = 0
+                            self._recover_driver()
+                            if self._relogin_after_recovery():
+                                self._prepare_odds_watch_page()
+                        time.sleep(2)
+                        continue
+
+                    self.logger.warning(f"Odds watch unexpected URL ({current_url}); recovering")
+                    self._recover_driver()
+                    if self._relogin_after_recovery():
+                        self._prepare_odds_watch_page()
+                    time.sleep(5)
+                    continue
+
+                consecutive_recoveries = 0
+                consecutive_soft_nav_failures = 0
+
+                now = time.monotonic()
+                updates = []
+                is_force_scan = False
+                if last_force_scan == 0.0 or (now - last_force_scan) >= force_scan_interval:
+                    self.logger.info("Odds watch — force scan")
+                    updates = [self.driver.page_source]
+                    last_force_scan = now
+                    is_force_scan = True
+                else:
+                    updates = self._drain_odds_mutation_buffer()
+                    if not updates:
+                        time.sleep(poll_interval)
+                        continue
+
+                for html_chunk in updates:
+                    games = self._parse_games_from_html(html_chunk)
+                    source = "force-scan" if is_force_scan else "watch"
+                    saved = self._persist_games_odds(games, source=source)
+                    if saved or is_force_scan:
+                        self.logger.info(
+                            f"Extracted {len(games)} {self.sport_name} matches ({source})"
+                        )
+
+                time.sleep(poll_interval)
+
+        except KeyboardInterrupt:
+            self.logger.info("Odds watch stopped by user")
+        except Exception as e:
+            self.logger.error(f"Fatal odds watch error: {e}", exc_info=True)
+            self._safe_send_monitoring_alert(e)
+        finally:
+            self.logger.info(f"========== Odds Watch ({self.sport_name}) (END) ==========")
     # END CHANGE
 
     def _wait_for_login_page_or_sports(self, timeout=15):

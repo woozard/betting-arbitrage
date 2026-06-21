@@ -29,6 +29,8 @@ from utils.bet_placement import (
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
+from utils.betting_watchdog import BettingLoopWatchdog
+from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -40,6 +42,9 @@ class BetWarController:
         "session expired",
         "logged out",
     )
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("BETWAR_ODDS_POLL_SEC", "1.5"))
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("BETWAR_ODDS_FORCE_SCAN_SEC", "5"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETWAR_ODDS_IDLE_POLL_SEC", "2"))
 
     # ===================================================================
     # BetWar.com - Player portal (ASP.NET main.aspx sidebar + bet slip)
@@ -1697,6 +1702,143 @@ class BetWarController:
         self.logger.info("Session invalid for odds fetch; performing full login")
         self.__login()
 
+    def _fetch_games_for_odds(self, allow_dom_fallback: bool = False):
+        games = self._fetch_lines_via_getlines_api()
+        if games:
+            return games, "GetLines"
+
+        api_lines = self._fetch_game_lines_via_api()
+        if api_lines:
+            games = self._parse_api_game_lines(api_lines)
+            if games:
+                return games, "GetSportOffering"
+
+        if allow_dom_fallback:
+            if not self._player_lines_populated():
+                self._wait_for_player_game_lines(timeout=15)
+            games = self._parse_player_portal_dom(self.driver.page_source)
+            if games:
+                games = self._filter_games_with_valid_moneylines(games)
+                if games:
+                    return games, "dom"
+
+        return [], "none"
+
+    def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch") -> int:
+        if not hasattr(self, "_last_saved_ml"):
+            self._last_saved_ml = {}
+        games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
+        label = f"{source}/{src}" if src != "none" else source
+        if not games and force_scan:
+            self.logger.warning(f"No {self.sport_name} lines from API/DOM on force scan")
+        return persist_moneyline_games(
+            self.cache,
+            self.storage,
+            self.logger,
+            games,
+            self.sport_name,
+            self.league,
+            self._last_saved_ml,
+            source=label,
+        )
+
+    def _maybe_poll_odds_while_idle(self):
+        if not hasattr(self, "_last_idle_odds_poll"):
+            self._last_idle_odds_poll = 0.0
+        now = time.monotonic()
+        if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
+            return
+        self._last_idle_odds_poll = now
+        if not self._is_session_valid():
+            return
+        try:
+            self._poll_odds_watch_once(source="betting-idle")
+        except Exception as e:
+            self.logger.warning(f"Idle odds poll failed: {e}")
+
+    def watch_odds(
+        self,
+        poll_interval: float = None,
+        force_scan_interval: int = None,
+    ):
+        poll_interval = poll_interval or self.ODDS_WATCH_POLL_SECONDS
+        force_scan_interval = force_scan_interval or self.ODDS_WATCH_FORCE_SCAN_SECONDS
+
+        self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
+        self.storage = Storage(self.logger)
+        self._last_saved_ml = {}
+
+        self.logger.info(
+            f"========== Odds Watch ({self.sport_name}) (START) — "
+            f"API poll {poll_interval}s, force scan {force_scan_interval}s =========="
+        )
+
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+        self._cleanup_stale_temp_dirs()
+
+        setup_ok = False
+        for attempt in range(1, 6):
+            watchdog.beat()
+            try:
+                self._ensure_odds_session()
+                self.__ensure_sport_offering_loaded()
+                setup_ok = True
+                break
+            except Exception as e:
+                self.logger.error(f"Odds watch setup failed (attempt {attempt}/5): {e}")
+                self._recover_driver()
+                time.sleep(5)
+
+        if not setup_ok:
+            self.logger.error("Could not start BetWar odds watch")
+            return
+
+        last_force_scan = 0.0
+
+        try:
+            while True:
+                watchdog.beat()
+                try:
+                    current_url = self.driver.current_url
+                except Exception as e:
+                    self.logger.error(f"Odds watch driver error: {e}")
+                    self._recover_driver()
+                    if self._relogin_after_recovery():
+                        self._ensure_odds_session()
+                        self.__ensure_sport_offering_loaded()
+                    time.sleep(5)
+                    continue
+
+                if "/player/" not in (current_url or "").lower():
+                    self.logger.warning(f"Odds watch off player page ({current_url}); recovering")
+                    self._recover_driver()
+                    if self._relogin_after_recovery():
+                        self._ensure_odds_session()
+                        self.__ensure_sport_offering_loaded()
+                    time.sleep(3)
+                    continue
+
+                now = time.monotonic()
+                force_scan = (
+                    last_force_scan == 0.0
+                    or (now - last_force_scan) >= force_scan_interval
+                )
+                if force_scan:
+                    self.logger.info("Odds watch — force scan")
+                    last_force_scan = now
+
+                self._poll_odds_watch_once(force_scan=force_scan, source="watch")
+                time.sleep(poll_interval)
+
+        except KeyboardInterrupt:
+            self.logger.info("BetWar odds watch stopped by user")
+        except Exception as e:
+            self.logger.error(f"Fatal BetWar odds watch error: {e}", exc_info=True)
+            self._safe_send_monitoring_alert(e)
+        finally:
+            self.logger.info(f"========== Odds Watch ({self.sport_name}) (END) ==========")
+
     @time_it
     def fetch_odds(self, refresh_interval=10, quit_driver=True):
         self.logger = Logger.get_logger(f"{self.bookmaker}-fetch-odds")
@@ -1809,19 +1951,17 @@ class BetWarController:
                 "matches": games,
                 "timestamp": datetime.now().isoformat()
             }
-            parsed_odds = parse_odds(odds_data)
-
-            for odd_row in parsed_odds:
-                if odd_row.get('bet_type') == 'moneyline':
-                    self.cache.add_odds(odd_row)
-                try:
-                    self.storage.save_odds(odd_row)
-                except Exception as db_err:
-                    error_str = str(db_err).lower()
-                    if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
-                        self.logger.warning("[WARN] Table 'arbitrage_odds' issue - continuing")
-                    else:
-                        self.logger.warning(f"DB save failed: {db_err}")
+            self._last_saved_ml = {}
+            persist_moneyline_games(
+                self.cache,
+                self.storage,
+                self.logger,
+                games,
+                self.sport_name,
+                self.league,
+                self._last_saved_ml,
+                source=odds_source,
+            )
 
         except Exception as e:
             self.logger.error(f"Selenium fetch_odds failed: {e}", exc_info=True)
@@ -2696,6 +2836,7 @@ class BetWarController:
             consecutive_recoveries = 0
             arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
             if not arbs:
+                self._maybe_poll_odds_while_idle()
                 self.logger.info("Waiting for Arbitrage")
                 continue
 

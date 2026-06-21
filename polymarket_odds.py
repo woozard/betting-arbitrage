@@ -3,10 +3,10 @@ from utils.config import POLYMARKET
 
 
 def main():
-    print("=== Fetching MLB Moneyline from Polymarket (Gamma API) ===")
+    print("=== Watching MLB moneyline (Gamma API poll) ===")
     controller = PolymarketController(POLYMARKET, sport="baseball")
-    controller.fetch_odds()
-    print("\nFinished fetching MLB moneyline odds from Polymarket")
+    controller.watch_odds()
+    print("\n✅ Polymarket odds watch ended")
 
 
 if __name__ == "__main__":

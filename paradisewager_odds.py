@@ -21,10 +21,10 @@ def main():
         label=PARADIESWAGER_LABEL,
     )
 
-    print("=== Fetching MLB Moneyline ===")
+    print("=== Watching MLB moneyline (persistent session + player-api) ===")
     controller = ParadiseWagerController(account, PARADISEWAGER, sport="baseball")
-    controller.fetch_odds()
-    print("\nFinished fetching MLB moneyline odds from ParadiseWager")
+    controller.watch_odds()
+    print("\n✅ ParadiseWager odds watch ended")
 
 
 if __name__ == "__main__":
