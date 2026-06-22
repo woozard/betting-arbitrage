@@ -19,6 +19,8 @@ from database.models.Accounts import Accounts
 from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageBets import ArbitrageBets
 from database.models.ArbitrageOdds import ArbitrageOdds
+from database.models.CanonicalGame import CanonicalGame
+from database.models.GameBookLink import GameBookLink
 from database.models.DailyFigures import DailyFigures
 from database.models.Odds2 import Odds2
 from database.models.Trades import Trades

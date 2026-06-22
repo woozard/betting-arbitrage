@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -10,7 +9,7 @@ from typing import List, Optional, Tuple
 
 from controllers.ArbitrageController import ArbitrageController
 from utils.config import ACTIVE_ARB_BOOKMAKERS, ACTIVE_ARB_BOOK_PAIRS, ARB_MAX_TOTAL_PROB, MIN_ARB_PROFIT_PCT
-from utils.helpers import is_plausible_moneyline_pair
+from utils.helpers import is_plausible_moneyline_pair, normalize_team, teams_same
 
 SCAN_ODDS_WINDOW_MINUTES = 10
 
@@ -20,19 +19,6 @@ BOOK_LABELS = {
     "paradisewager": "Paradise",
     "betwar": "BetWar",
 }
-
-
-def normalize_team(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"^[A-Z]{2,4}\s+", "", name)
-    return name.strip().lower()
-
-
-def teams_same(a: str, b: str) -> bool:
-    a_n, b_n = normalize_team(a), normalize_team(b)
-    if not a_n or not b_n:
-        return False
-    return a_n == b_n or a_n in b_n or b_n in a_n
 
 
 def valid_ml(value) -> bool:

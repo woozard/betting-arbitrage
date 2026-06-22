@@ -2082,7 +2082,9 @@ class BetamapolaController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if should_pause_first_leg_for_exposure(self.cache, book_1, book_2, self.bookmaker):
+                if should_pause_first_leg_for_exposure(
+                    self.cache, book_1, book_2, self.bookmaker, arb, bet_type
+                ):
                     self.logger.info(
                         f"Skipping arb — open partial exposure; pausing new first legs | "
                         f"{team_1} vs {team_2}"

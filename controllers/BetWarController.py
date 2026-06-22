@@ -22,6 +22,7 @@ from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_ar
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable
+from utils.team_registry import standard_team_name
 from utils.bet_placement import (
     finalize_confirmed_bet,
     maybe_notify_partial_arb_exposure,
@@ -602,6 +603,9 @@ class BetWarController:
         except (TypeError, ValueError):
             text = str(odds).strip()
             return text if text.startswith(("+", "-")) else f"+{text}"
+
+    def _standardize_team_name(self, raw: str) -> str:
+        return standard_team_name(raw, sport=self.sport_name, league=self.league)
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
@@ -1474,8 +1478,8 @@ class BetWarController:
             s1, s2 = sides[0], sides[1]
             rot1 = str(s1.get("rotation") or "").strip()
             rot2 = str(s2.get("rotation") or "").strip()
-            team1 = (s1.get("name") or "").strip()
-            team2 = (s2.get("name") or "").strip()
+            team1 = self._standardize_team_name((s1.get("name") or "").strip())
+            team2 = self._standardize_team_name((s2.get("name") or "").strip())
             ml1 = self._get_side_moneyline_odds(s1)
             ml2 = self._get_side_moneyline_odds(s2)
 
@@ -1541,6 +1545,9 @@ class BetWarController:
             game_id = f"{r1['rotation']}-{r2['rotation']}"
             game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             normalized_dt = parse_to_mysql_datetime(game_datetime_str, tz_name=self.game_tz) or game_datetime_str
+
+            r1["team"] = self._standardize_team_name(r1["team"])
+            r2["team"] = self._standardize_team_name(r2["team"])
 
             games.append({
                 "bookmaker": self.bookmaker,
@@ -1648,6 +1655,9 @@ class BetWarController:
             rot2 = gl.get("Team2RotNum")
             ml1 = gl.get("MoneyLine1")
             ml2 = gl.get("MoneyLine2")
+
+            team1 = self._standardize_team_name(str(team1).strip())
+            team2 = self._standardize_team_name(str(team2).strip())
 
             if not team1 or not team2 or ml1 is None or ml2 is None:
                 continue
@@ -3028,7 +3038,9 @@ class BetWarController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if should_pause_first_leg_for_exposure(self.cache, book_1, book_2, self.bookmaker):
+                if should_pause_first_leg_for_exposure(
+                    self.cache, book_1, book_2, self.bookmaker, arb, bet_type
+                ):
                     self.logger.info(
                         f"Skipping arb — open partial exposure; pausing new first legs | "
                         f"{team_1} vs {team_2}"

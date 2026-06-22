@@ -76,8 +76,33 @@ def should_defer_for_sequential_first_leg(
     return not cache.is_leg_placed(first_leg_book, bet_type, first_leg_game_id)
 
 
-def should_pause_first_leg_for_exposure(cache, book_1: str, book_2: str, bookmaker: str) -> bool:
-    return is_first_leg_bookmaker(book_1, book_2, bookmaker) and cache.has_partial_exposure()
+def should_pause_first_leg_for_exposure(
+    cache,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    arb: dict | None = None,
+    bet_type: str = "moneyline",
+) -> bool:
+    """Pause new first-leg arbs while one-sided exposure exists elsewhere.
+
+    Still allow the configured first-leg book to complete the hedge when the
+    other book's leg for *this* arb is already confirmed (parallel placement).
+    """
+    if not is_first_leg_bookmaker(book_1, book_2, bookmaker):
+        return False
+    if not cache.has_partial_exposure():
+        return False
+    if arb is not None:
+        bm = (bookmaker or "").strip().lower()
+        b1 = (book_1 or "").strip().lower()
+        other_book = book_2 if bm == b1 else book_1
+        other_game_id = (
+            arb["team_1_game_id"] if other_book == b1 else arb["team_2_game_id"]
+        )
+        if cache.is_leg_placed(other_book, bet_type, other_game_id):
+            return False
+    return True
 
 
 def _build_leg_confirmed_alert(

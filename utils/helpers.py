@@ -711,14 +711,20 @@ def arb_live_odds_acceptable(expected, live, tolerance: int = 0) -> bool:
 
 
 def normalize_team(name: str) -> str:
-    """Strip book-specific abbrev prefixes (e.g. SEA Mariners -> mariners)."""
-    name = (name or "").strip()
-    name = re.sub(r"^[A-Z]{2,4}\s+", "", name)
-    return name.strip().lower()
+    """Return canonical team slug for cross-book matchup keys."""
+    from utils.team_registry import canonical_team
+
+    return canonical_team(name)
 
 
 def teams_same(a: str, b: str) -> bool:
-    a_n, b_n = normalize_team(a), normalize_team(b)
+    from utils.team_registry import canonical_team
+
+    a_c = canonical_team(a)
+    b_c = canonical_team(b)
+    if a_c and b_c and a_c == b_c:
+        return True
+    a_n, b_n = (a or "").strip().lower(), (b or "").strip().lower()
     if not a_n or not b_n:
         return False
     return a_n == b_n or a_n in b_n or b_n in a_n

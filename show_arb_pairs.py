@@ -7,23 +7,10 @@ from decimal import Decimal
 from itertools import combinations
 
 from controllers.ArbitrageController import ArbitrageController
+from utils.helpers import normalize_team, teams_same
 
 BOOKS = ("betamapola", "sports411", "paradisewager", "betwar")
 BOOK_PAIRS = list(combinations(BOOKS, 2))
-
-
-def normalize_team(name: str) -> str:
-    """Canonical team token for cross-book matching (handles BetWar abbrev prefixes)."""
-    name = (name or "").strip()
-    name = re.sub(r"^[A-Z]{2,4}\s+", "", name)
-    return name.strip().lower()
-
-
-def teams_same(a: str, b: str) -> bool:
-    a_n, b_n = normalize_team(a), normalize_team(b)
-    if not a_n or not b_n:
-        return False
-    return a_n == b_n or a_n in b_n or b_n in a_n
 
 
 def valid_ml(value) -> bool:

@@ -6,6 +6,7 @@ from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageBets import ArbitrageBets
 from database.models.Trades import Trades
 from utils.helpers import currency_to_float
+from utils.game_registry import register_game_from_odds
 from sqlalchemy.sql import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from datetime import datetime
@@ -169,6 +170,13 @@ class Storage:
             self.db.add(odds_row)
             self.db.commit()
             saved = True
+
+            try:
+                register_game_from_odds(self.db, odd, logger=self.logger)
+                self.db.commit()
+            except Exception as reg_err:
+                self.db.rollback()
+                self.logger.warning(f"Canonical game registry skipped: {reg_err}")
 
             self.logger.info(f"DB - Odds Saved (bookmaker = {odd['bookmaker']} - bet_type = {odd['bet_type']} - game_id = {odd['game_id']})")
                 
