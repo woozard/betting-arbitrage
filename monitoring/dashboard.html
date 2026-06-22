@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Betting Arb Monitor</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --green: #3dd68c;
+      --yellow: #f5c542;
+      --red: #f07178;
+      --blue: #59c2ff;
+      --accent: #7aa2f7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, #151d29, var(--bg));
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header h1 { margin: 0 0 .35rem; font-size: 1.25rem; }
+    .meta { color: var(--muted); font-size: .85rem; }
+    .meta span { margin-right: 1rem; }
+    main { padding: 1rem 1.25rem 2rem; max-width: 1400px; margin: 0 auto; }
+    .grid { display: grid; gap: 1rem; }
+    @media (min-width: 900px) {
+      .grid-2 { grid-template-columns: 1fr 1fr; }
+      .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+    }
+    .card h2 {
+      margin: 0 0 .75rem;
+      font-size: .95rem;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: var(--muted);
+    }
+    .pill {
+      display: inline-block;
+      padding: .15rem .55rem;
+      border-radius: 999px;
+      font-size: .75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .healthy { background: rgba(61,214,140,.15); color: var(--green); }
+    .degraded { background: rgba(245,197,66,.15); color: var(--yellow); }
+    .down, .no_overlap { background: rgba(240,113,120,.15); color: var(--red); }
+    .watching { background: rgba(89,194,255,.12); color: var(--blue); }
+    .executable { background: rgba(61,214,140,.25); color: var(--green); animation: pulse 1.5s infinite; }
+    @keyframes pulse { 50% { opacity: .7; } }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th, td { text-align: left; padding: .45rem .35rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; }
+    tr:last-child td { border-bottom: none; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; }
+    .summary-box {
+      display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
+      padding: 1rem; border-radius: 10px;
+      background: rgba(122,162,247,.08); border: 1px solid rgba(122,162,247,.25);
+    }
+    .summary-box .big { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+    .err { color: var(--red); padding: 1rem; }
+    .truncate { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .fire-yes { color: var(--green); font-weight: 700; }
+    .fire-no { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Betting Arb Monitor</h1>
+    <div class="meta">
+      <span id="ts">Loading…</span>
+      <span id="cfg"></span>
+      <span>Auto-refresh: __REFRESH_SEC__s</span>
+    </div>
+  </header>
+  <main>
+    <div id="error" class="err" style="display:none"></div>
+    <section class="card summary-box" id="summary"></section>
+    <div class="grid grid-2" style="margin-top:1rem">
+      <section class="card">
+        <h2>Books</h2>
+        <table id="books"><tbody></tbody></table>
+      </section>
+      <section class="card">
+        <h2>Scanner</h2>
+        <div id="scanner"></div>
+      </section>
+    </div>
+    <section class="card" style="margin-top:1rem">
+      <h2>Active pairs (closest arbs)</h2>
+      <table id="pairs"><tbody></tbody></table>
+    </section>
+    <section class="card" style="margin-top:1rem">
+      <h2>Jobs & processes</h2>
+      <table id="jobs"><tbody></tbody></table>
+    </section>
+    <section class="card" style="margin-top:1rem">
+      <h2>Active arbs in Redis</h2>
+      <div id="active-arbs"></div>
+    </section>
+  </main>
+  <script>
+    const REFRESH_MS = __REFRESH_SEC__ * 1000;
+    const params = new URLSearchParams(location.search);
+    const token = params.get('token');
+
+    function fmtAge(sec) {
+      if (sec == null) return '—';
+      if (sec < 60) return sec + 's';
+      if (sec < 3600) return Math.floor(sec/60) + 'm ' + (sec%60) + 's';
+      return Math.floor(sec/3600) + 'h';
+    }
+
+    function pill(cls, text) {
+      return `<span class="pill ${cls}">${text}</span>`;
+    }
+
+    function render(data) {
+      document.getElementById('error').style.display = 'none';
+      document.getElementById('ts').textContent = data.timestamp;
+      const c = data.config;
+      document.getElementById('cfg').textContent =
+        `Stake $${c.bet_stake} | Threshold ≥ ${c.min_arb_profit_pct}% | Sequential: ${c.sequential_betting}`;
+
+      const s = data.summary;
+      const fire = s.would_fire_now
+        ? `<span class="fire-yes">WOULD FIRE NOW</span>`
+        : `<span class="fire-no">No executable arb</span>`;
+      document.getElementById('summary').innerHTML = `
+        <div>${fire}</div>
+        <div>Closest: <strong>${s.closest_match || '—'}</strong> (${s.closest_pair || '—'})</div>
+        <div class="big">${s.closest_profit_pct != null ? s.closest_profit_pct.toFixed(2) + '%' : '—'}</div>
+        <div>Systemd: betting-arb <strong>${data.system.systemd_betting_arb || '?'}</strong></div>
+      `;
+
+      const booksTb = document.querySelector('#books tbody');
+      booksTb.innerHTML = Object.entries(data.books).map(([k, b]) => `
+        <tr>
+          <td>${b.label} ${pill(b.health, b.health)}</td>
+          <td>${b.games_in_window} games</td>
+          <td>Log ${fmtAge(b.last_log_activity_sec)}</td>
+          <td>DB ${fmtAge(b.last_db_write_sec)}</td>
+          <td class="mono truncate" title="${b.last_poll_line || ''}">${(b.last_poll_line || b.last_warning || '—').replace(/^\[[^\]]+\]\s*[^.]+\.\w+:\s*/, '')}</td>
+        </tr>`).join('');
+
+      const sc = data.scanner.last_scan || {};
+      document.getElementById('scanner').innerHTML = `
+        <p><strong>Last scan:</strong> ${sc.odds ?? '—'} odds, ${sc.matches ?? '—'} matches, ${sc.arbs ?? '—'} arbs</p>
+        <p><strong>Closest prob:</strong> ${sc.closest_prob ?? '—'}</p>
+        <pre class="mono" style="white-space:pre-wrap;color:var(--muted);font-size:.75rem">${(data.scanner.freshness_lines || []).join('\n')}</pre>
+      `;
+
+      document.querySelector('#pairs tbody').innerHTML = (data.pairs || []).map(p => `
+        <tr>
+          <td>${p.pair}</td>
+          <td>${p.matchups}</td>
+          <td>${p.closest_match || '—'}</td>
+          <td>${p.closest_profit_pct != null ? p.closest_profit_pct.toFixed(2) + '%' : '—'}</td>
+          <td>${pill(p.health, p.health)}</td>
+          <td class="mono truncate" title="${p.best_legs || ''}">${p.best_legs || '—'}</td>
+        </tr>`).join('');
+
+      document.querySelector('#jobs tbody').innerHTML = (data.jobs || []).map(j => `
+        <tr>
+          <td>${j.label} ${pill(j.health, j.health)}</td>
+          <td>${j.running ? '✓' : '✗'}</td>
+          <td>${fmtAge(j.log_age_sec)}</td>
+          <td class="mono truncate" title="${j.last_activity || ''}">${(j.last_activity || '—').replace(/^\[[^\]]+\]\s*[^.]+\.\w+:\s*/, '')}</td>
+        </tr>`).join('');
+
+      const arbs = data.active_arbs || [];
+      document.getElementById('active-arbs').innerHTML = arbs.length
+        ? `<table><thead><tr><th>Match</th><th>Books</th><th>Profit</th><th>Age</th></tr></thead><tbody>${
+            arbs.map(a => `<tr><td>${a.match}</td><td>${a.books}</td><td>${a.profit_pct}%</td><td>${fmtAge(a.age_sec)}</td></tr>`).join('')
+          }</tbody></table>`
+        : '<p style="color:var(--muted)">None in Redis</p>';
+    }
+
+    async function refresh() {
+      try {
+        const url = token ? `/api/status?token=${encodeURIComponent(token)}` : '/api/status';
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        render(await r.json());
+      } catch (e) {
+        const el = document.getElementById('error');
+        el.style.display = 'block';
+        el.textContent = 'Failed to load status: ' + e.message;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  </script>
+</body>
+</html>
