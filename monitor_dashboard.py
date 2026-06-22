@@ -48,6 +48,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/health":
+            self._send(200, b"ok", "text/plain")
+            return
+
         if not self._authorized():
             self._send(401, b"Unauthorized", "text/plain")
             return
