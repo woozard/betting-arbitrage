@@ -25,6 +25,7 @@ from utils.helpers import (
 )
 from utils.timing import time_it
 from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
+from utils.exposure_cleanup import tick_exposure_cleanup
 from cache.arbitrage_cache import ArbitrageCache
 
 
@@ -38,6 +39,7 @@ class ArbitrageController:
 
         # Cache
         self.cache = ArbitrageCache()
+        self._exposure_cleanup_at = 0.0
 
     # --------------------------------------------------------
     # Static Helpers
@@ -69,6 +71,9 @@ class ArbitrageController:
         self.logger.info("========== Arbitrage (START) ==========")
         try:
             while True:
+                self._exposure_cleanup_at = tick_exposure_cleanup(
+                    self.cache, self.logger, self._exposure_cleanup_at
+                )
                 self.scan_opportunities()
                 time.sleep(delay)
         except KeyboardInterrupt:

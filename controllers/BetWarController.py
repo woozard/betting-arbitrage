@@ -30,6 +30,7 @@ from utils.bet_placement import (
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
+from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.betting_watchdog import (
     BettingLoopWatchdog,
     OddsScanHealthWatchdog,
@@ -633,8 +634,13 @@ class BetWarController:
             return None, None
 
         rot1, rot2 = rotations[0], rotations[1]
-        api_lines = self._fetch_game_lines_via_api()
+        try:
+            api_lines = self._fetch_game_lines_via_api()
+        except SessionUnauthorizedError:
+            raise
         if not api_lines:
+            if self._page_has_login_required_marker():
+                raise SessionUnauthorizedError("GetSportOffering returned no lines (login required)")
             return None, None
 
         for gl in api_lines:
@@ -2288,7 +2294,9 @@ class BetWarController:
 
     def _message_requires_relogin(self, message: str) -> bool:
         msg_l = (message or "").lower()
-        return any(marker in msg_l for marker in self.WAGER_SESSION_EXPIRED_MARKERS)
+        return any(marker in msg_l for marker in self.WAGER_SESSION_EXPIRED_MARKERS) or (
+            self._api_response_requires_relogin(message)
+        )
 
     def _invalidate_wager_session(self):
         self._force_wager_relogin = True
@@ -2653,24 +2661,36 @@ class BetWarController:
         self._last_bet_error = None
 
         try:
-            for attempt in range(1, 3):
+            for attempt in range(1, 4):
                 try:
                     if attempt > 1:
-                        self.logger.info(f"Retrying wager after re-login (attempt {attempt}/2)")
+                        self.logger.info(f"Retrying wager after session recovery (attempt {attempt}/3)")
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
                     )
-                except Exception as e:
-                    if attempt == 1 and self._message_requires_relogin(str(e)):
-                        self.logger.warning(
-                            f"Wager blocked by expired session ({e}); forcing re-login and retry"
-                        )
+                except SessionUnauthorizedError as e:
+                    if attempt >= 3:
+                        raise
+                    self.logger.warning(
+                        f"Wager blocked by expired session ({e}); recovering and retrying"
+                    )
+                    if not self._recover_odds_session(str(e), recover_driver=(attempt >= 2)):
                         self._invalidate_wager_session()
                         self.__login()
                         self.__ensure_sport_offering_loaded()
-                        continue
-                    raise
+                    continue
+                except Exception as e:
+                    if attempt >= 3 or not self._message_requires_relogin(str(e)):
+                        raise
+                    self.logger.warning(
+                        f"Wager blocked by session error ({e}); recovering and retrying"
+                    )
+                    if not self._recover_odds_session(str(e), recover_driver=(attempt >= 2)):
+                        self._invalidate_wager_session()
+                        self.__login()
+                        self.__ensure_sport_offering_loaded()
+                    continue
             return False, stake
 
         except Exception as e:
@@ -2927,8 +2947,12 @@ class BetWarController:
             return
 
         consecutive_recoveries = 0
+        self._exposure_cleanup_at = 0.0
         while True:
             watchdog.beat()
+            self._exposure_cleanup_at = tick_exposure_cleanup(
+                self.cache, self.logger, self._exposure_cleanup_at
+            )
             time.sleep(2)
 
             try:

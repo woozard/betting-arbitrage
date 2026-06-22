@@ -84,24 +84,34 @@ def should_pause_first_leg_for_exposure(
     arb: dict | None = None,
     bet_type: str = "moneyline",
 ) -> bool:
-    """Pause new first-leg arbs while one-sided exposure exists elsewhere.
+    """Pause new first-leg arbs only while one-sided exposure exists on the same matchup.
 
     Still allow the configured first-leg book to complete the hedge when the
     other book's leg for *this* arb is already confirmed (parallel placement).
     """
     if not is_first_leg_bookmaker(book_1, book_2, bookmaker):
         return False
-    if not cache.has_partial_exposure():
+    if arb is None:
+        return cache.has_partial_exposure()
+
+    pair_key = cache.matchup_pair_key(
+        arb.get("team_1"),
+        arb.get("team_2"),
+        book_1,
+        book_2,
+        arb.get("game_date"),
+    )
+    if not cache.has_partial_exposure_for_pair(pair_key):
         return False
-    if arb is not None:
-        bm = (bookmaker or "").strip().lower()
-        b1 = (book_1 or "").strip().lower()
-        other_book = book_2 if bm == b1 else book_1
-        other_game_id = (
-            arb["team_1_game_id"] if other_book == b1 else arb["team_2_game_id"]
-        )
-        if cache.is_leg_placed(other_book, bet_type, other_game_id):
-            return False
+
+    bm = (bookmaker or "").strip().lower()
+    b1 = (book_1 or "").strip().lower()
+    other_book = book_2 if bm == b1 else book_1
+    other_game_id = (
+        arb["team_1_game_id"] if other_book == b1 else arb["team_2_game_id"]
+    )
+    if cache.is_leg_placed(other_book, bet_type, other_game_id):
+        return False
     return True
 
 

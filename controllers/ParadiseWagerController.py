@@ -31,6 +31,7 @@ from utils.bet_placement import (
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
+from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.betting_watchdog import (
     BettingLoopWatchdog,
     OddsScanHealthWatchdog,
@@ -1417,8 +1418,12 @@ class ParadiseWagerController:
             return
 
         consecutive_recoveries = 0
+        self._exposure_cleanup_at = 0.0
         while True:
             watchdog.beat()
+            self._exposure_cleanup_at = tick_exposure_cleanup(
+                self.cache, self.logger, self._exposure_cleanup_at
+            )
             time.sleep(2)
 
             try:

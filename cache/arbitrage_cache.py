@@ -127,6 +127,19 @@ class ArbitrageCache:
         date = str(game_date or "")[:10]
         return f"{date}:{teams[0]}:{teams[1]}:{books[0]}:{books[1]}"
 
+    @staticmethod
+    def parse_matchup_pair_key(pair_key):
+        parts = str(pair_key or "").split(":", 4)
+        if len(parts) != 5:
+            return None
+        return {
+            "game_date": parts[0],
+            "team_1": parts[1],
+            "team_2": parts[2],
+            "book_1": parts[3],
+            "book_2": parts[4],
+        }
+
     def _arb_scan_locked_key(self, pair_key):
         return f"arb_scan_locked:{pair_key}"
 
@@ -224,6 +237,18 @@ class ArbitrageCache:
 
     def clear_partial_exposure(self, pair_key):
         self.redis.delete(self._partial_exposure_key(pair_key))
+
+    def get_partial_exposure_meta(self, pair_key):
+        data = self.redis.get(self._partial_exposure_key(pair_key))
+        return data if isinstance(data, dict) else None
+
+    def has_partial_exposure_for_pair(self, pair_key):
+        return bool(self.redis.get(self._partial_exposure_key(pair_key)))
+
+    def list_partial_exposure_pair_keys(self):
+        keys = self.redis.scan("partial_exposure:*")
+        prefix = "partial_exposure:"
+        return [key[len(prefix):] for key in keys if key.startswith(prefix)]
 
     def has_partial_exposure(self):
         return bool(self.redis.scan("partial_exposure:*"))
