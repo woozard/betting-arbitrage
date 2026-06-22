@@ -7,8 +7,6 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from database.models.CanonicalGame import CanonicalGame
-from database.models.GameBookLink import GameBookLink
 from utils.team_registry import canonical_matchup_key, standard_team_name
 
 
@@ -58,6 +56,9 @@ def build_matchup_key(
 
 def register_game_from_odds(db: Session, odd: dict, logger=None) -> Optional[int]:
     """Upsert canonical game + book link from a moneyline odds row."""
+    from database.models.CanonicalGame import CanonicalGame
+    from database.models.GameBookLink import GameBookLink
+
     bookmaker = (odd.get("bookmaker") or "").strip().lower()
     book_game_id = str(odd.get("game_id") or "").strip()
     sport = odd.get("sport") or "baseball"
@@ -130,6 +131,8 @@ def get_book_game_id(
     bookmaker: str,
     canonical_game_id: int,
 ) -> Optional[str]:
+    from database.models.GameBookLink import GameBookLink
+
     link = (
         db.query(GameBookLink)
         .filter_by(
@@ -147,6 +150,8 @@ def get_canonical_game_id(
     bookmaker: str,
     book_game_id: str,
 ) -> Optional[int]:
+    from database.models.GameBookLink import GameBookLink
+
     link = (
         db.query(GameBookLink)
         .filter_by(
