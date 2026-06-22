@@ -24,6 +24,7 @@ from utils.helpers import (
     align_cross_book_moneylines,
 )
 from utils.timing import time_it
+from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
 from cache.arbitrage_cache import ArbitrageCache
 
 
@@ -82,12 +83,11 @@ class ArbitrageController:
     # --------------------------------------------------------
     @staticmethod
     def _odds_dedup_key(row: dict) -> tuple:
-        team_a, team_b = sorted(
-            [normalize_team(row.get("team_1") or ""), normalize_team(row.get("team_2") or "")]
-        )
-        dt = row.get("game_datetime") or ""
-        date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-        return row["bookmaker"], team_a, team_b, date_key
+        return odds_dedup_key(row)
+
+    @staticmethod
+    def _matchup_group_key(row: dict) -> tuple:
+        return matchup_group_key(row)
 
     @staticmethod
     def _prefer_odds_row(candidate: dict, current: dict) -> dict:
@@ -148,7 +148,9 @@ class ArbitrageController:
                 "created_at": r.created_at,
             })
 
-        # Deduplicate: keep only the most recent odds per bookmaker + matchup
+        attach_canonical_game_ids(self.db, results)
+
+        # Deduplicate: keep only the most recent odds per bookmaker + canonical game
         latest = {}
         for o in results:
             key = self._odds_dedup_key(o)
@@ -178,17 +180,12 @@ class ArbitrageController:
 
             if all_odds:
                 for o in all_odds:
-                    dt = o.get("game_datetime") or ""
-                    date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-                    key = (
-                        tuple(sorted([normalize_team(o["team_1"]), normalize_team(o["team_2"])])),
-                        date_key,
-                    )
+                    key = self._matchup_group_key(o)
                     matches.setdefault(key, []).append(o)
 
                 best_arb = None
                 best_match = None
-                for (norm_teams, date_key), odds_group in matches.items():
+                for group_key, odds_group in matches.items():
                     for i in range(len(odds_group)):
                         for j in range(i + 1, len(odds_group)):
                             o1 = odds_group[i]
@@ -247,7 +244,10 @@ class ArbitrageController:
                                         team_1_odds=b_t1, team_2_odds=a_t2,
                                     )
 
-                msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
+        msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
+                linked = sum(1 for o in all_odds if o.get("canonical_game_id"))
+                if linked:
+                    msg += f" (canonical-linked: {linked}/{len(all_odds)})"
                 if arb_found == 0 and best_arb is not None:
                     msg += f" (closest total prob: {float(best_arb):.4f})"
                 self.logger.info(msg)

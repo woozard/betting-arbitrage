@@ -161,3 +161,86 @@ def get_canonical_game_id(
         .first()
     )
     return link.canonical_game_id if link else None
+
+
+def attach_canonical_game_ids(db: Session, rows: list[dict]) -> int:
+    """Set canonical_game_id on odds rows using game_book_links (batch lookup)."""
+    from sqlalchemy import and_, or_
+
+    from database.models.GameBookLink import GameBookLink
+
+    pairs = set()
+    for row in rows:
+        bookmaker = (row.get("bookmaker") or "").strip().lower()
+        game_id = str(row.get("game_id") or "").strip()
+        if bookmaker and game_id:
+            pairs.add((bookmaker, game_id))
+    if not pairs:
+        return 0
+
+    links = (
+        db.query(GameBookLink)
+        .filter(
+            or_(
+                *[
+                    and_(
+                        GameBookLink.bookmaker == bookmaker,
+                        GameBookLink.book_game_id == game_id,
+                    )
+                    for bookmaker, game_id in pairs
+                ]
+            )
+        )
+        .all()
+    )
+    lookup = {
+        (link.bookmaker, link.book_game_id): link.canonical_game_id for link in links
+    }
+    attached = 0
+    for row in rows:
+        bookmaker = (row.get("bookmaker") or "").strip().lower()
+        game_id = str(row.get("game_id") or "").strip()
+        canonical_game_id = lookup.get((bookmaker, game_id))
+        if canonical_game_id:
+            row["canonical_game_id"] = canonical_game_id
+            attached += 1
+    return attached
+
+
+def odds_dedup_key(row: dict) -> tuple:
+    """Latest-odds dedup key: one row per book per canonical game when linked."""
+    bookmaker = row.get("bookmaker")
+    canonical_game_id = row.get("canonical_game_id")
+    if canonical_game_id:
+        return bookmaker, "cg", canonical_game_id
+
+    team_a, team_b = sorted(
+        [normalize_team_slug(row.get("team_1") or ""), normalize_team_slug(row.get("team_2") or "")]
+    )
+    dt = row.get("game_datetime") or ""
+    date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
+    return bookmaker, "mk", team_a, team_b, date_key
+
+
+def matchup_group_key(row: dict) -> tuple:
+    """Group odds from different books that refer to the same game."""
+    canonical_game_id = row.get("canonical_game_id")
+    if canonical_game_id:
+        return ("cg", canonical_game_id)
+
+    sport = row.get("sport") or "baseball"
+    league = row.get("league") or "mlb"
+    matchup_key = build_matchup_key(
+        sport,
+        league,
+        row.get("team_1") or "",
+        row.get("team_2") or "",
+        row.get("game_datetime"),
+    )
+    return ("mk", matchup_key)
+
+
+def normalize_team_slug(name: str) -> str:
+    from utils.team_registry import canonical_team
+
+    return canonical_team(name)

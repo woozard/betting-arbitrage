@@ -8,6 +8,7 @@ from itertools import combinations
 
 from controllers.ArbitrageController import ArbitrageController
 from utils.helpers import normalize_team, teams_same
+from utils.game_registry import matchup_group_key
 
 BOOKS = ("betamapola", "sports411", "paradisewager", "betwar")
 BOOK_PAIRS = list(combinations(BOOKS, 2))
@@ -23,10 +24,7 @@ def valid_ml(value) -> bool:
 
 
 def matchup_key(row: dict) -> tuple:
-    dt = row.get("game_datetime") or ""
-    date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-    pair = tuple(sorted([normalize_team(row["team_1"]), normalize_team(row["team_2"])]))
-    return pair, date_key
+    return matchup_group_key(row)
 
 
 def display_matchup(rows: list, key: tuple) -> str:

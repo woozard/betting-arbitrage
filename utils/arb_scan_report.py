@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 from controllers.ArbitrageController import ArbitrageController
 from utils.config import ACTIVE_ARB_BOOKMAKERS, ACTIVE_ARB_BOOK_PAIRS, ARB_MAX_TOTAL_PROB, MIN_ARB_PROFIT_PCT
 from utils.helpers import is_plausible_moneyline_pair, normalize_team, teams_same
+from utils.game_registry import matchup_group_key
 
 SCAN_ODDS_WINDOW_MINUTES = 10
 
@@ -80,10 +81,7 @@ def _book_freshness_lines(odds: list) -> List[str]:
 
 
 def matchup_key(row: dict) -> tuple:
-    dt = row.get("game_datetime") or ""
-    date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-    pair = tuple(sorted([normalize_team(row["team_1"]), normalize_team(row["team_2"])]))
-    return pair, date_key
+    return matchup_group_key(row)
 
 
 def align_moneylines(o1: dict, o2: dict):
