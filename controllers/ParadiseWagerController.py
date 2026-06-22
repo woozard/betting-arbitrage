@@ -31,7 +31,11 @@ from utils.bet_placement import (
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
-from utils.betting_watchdog import BettingLoopWatchdog
+from utils.betting_watchdog import (
+    BettingLoopWatchdog,
+    OddsScanHealthWatchdog,
+    SessionUnauthorizedError,
+)
 from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -516,6 +520,10 @@ class ParadiseWagerController:
         if not result or not result.get("ok"):
             status = (result or {}).get("status")
             self.logger.warning(f"sportsavailablebyplayeronleague failed (HTTP {status})")
+            if status == 401:
+                raise SessionUnauthorizedError(
+                    f"sportsavailablebyplayeronleague unauthorized (HTTP {status})"
+                )
             return []
         return result.get("data") or []
 
@@ -556,6 +564,10 @@ class ParadiseWagerController:
         if not result or not result.get("ok"):
             status = (result or {}).get("status")
             self.logger.warning(f"schedules API failed (HTTP {status})")
+            if status == 401:
+                raise SessionUnauthorizedError(
+                    f"schedules API unauthorized (HTTP {status})"
+                )
             return []
 
         data = result.get("data")
@@ -958,12 +970,71 @@ class ParadiseWagerController:
             return
         self.logger.info("Token present; skipping login refresh before wager")
 
+    def _recover_odds_session(self, reason: str, recover_driver: bool = False) -> bool:
+        self.logger.warning(f"Recovering Paradise session: {reason}")
+        self._invalidate_wager_session()
+        if recover_driver:
+            try:
+                self._recover_driver()
+            except Exception as e:
+                self.logger.error(f"Driver recovery failed: {e}")
+                return False
+        try:
+            self.__login()
+            games = self._refresh_schedule_cache()
+            if games and hasattr(self, "_scan_health"):
+                self._scan_health.mark_success(len(games))
+            return True
+        except SessionUnauthorizedError as e:
+            self.logger.error(f"Paradise session recovery still unauthorized: {e}")
+            if hasattr(self, "_scan_health"):
+                self._scan_health.mark_failure(str(e))
+            return False
+        except Exception as e:
+            self.logger.error(f"Paradise session recovery failed: {e}")
+            if hasattr(self, "_scan_health"):
+                self._scan_health.mark_failure(str(e))
+            return False
+
     def _poll_odds_watch_once(self, source: str = "watch", force_relogin: bool = False) -> int:
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
         if force_relogin or self._force_wager_relogin or not self._access_token:
             self.__login()
-        games = self._refresh_schedule_cache()
+        try:
+            games = self._refresh_schedule_cache()
+        except SessionUnauthorizedError as e:
+            if not self._recover_odds_session(str(e), recover_driver=False):
+                if hasattr(self, "_scan_health"):
+                    self._scan_health.mark_failure(str(e))
+                return 0
+            games = self._refresh_schedule_cache()
+
+        if games:
+            self._consecutive_empty_polls = 0
+            if hasattr(self, "_scan_health"):
+                self._scan_health.mark_success(len(games))
+        else:
+            self._consecutive_empty_polls = getattr(self, "_consecutive_empty_polls", 0) + 1
+            if hasattr(self, "_scan_health"):
+                self._scan_health.mark_failure("zero games from schedule API")
+            if self._consecutive_empty_polls >= 5:
+                self.logger.warning(
+                    f"Paradise schedule empty {self._consecutive_empty_polls} polls; "
+                    "attempting driver recovery + re-login"
+                )
+                self._recover_odds_session(
+                    "repeated empty schedule polls", recover_driver=True
+                )
+                self._consecutive_empty_polls = 0
+                try:
+                    games = self._refresh_schedule_cache()
+                    if games and hasattr(self, "_scan_health"):
+                        self._scan_health.mark_success(len(games))
+                except SessionUnauthorizedError as e:
+                    if hasattr(self, "_scan_health"):
+                        self._scan_health.mark_failure(str(e))
+
         return persist_moneyline_games(
             self.cache,
             self.storage,
@@ -984,12 +1055,17 @@ class ParadiseWagerController:
         self._last_idle_odds_poll = now
         try:
             self._poll_odds_watch_once(source="betting-idle")
+        except SessionUnauthorizedError as e:
+            self._recover_odds_session(str(e), recover_driver=True)
+            try:
+                self._poll_odds_watch_once(source="betting-idle-relogin")
+            except Exception as relogin_err:
+                self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
         except Exception as e:
             msg = str(e).lower()
             if "401" in msg or "unauthorized" in msg:
-                self._invalidate_wager_session()
+                self._recover_odds_session(str(e), recover_driver=True)
                 try:
-                    self.__login()
                     self._poll_odds_watch_once(source="betting-idle-relogin")
                 except Exception as relogin_err:
                     self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
@@ -1015,6 +1091,9 @@ class ParadiseWagerController:
 
         watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
         watchdog.start()
+        self._scan_health = OddsScanHealthWatchdog(self.logger)
+        self._scan_health.start()
+        self._consecutive_empty_polls = 0
         self._cleanup_stale_temp_dirs()
 
         setup_ok = False
@@ -1052,16 +1131,14 @@ class ParadiseWagerController:
                         source="watch-refresh" if force_scan else "watch",
                         force_relogin=force_scan,
                     )
+                except SessionUnauthorizedError as e:
+                    self.logger.warning(f"Odds watch poll unauthorized: {e}")
+                    self._recover_odds_session(str(e), recover_driver=True)
                 except Exception as e:
                     msg = str(e).lower()
                     self.logger.warning(f"Odds watch poll failed: {e}")
                     if "401" in msg or "unauthorized" in msg:
-                        self._invalidate_wager_session()
-                        try:
-                            self.__login()
-                        except Exception as relogin_err:
-                            self.logger.error(f"Odds watch re-login failed: {relogin_err}")
-                            time.sleep(5)
+                        self._recover_odds_session(str(e), recover_driver=True)
 
                 time.sleep(poll_interval)
 
@@ -1306,6 +1383,9 @@ class ParadiseWagerController:
 
         watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
         watchdog.start()
+        self._scan_health = OddsScanHealthWatchdog(self.logger)
+        self._scan_health.start()
+        self._consecutive_empty_polls = 0
 
         self._cleanup_stale_temp_dirs()
 
@@ -1314,9 +1394,18 @@ class ParadiseWagerController:
             watchdog.beat()
             try:
                 self._ensure_betting_session()
-                self._refresh_schedule_cache()
+                games = self._refresh_schedule_cache()
+                if games:
+                    self._scan_health.mark_success(len(games))
                 setup_ok = True
                 break
+            except SessionUnauthorizedError as e:
+                self.logger.error(f"Initial setup unauthorized (attempt {attempt}/5): {e}")
+                if self._recover_odds_session(str(e), recover_driver=(attempt >= 3)):
+                    setup_ok = True
+                    break
+                self._recover_driver()
+                time.sleep(8)
             except Exception as e:
                 self.logger.error(f"Initial setup/login failed (attempt {attempt}/5): {e}")
                 self._recover_driver()

@@ -4,13 +4,8 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 0
 
-  - name: sports411_odds
-    script: sports411_odds.py
-    interval_seconds: 20
-    start_offset_seconds: 0
-
-  # Betamapola/BetWar/Paradise odds polled from each book's betting loop (same session).
-  # Standalone watch_odds() remains in *_odds.py for manual runs.
+  # S411 odds + betting share one Chrome session in sports411_betting (watch when idle, bet on arb).
+  # sports411_odds.py remains for manual runs only.
 
   - name: polymarket_odds
     script: polymarket_odds.py

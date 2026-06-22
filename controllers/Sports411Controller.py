@@ -1145,17 +1145,30 @@ class Sports411Controller:
         return teams + (date_part,)
 
     @staticmethod
-    def _pick_canonical_game(existing: dict, candidate: dict) -> dict:
-        """When the DOM lists the same matchup twice, keep the higher idgame.
+    def _moneyline_is_populated(game: dict) -> bool:
+        ml = game.get("moneyline") or {}
+        invalid = {"", "0", "none", "null"}
+        t1 = str(ml.get("team_1") or "").strip().lower()
+        t2 = str(ml.get("team_2") or "").strip().lower()
+        return t1 not in invalid and t2 not in invalid
 
-        Placement clicks use div.sports-league-game[idgame='…']; the higher idgame
-        is the node that matches live betting (e.g. 52002449 vs 51977641).
+    @staticmethod
+    def _pick_canonical_game(existing: dict, candidate: dict) -> dict:
+        """When the DOM lists the same matchup twice, prefer rows with real ML odds.
+
+        If both have odds, keep the higher idgame (matches live bet clicks).
         """
+        existing_ok = Sports411Controller._moneyline_is_populated(existing)
+        candidate_ok = Sports411Controller._moneyline_is_populated(candidate)
+        if existing_ok and not candidate_ok:
+            return existing
+        if candidate_ok and not existing_ok:
+            return candidate
         try:
             existing_id = int(existing.get("game_id") or 0)
             candidate_id = int(candidate.get("game_id") or 0)
         except (TypeError, ValueError):
-            return existing
+            return existing if existing_ok else candidate
         return candidate if candidate_id > existing_id else existing
 
     def _dedupe_games_by_matchup(self, games: list) -> list:
@@ -1365,28 +1378,12 @@ class Sports411Controller:
                 consecutive_recoveries = 0
                 consecutive_soft_nav_failures = 0
 
-                now = time.monotonic()
-                updates = []
-                is_force_scan = False
-                if last_force_scan == 0.0 or (now - last_force_scan) >= force_scan_interval:
-                    self.logger.info("Odds watch — force scan")
-                    updates = [self.driver.page_source]
-                    last_force_scan = now
-                    is_force_scan = True
-                else:
-                    updates = self._drain_odds_mutation_buffer()
-                    if not updates:
-                        time.sleep(poll_interval)
-                        continue
-
-                for html_chunk in updates:
-                    games = self._parse_games_from_html(html_chunk)
-                    source = "force-scan" if is_force_scan else "watch"
-                    saved = self._persist_games_odds(games, source=source)
-                    if saved or is_force_scan:
-                        self.logger.info(
-                            f"Extracted {len(games)} {self.sport_name} matches ({source})"
-                        )
+                last_force_scan, processed = self._tick_odds_watch_once(
+                    last_force_scan, force_scan_interval, idle_label="watch"
+                )
+                if not processed:
+                    time.sleep(poll_interval)
+                    continue
 
                 time.sleep(poll_interval)
 
@@ -1397,7 +1394,44 @@ class Sports411Controller:
             self._safe_send_monitoring_alert(e)
         finally:
             self.logger.info(f"========== Odds Watch ({self.sport_name}) (END) ==========")
-    # END CHANGE
+
+    def _tick_odds_watch_once(
+        self,
+        last_force_scan: float,
+        force_scan_interval: int = None,
+        idle_label: str = "watch",
+    ):
+        """Single odds-watch iteration. Returns (last_force_scan, processed)."""
+        force_scan_interval = force_scan_interval or self.ODDS_WATCH_FORCE_SCAN_SECONDS
+        now = time.monotonic()
+        is_force_scan = (
+            last_force_scan == 0.0
+            or (now - last_force_scan) >= force_scan_interval
+        )
+        if is_force_scan:
+            self.logger.info(f"Odds watch — force scan ({idle_label})")
+            updates = [self.driver.page_source]
+            last_force_scan = now
+        else:
+            updates = self._drain_odds_mutation_buffer()
+            if not updates:
+                return last_force_scan, False
+
+        for html_chunk in updates:
+            games = self._parse_games_from_html(html_chunk)
+            source = f"force-scan" if is_force_scan else idle_label
+            saved = self._persist_games_odds(games, source=source)
+            if saved or is_force_scan:
+                self.logger.info(
+                    f"Extracted {len(games)} {self.sport_name} matches ({source})"
+                )
+        return last_force_scan, True
+
+    def _resume_odds_watch_on_sport_page(self):
+        """Return to game-lines and reinstall DOM observer after wager flow."""
+        self._return_to_sport_page()
+        if self._is_on_sport_page_with_games():
+            self._ensure_odds_mutation_observer()
 
     def _wait_for_login_page_or_sports(self, timeout=15):
         def ready(driver):
@@ -2550,8 +2584,16 @@ class Sports411Controller:
         # Logger & Storage
         self.logger = Logger.get_logger(f"{self.bookmaker}-betting-{self.sport_name.lower()}")
         self.storage = Storage(self.logger)
+        self._last_saved_ml = {}
+        force_scan_interval = self.ODDS_WATCH_FORCE_SCAN_SECONDS
+        poll_interval = self.ODDS_WATCH_POLL_SECONDS
+        last_force_scan = 0.0
 
-        self.logger.info(f"==================== Betting ({self.sport_name}) (START) ====================")
+        self.logger.info(
+            f"==================== Betting ({self.sport_name}) (START) — "
+            f"unified session: odds watch when idle, bet when arb ({force_scan_interval}s force scan) "
+            f"===================="
+        )
 
         watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
         watchdog.start()
@@ -2559,16 +2601,13 @@ class Sports411Controller:
         # Clean only stale temp dirs; never pkill all Chrome (other jobs may be running).
         self._cleanup_stale_temp_dirs()
 
-        # Initial driver is created in __init__, but under systemd + BrightData extension
-        # the session can be dead within seconds even if webdriver.Chrome() "succeeded".
-        # Wrap first login + nav in recovery retries so we don't lose the whole process.
         setup_ok = False
         for attempt in range(1, 6):
             watchdog.beat()
             try:
-                self._ensure_betting_session()
-                setup_ok = True
-                break
+                setup_ok = self._prepare_odds_watch_page()
+                if setup_ok:
+                    break
             except Exception as e:
                 self.logger.error(f"Initial setup/login failed (attempt {attempt}/5): {e}")
                 self._recover_driver()
@@ -2583,7 +2622,6 @@ class Sports411Controller:
         consecutive_soft_nav_failures = 0
         while True:
             watchdog.beat()
-            time.sleep(2)
 
             try:
                 current_url = self.driver.current_url
@@ -2599,12 +2637,11 @@ class Sports411Controller:
                     consecutive_recoveries = 0
                 if not self._relogin_after_recovery():
                     time.sleep(8)
+                    continue
+                if self._prepare_odds_watch_page():
+                    last_force_scan = 0.0
                 continue
 
-            # Ensure still on the sport-specific game-lines page.
-            # The site often redirects to the parent /sports page (be.sports411.ag/) or www root
-            # after login, idle periods, or page interactions. Use a tolerant path check instead of
-            # exact startswith on the long URL.
             if self._is_off_sport_page(current_url):
                 if self._should_soft_navigate_back(current_url):
                     self.logger.warning(
@@ -2612,6 +2649,7 @@ class Sports411Controller:
                     )
                     self._return_to_sport_page()
                     if self._is_on_sport_page_with_games():
+                        self._ensure_odds_mutation_observer()
                         consecutive_soft_nav_failures = 0
                         continue
                     consecutive_soft_nav_failures += 1
@@ -2636,6 +2674,9 @@ class Sports411Controller:
                             consecutive_recoveries = 0
                         if not self._relogin_after_recovery():
                             time.sleep(8)
+                            continue
+                        if self._prepare_odds_watch_page():
+                            last_force_scan = 0.0
                     continue
                 self.logger.warning(f"Unexpected URL detected ({current_url}). Re-establishing session...")
                 self._recover_driver()
@@ -2648,6 +2689,9 @@ class Sports411Controller:
                     consecutive_recoveries = 0
                 if not self._relogin_after_recovery():
                     time.sleep(8)
+                    continue
+                if self._prepare_odds_watch_page():
+                    last_force_scan = 0.0
                 continue
 
             consecutive_recoveries = 0
@@ -2658,10 +2702,16 @@ class Sports411Controller:
                 if arb.get("sport") == self.sport_name and arb.get("league") == self.league
             ]
             if not matching_arbs:
-                self.logger.info("Waiting for Arbitrage")
+                last_force_scan, processed = self._tick_odds_watch_once(
+                    last_force_scan,
+                    force_scan_interval,
+                    idle_label="betting-idle",
+                )
+                if not processed:
+                    time.sleep(poll_interval)
                 continue
 
-            self.logger.info(f"Arbitrage: {len(matching_arbs)}")
+            self.logger.info(f"Arbitrage: {len(matching_arbs)} — pausing odds watch for placement")
 
             for arb in matching_arbs:
 
@@ -2834,8 +2884,9 @@ class Sports411Controller:
                         moneyline_odd,
                         TELEGRAM,
                     )
-                    self.logger.info("Returning to sport page before next arbitrage")
-                    self._return_to_sport_page()
+                    self.logger.info("Returning to sport page and resuming odds watch")
+                    self._resume_odds_watch_on_sport_page()
+                    last_force_scan = 0.0
 
         # The main arbitrage/betting loop above runs until the process is terminated.
         # Explicit returns in the setup phase or unrecoverable errors will end here.

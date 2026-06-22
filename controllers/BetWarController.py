@@ -29,7 +29,11 @@ from utils.bet_placement import (
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
-from utils.betting_watchdog import BettingLoopWatchdog
+from utils.betting_watchdog import (
+    BettingLoopWatchdog,
+    OddsScanHealthWatchdog,
+    SessionUnauthorizedError,
+)
 from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -1327,6 +1331,39 @@ class BetWarController:
 
         return {"rotation": rot, "team": team, "moneyline": ml}
 
+    def _api_response_requires_relogin(self, message: str) -> bool:
+        msg_l = (message or "").lower()
+        return any(
+            marker in msg_l
+            for marker in (
+                "unexpected token '<'",
+                "<!doctype",
+                "http 401",
+                " 401",
+                "unauthorized",
+                "please log in",
+                "session expired",
+            )
+        )
+
+    def _recover_odds_session(self, reason: str, recover_driver: bool = False) -> bool:
+        self.logger.warning(f"Recovering BetWar session: {reason}")
+        self._invalidate_wager_session()
+        if recover_driver:
+            try:
+                self._recover_driver()
+            except Exception as e:
+                self.logger.error(f"Driver recovery failed: {e}")
+                return False
+        ok = self._relogin_after_recovery()
+        if ok and hasattr(self, "_scan_health"):
+            games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
+            if games:
+                self._scan_health.mark_success(len(games))
+        elif hasattr(self, "_scan_health"):
+            self._scan_health.mark_failure(reason)
+        return ok
+
     def _fetch_lines_via_getlines_api(self) -> list:
         """Call linesAJX.aspx/GetLines inside the authenticated browser session."""
         script = """
@@ -1394,11 +1431,17 @@ class BetWarController:
         try:
             result = self.driver.execute_async_script(script)
         except Exception as e:
+            err = str(e)
             self.logger.warning(f"GetLines browser API call failed: {e}")
+            if self._api_response_requires_relogin(err):
+                raise SessionUnauthorizedError(err)
             return []
 
         if not result or result.get("error"):
+            err = str((result or {}).get("error", ""))
             self.logger.warning(f"GetLines API unavailable: {result}")
+            if self._api_response_requires_relogin(err):
+                raise SessionUnauthorizedError(err or "GetLines API unavailable")
             return []
 
         return self._parse_getlines_response(result.get("body") or {})
@@ -1582,8 +1625,13 @@ class BetWarController:
 
             self.logger.info(f"API success: {len(lines)} GameLines, {len(limits)} SportLimits entries")
             return lines
+        except SessionUnauthorizedError:
+            raise
         except Exception as e:
+            err = str(e)
             self.logger.error(f"Browser-context API call failed: {e}")
+            if self._api_response_requires_relogin(err):
+                raise SessionUnauthorizedError(err)
             return []
 
     def _parse_api_game_lines(self, game_lines):
@@ -1727,7 +1775,40 @@ class BetWarController:
     def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch") -> int:
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
-        games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
+        try:
+            games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
+        except SessionUnauthorizedError as e:
+            if not self._recover_odds_session(str(e), recover_driver=False):
+                if hasattr(self, "_scan_health"):
+                    self._scan_health.mark_failure(str(e))
+                return 0
+            games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
+
+        if games:
+            self._consecutive_odds_failures = 0
+            if hasattr(self, "_scan_health"):
+                self._scan_health.mark_success(len(games))
+        else:
+            self._consecutive_odds_failures = getattr(self, "_consecutive_odds_failures", 0) + 1
+            if hasattr(self, "_scan_health"):
+                self._scan_health.mark_failure(f"no lines ({src})")
+            if self._consecutive_odds_failures >= 3:
+                self.logger.warning(
+                    f"BetWar odds empty {self._consecutive_odds_failures} polls; "
+                    "attempting driver recovery + re-login"
+                )
+                self._recover_odds_session(
+                    "repeated empty API polls", recover_driver=True
+                )
+                self._consecutive_odds_failures = 0
+                try:
+                    games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
+                    if games and hasattr(self, "_scan_health"):
+                        self._scan_health.mark_success(len(games))
+                except SessionUnauthorizedError as e:
+                    if hasattr(self, "_scan_health"):
+                        self._scan_health.mark_failure(str(e))
+
         label = f"{source}/{src}" if src != "none" else source
         if not games and force_scan:
             self.logger.warning(f"No {self.sport_name} lines from API/DOM on force scan")
@@ -1749,12 +1830,23 @@ class BetWarController:
         if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
             return
         self._last_idle_odds_poll = now
-        if not self._is_session_valid():
-            return
         try:
             self._poll_odds_watch_once(source="betting-idle")
+        except SessionUnauthorizedError as e:
+            self._recover_odds_session(str(e), recover_driver=True)
+            try:
+                self._poll_odds_watch_once(source="betting-idle-relogin")
+            except Exception as relogin_err:
+                self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
         except Exception as e:
-            self.logger.warning(f"Idle odds poll failed: {e}")
+            if self._api_response_requires_relogin(str(e)):
+                self._recover_odds_session(str(e), recover_driver=True)
+                try:
+                    self._poll_odds_watch_once(source="betting-idle-relogin")
+                except Exception as relogin_err:
+                    self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
+            else:
+                self.logger.warning(f"Idle odds poll failed: {e}")
 
     def watch_odds(
         self,
@@ -1775,6 +1867,9 @@ class BetWarController:
 
         watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
         watchdog.start()
+        self._scan_health = OddsScanHealthWatchdog(self.logger)
+        self._scan_health.start()
+        self._consecutive_odds_failures = 0
         self._cleanup_stale_temp_dirs()
 
         setup_ok = False
@@ -1828,7 +1923,11 @@ class BetWarController:
                     self.logger.info("Odds watch — force scan")
                     last_force_scan = now
 
-                self._poll_odds_watch_once(force_scan=force_scan, source="watch")
+                try:
+                    self._poll_odds_watch_once(force_scan=force_scan, source="watch")
+                except SessionUnauthorizedError as e:
+                    self.logger.warning(f"Odds watch poll unauthorized: {e}")
+                    self._recover_odds_session(str(e), recover_driver=True)
                 time.sleep(poll_interval)
 
         except KeyboardInterrupt:
@@ -2777,6 +2876,12 @@ class BetWarController:
 
         self.logger.info("==================== Betting (START) ====================")
 
+        watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
+        watchdog.start()
+        self._scan_health = OddsScanHealthWatchdog(self.logger)
+        self._scan_health.start()
+        self._consecutive_odds_failures = 0
+
         # Clean only stale temp dirs; never pkill all Chrome (other jobs may be running).
         self._cleanup_stale_temp_dirs()
 
@@ -2788,9 +2893,19 @@ class BetWarController:
             try:
                 # Step 1: Ensure logged-in session (login only when invalid)
                 self._ensure_betting_session()
+                games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
+                if games:
+                    self._scan_health.mark_success(len(games))
 
                 setup_ok = True
                 break
+            except SessionUnauthorizedError as e:
+                self.logger.error(f"Initial setup unauthorized (attempt {attempt}/5): {e}")
+                if self._recover_odds_session(str(e), recover_driver=(attempt >= 3)):
+                    setup_ok = True
+                    break
+                self._recover_driver()
+                time.sleep(8)
             except Exception as e:
                 self.logger.error(f"Initial setup/login failed (attempt {attempt}/5): {e}")
                 self._recover_driver()
@@ -2803,6 +2918,7 @@ class BetWarController:
 
         consecutive_recoveries = 0
         while True:
+            watchdog.beat()
             time.sleep(2)
 
             try:

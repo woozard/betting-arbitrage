@@ -7,6 +7,7 @@ db = __get_db1_session__()
 
 
 def main():
+    """Manual-only odds watch (second Chrome). Production uses sports411_betting unified loop."""
     account = Accounts(
         account='8715',
         password='eqr0mjx-MXY*rcn1ana',
