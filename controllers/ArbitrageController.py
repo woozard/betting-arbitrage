@@ -244,7 +244,7 @@ class ArbitrageController:
                                         team_1_odds=b_t1, team_2_odds=a_t2,
                                     )
 
-        msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
+                msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
                 linked = sum(1 for o in all_odds if o.get("canonical_game_id"))
                 if linked:
                     msg += f" (canonical-linked: {linked}/{len(all_odds)})"
