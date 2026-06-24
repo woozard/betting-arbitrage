@@ -21,7 +21,7 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, teams_same
 from utils.team_registry import standard_team_name
 from utils.bet_placement import (
     finalize_confirmed_bet,
@@ -748,7 +748,13 @@ class BetWarController:
             except Exception:
                 continue
 
-            if not self._team_name_matches(label_text, team_name):
+            if (
+                target_rot
+                and rot_text == target_rot
+                and team_no in (1, 2)
+            ):
+                pass  # rotation + team_no is enough (e.g. TOR Blue Jays vs Toronto Blue Jays)
+            elif not self._team_name_matches(label_text, team_name):
                 continue
 
             self.driver.execute_script(
@@ -776,11 +782,9 @@ class BetWarController:
 
     @staticmethod
     def _team_name_matches(candidate: str, expected: str) -> bool:
-        cand = (candidate or "").strip().lower()
-        exp = (expected or "").strip().lower()
-        if not cand or not exp:
+        if not (candidate or "").strip() or not (expected or "").strip():
             return False
-        return cand == exp or exp in cand or cand in exp
+        return teams_same(candidate, expected)
 
     def _lookup_game_line_from_api(self, game_id: str, team_name: str):
         """Resolve a live API game line by rotation game_id + team name."""
@@ -2470,12 +2474,11 @@ class BetWarController:
     def _find_player_moneyline_element(self, game_id: str, team_name: str, moneyline_odd):
         """Locate clickable moneyline odds in BetWar Player portal divGameTeam rows."""
         rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
-        team_lower = team_name.lower()
 
         # Modern layout: team name in divGameTeam, moneyline click target in sibling divLineContainer.
         for team_label in self.driver.find_elements(By.CSS_SELECTOR, "span.lblTeamName"):
-            label_text = (team_label.text or "").strip().lower()
-            if team_lower not in label_text and label_text not in team_lower:
+            label_text = (team_label.text or "").strip()
+            if not self._team_name_matches(label_text, team_name):
                 continue
 
             team_row = team_label.find_element(
@@ -2512,13 +2515,13 @@ class BetWarController:
                 return parent or click_target
 
         for row in self.driver.find_elements(By.CSS_SELECTOR, "div.divGameTeam"):
-            row_text = (row.text or "").lower()
-            if team_lower not in row_text:
-                continue
-
             rot_spans = row.find_elements(By.CSS_SELECTOR, "span.lblRotation")
             rot_text = (rot_spans[0].text if rot_spans else "").strip()
             if rotations and rot_text and rot_text not in rotations:
+                continue
+            name_spans = row.find_elements(By.CSS_SELECTOR, "span.lblTeamName")
+            row_team = (name_spans[0].text if name_spans else row.text or "").strip()
+            if not self._team_name_matches(row_team, team_name):
                 continue
 
             for odds_elem in row.find_elements(
@@ -3101,6 +3104,8 @@ class BetWarController:
             team_no, display_name, live_odds = self._lookup_side_from_getlines(
                 game_id, team_name
             )
+            if team_no is None:
+                team_no = self._infer_team_no(team_name, team_1, team_2)
             lookup_name = display_name or team_name
             if display_name and display_name != team_name:
                 self.logger.info(
