@@ -1,8 +1,42 @@
 import asyncio
+import re
 import threading
 
 from utils.config import SEQUENTIAL_ARB_BETTING, TELEGRAM_ALERTS_ASYNC, SECOND_LEG_ODDS_TOLERANCE, arb_pair_legs, required_first_leg_book
 from utils.helpers import send_telegram_alert, format_utc_timestamp
+
+
+def format_bet_failure_reason(reason: str | None, bookmaker: str = "") -> str:
+    """Turn raw Selenium/API exceptions into a short ops-friendly message."""
+    if not reason:
+        return "Bet not accepted by bookmaker"
+
+    text = str(reason).strip()
+    if "Stacktrace:" in text:
+        text = text.split("Stacktrace:")[0].strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if lines:
+        text = lines[0]
+
+    text = re.sub(r"\s*\(Session info:.*", "", text).strip()
+    book_label = (bookmaker or "bookmaker").strip() or "bookmaker"
+
+    lower = text.lower()
+    if "<!doctype" in lower or "not valid json" in lower:
+        return (
+            f"{book_label} session expired — site returned a login page "
+            f"instead of betting data"
+        )
+    if "session expired" in lower or "please log in" in lower:
+        return f"{book_label} session expired — re-login required"
+    if "moneyline element not found" in lower:
+        return text.replace("Message: ", "").strip()
+    if text.lower().startswith("message:"):
+        text = text[8:].strip()
+
+    if len(text) > 220:
+        text = text[:217] + "..."
+    return text or "Bet not accepted by bookmaker"
 
 
 def _ops_telegram_chat(telegram_config: dict):
@@ -213,7 +247,7 @@ def _build_partial_arb_alert(
     else:
         confirmed_team, confirmed_odds = team_2, arb.get("team_2_odds")
 
-    reason_line = f"Reason: {reason}\n" if reason else ""
+    reason_text = format_bet_failure_reason(reason, failed_book)
     return (
         f"===== Partial Arb (One Leg Only) =====\n"
         f"Identified At: {format_utc_timestamp(identified_at)}\n"
@@ -226,7 +260,7 @@ def _build_partial_arb_alert(
         f"Odds: {confirmed_odds}\n"
         f"Stake: ${stake:.2f}\n\n"
         f"FAILED: second leg on {failed_book}\n"
-        f"{reason_line}"
+        f"Reason: {reason_text}\n"
         f"Status: Exposed — only one side placed; check books manually\n"
     )
 

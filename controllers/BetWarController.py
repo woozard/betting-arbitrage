@@ -25,6 +25,7 @@ from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float
 from utils.team_registry import standard_team_name
 from utils.bet_placement import (
     finalize_confirmed_bet,
+    format_bet_failure_reason,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
     should_pause_first_leg_for_exposure,
@@ -672,6 +673,53 @@ class BetWarController:
             return gl, team_no
 
         return None, None
+
+    def _minimal_game_line_from_rotations(self, rotations: list) -> dict:
+        rot1 = rotations[0] if len(rotations) > 0 else ""
+        rot2 = rotations[1] if len(rotations) > 1 else ""
+        return {
+            "GameNum": None,
+            "PeriodNumber": 0,
+            "Team1RotNum": rot1,
+            "Team2RotNum": rot2,
+        }
+
+    def _parse_game_line_from_button(self, elem, game_id: str):
+        """Extract GameNum/team_no from a Player portal moneyline button when available."""
+        elem_id = (elem.get_attribute("id") or "").strip()
+        match = re.match(r"M(\d)_(\d+)_(\d+)", elem_id, re.I)
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        if match:
+            team_no = int(match.group(1))
+            return {
+                "GameNum": int(match.group(2)),
+                "PeriodNumber": int(match.group(3)),
+                "Team1RotNum": rotations[0] if len(rotations) > 0 else "",
+                "Team2RotNum": rotations[1] if len(rotations) > 1 else "",
+            }, team_no
+        return self._minimal_game_line_from_rotations(rotations), None
+
+    def _infer_team_no(self, team_name: str, team_1: str = None, team_2: str = None) -> int | None:
+        if team_1 and self._team_name_matches(team_1, team_name):
+            return 1
+        if team_2 and self._team_name_matches(team_2, team_name):
+            return 2
+        return None
+
+    def _find_moneyline_on_board(self, game_id: str, team_name: str, moneyline_odd):
+        """Locate a clickable moneyline using only the loaded Player portal DOM."""
+        elem = self._find_player_moneyline_element(game_id, team_name, moneyline_odd)
+        if elem:
+            return elem
+        return self._find_moneyline_element(game_id, team_name, moneyline_odd)
+
+    def _ensure_bet_board_ready(self) -> bool:
+        """Ensure lines are visible for clicking without redundant sidebar navigation."""
+        if self._is_on_sport_page_with_games():
+            self.logger.info("Bet board already loaded; skipping full sport navigation")
+            self._ensure_straights_tab()
+            return True
+        return self.__ensure_sport_offering_loaded()
 
     def _trigger_angular_offering_select(self) -> bool:
         """Select the active sport/league in the Angular SPA (same UI path users take)."""
@@ -2818,7 +2866,7 @@ class BetWarController:
                     if not self._recover_odds_session(str(e), recover_driver=(attempt >= 2)):
                         self._invalidate_wager_session()
                         self.__login()
-                        self.__ensure_sport_offering_loaded()
+                        self._ensure_bet_board_ready()
                     continue
                 except Exception as e:
                     if attempt >= 3 or not self._message_requires_relogin(str(e)):
@@ -2829,12 +2877,12 @@ class BetWarController:
                     if not self._recover_odds_session(str(e), recover_driver=(attempt >= 2)):
                         self._invalidate_wager_session()
                         self.__login()
-                        self.__ensure_sport_offering_loaded()
+                        self._ensure_bet_board_ready()
                     continue
             return False, stake
 
         except Exception as e:
-            self._last_bet_error = str(e)
+            self._last_bet_error = format_bet_failure_reason(str(e), self.bookmaker)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
             return False, stake
@@ -2857,36 +2905,42 @@ class BetWarController:
 
             self._refresh_session_before_wager()
 
-            if not self.__ensure_sport_offering_loaded():
+            if not self._ensure_bet_board_ready():
                 raise Exception(f"{self.sport_name} lines not loaded before bet placement")
 
-            game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
-
-            moneyline_elem = self._find_moneyline_element(
-                game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
-            )
+            moneyline_elem = self._find_moneyline_on_board(game_id, team_name, moneyline_odd)
 
             if not moneyline_elem:
                 self.logger.warning(
-                    f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, re-navigating"
+                    f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, "
+                    "soft-refreshing board"
                 )
-                self.__ensure_sport_offering_loaded()
-                game_line, team_no = self._lookup_game_line_from_api(game_id, team_name)
-                moneyline_elem = self._find_moneyline_element(
-                    game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
-                )
+                self._soft_refresh_lines_context()
+                time.sleep(1.0)
+                moneyline_elem = self._find_moneyline_on_board(game_id, team_name, moneyline_odd)
 
             if not moneyline_elem:
                 raise Exception(
                     f"Moneyline element not found for {team_name} @ {moneyline_odd} (game_id={game_id})"
                 )
 
-            self.driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", moneyline_elem
-            )
-            time.sleep(0.4)
-            self.driver.execute_script("arguments[0].click();", moneyline_elem)
-            self.logger.info("Player portal moneyline odds clicked")
+            game_line, team_no = self._parse_game_line_from_button(moneyline_elem, game_id)
+            if team_no is None:
+                team_no = self._infer_team_no(team_name, team_1, team_2)
+
+            slip_populated = False
+            if game_line and team_no in (1, 2):
+                slip_populated = self._add_moneyline_to_slip(
+                    game_line, team_no, team_name, moneyline_elem=moneyline_elem
+                )
+
+            if not slip_populated:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", moneyline_elem
+                )
+                time.sleep(0.4)
+                self.driver.execute_script("arguments[0].click();", moneyline_elem)
+                self.logger.info("Player portal moneyline odds clicked")
 
             if not self._wait_for_betslip_team(team_name, timeout=8):
                 slip_preview = self._betslip_text()[:200]
