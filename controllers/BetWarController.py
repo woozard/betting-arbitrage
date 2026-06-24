@@ -623,7 +623,156 @@ class BetWarController:
         if disp == exp:
             return True
         raw = (displayed or "").strip()
-        return exp in raw or raw == str(expected).strip()
+        if exp in raw or raw == str(expected).strip():
+            return True
+        # BetWar Player portal often shows favorites as bare "105" without a minus sign.
+        try:
+            exp_val = int(float(str(expected)))
+            num_match = re.search(r"[-+]?\d+", raw.replace("\u2212", "-"))
+            if num_match and exp_val < 0:
+                disp_val = int(num_match.group(0).lstrip("+"))
+                if disp_val == abs(exp_val):
+                    return True
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    def _game_rotations(self, game_id: str) -> list[str]:
+        return [p.strip() for p in str(game_id).split("-") if p.strip()]
+
+    def _target_rotation(self, game_id: str, team_name: str, team_no: int | None = None) -> str | None:
+        rotations = self._game_rotations(game_id)
+        if team_no == 1 and rotations:
+            return rotations[0]
+        if team_no == 2 and len(rotations) > 1:
+            return rotations[1]
+        return None
+
+    def _rotation_on_board(self, game_id: str) -> bool:
+        """True when at least one rotation number for this game is visible in the DOM."""
+        rotations = set(self._game_rotations(game_id))
+        if not rotations:
+            return False
+        for span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
+            if (span.text or "").strip() in rotations:
+                return True
+        return False
+
+    def _board_rotation_numbers(self) -> list[str]:
+        return [
+            (span.text or "").strip()
+            for span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation")
+            if (span.text or "").strip()
+        ]
+
+    def _lookup_side_from_getlines(self, game_id: str, team_name: str):
+        """Resolve team_no and BetWar display name from GetLines (no GetSportOffering)."""
+        try:
+            games = self._fetch_getlines_games()
+        except SessionUnauthorizedError:
+            raise
+        except Exception as e:
+            self.logger.warning(f"GetLines lookup during bet failed: {e}")
+            return None, None, None
+
+        for game in games:
+            if str(game.get("game_id")) != str(game_id):
+                continue
+            t1 = game.get("team_1") or ""
+            t2 = game.get("team_2") or ""
+            if self._team_name_matches(t1, team_name):
+                return 1, t1, (game.get("moneyline") or {}).get("team_1")
+            if self._team_name_matches(t2, team_name):
+                return 2, t2, (game.get("moneyline") or {}).get("team_2")
+        return None, None, None
+
+    def _save_bet_board_debug(self, game_id: str, tag: str):
+        try:
+            rots = self._board_rotation_numbers()
+            debug_file = debug_filepath(f"debug_betwar_bet_{tag}_{self.sport_name.lower()}")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+            self.logger.warning(
+                f"Saved bet board debug: {debug_file} | target={game_id} | "
+                f"visible_rotations={rots[:20]}"
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not save bet board debug: {e}")
+
+    def _pick_moneyline_click_target(self, ml_card):
+        if ml_card.get_attribute("onclick"):
+            return ml_card
+        try:
+            return ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@onclick][1]")
+        except Exception:
+            return ml_card
+
+    def _moneyline_cards_for_rotation_row(self, rot_span):
+        team_row = rot_span.find_element(
+            By.XPATH,
+            "./ancestor::div[contains(@class,'row')][.//div[contains(@class,'divLineContainer')]][1]",
+        )
+        return team_row.find_elements(
+            By.CSS_SELECTOR,
+            "div.btnMLLine, div.gc-line.btnMLLine, div.divMLLine .gc-line",
+        )
+
+    def _find_moneyline_by_rotation(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd,
+        team_no: int | None = None,
+    ):
+        """Find moneyline by rotation + team row; prefer odds match but accept team row ML when tolerance applies."""
+        rotations = set(self._game_rotations(game_id))
+        if not rotations:
+            return None
+
+        target_rot = self._target_rotation(game_id, team_name, team_no)
+        fallback = None
+
+        for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
+            rot_text = (rot_span.text or "").strip()
+            if rot_text not in rotations:
+                continue
+            if target_rot and rot_text != target_rot:
+                continue
+
+            try:
+                team_block = rot_span.find_element(
+                    By.XPATH, "./ancestor::div[contains(@class,'divGameTeam')][1]"
+                )
+                team_label = team_block.find_element(By.CSS_SELECTOR, "span.lblTeamName")
+                label_text = (team_label.text or "").strip()
+            except Exception:
+                continue
+
+            if not self._team_name_matches(label_text, team_name):
+                continue
+
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", rot_span
+            )
+            time.sleep(0.3)
+
+            for ml_card in self._moneyline_cards_for_rotation_row(rot_span):
+                txt = (ml_card.text or "").strip()
+                if self._odds_text_matches(txt, moneyline_odd):
+                    return self._pick_moneyline_click_target(ml_card)
+                if fallback is None:
+                    fallback = self._pick_moneyline_click_target(ml_card)
+
+            if fallback is not None and (
+                getattr(self, "_odds_tolerance", 0) or not moneyline_odd
+            ):
+                self.logger.info(
+                    f"Using rotation-row moneyline for {label_text} @ {rot_text} "
+                    f"(expected {moneyline_odd}, tolerance active)"
+                )
+                return fallback
+
+        return None
 
     @staticmethod
     def _team_name_matches(candidate: str, expected: str) -> bool:
@@ -706,20 +855,64 @@ class BetWarController:
             return 2
         return None
 
-    def _find_moneyline_on_board(self, game_id: str, team_name: str, moneyline_odd):
+    def _find_moneyline_on_board(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd,
+        team_no: int | None = None,
+    ):
         """Locate a clickable moneyline using only the loaded Player portal DOM."""
+        elem = self._find_moneyline_by_rotation(
+            game_id, team_name, moneyline_odd, team_no=team_no
+        )
+        if elem:
+            return elem
         elem = self._find_player_moneyline_element(game_id, team_name, moneyline_odd)
         if elem:
             return elem
-        return self._find_moneyline_element(game_id, team_name, moneyline_odd)
+        return self._find_moneyline_element(
+            game_id, team_name, moneyline_odd, team_no=team_no
+        )
 
-    def _ensure_bet_board_ready(self) -> bool:
-        """Ensure lines are visible for clicking without redundant sidebar navigation."""
-        if self._is_on_sport_page_with_games():
-            self.logger.info("Bet board already loaded; skipping full sport navigation")
+    def _ensure_bet_board_ready(self, game_id: str | None = None) -> bool:
+        """Ensure lines are visible for clicking; reload when target rotations are missing."""
+        if (
+            game_id
+            and self._is_on_sport_page_with_games()
+            and self._rotation_on_board(game_id)
+        ):
+            self.logger.info(
+                f"Bet board loaded and target game {game_id} visible; "
+                "skipping full sport navigation"
+            )
             self._ensure_straights_tab()
             return True
+
+        if game_id and self._is_on_sport_page_with_games():
+            visible = self._board_rotation_numbers()
+            self.logger.info(
+                f"Target rotations {game_id} not on board (visible: {visible[:15]}); "
+                "reloading sport offering"
+            )
         return self.__ensure_sport_offering_loaded()
+
+    def _refresh_bet_board_for_game(self, game_id: str) -> bool:
+        """Try progressively stronger board refreshes until target rotations appear."""
+        if self._rotation_on_board(game_id):
+            return True
+
+        self.logger.info(f"Soft-refreshing bet board for missing game {game_id}")
+        self._soft_refresh_lines_context()
+        time.sleep(1.0)
+        if self._rotation_on_board(game_id):
+            return True
+
+        self.logger.info(f"Full sport navigation for missing game {game_id}")
+        if not self.__ensure_sport_offering_loaded():
+            return False
+        time.sleep(0.5)
+        return self._rotation_on_board(game_id)
 
     def _trigger_angular_offering_select(self) -> bool:
         """Select the active sport/league in the Angular SPA (same UI path users take)."""
@@ -2905,26 +3098,63 @@ class BetWarController:
 
             self._refresh_session_before_wager()
 
-            if not self._ensure_bet_board_ready():
+            team_no, display_name, live_odds = self._lookup_side_from_getlines(
+                game_id, team_name
+            )
+            lookup_name = display_name or team_name
+            if display_name and display_name != team_name:
+                self.logger.info(
+                    f"GetLines team label for {team_name}: {display_name} (team_no={team_no})"
+                )
+
+            if not self._ensure_bet_board_ready(game_id):
                 raise Exception(f"{self.sport_name} lines not loaded before bet placement")
 
-            moneyline_elem = self._find_moneyline_on_board(game_id, team_name, moneyline_odd)
+            if not self._rotation_on_board(game_id):
+                if not self._refresh_bet_board_for_game(game_id):
+                    self._save_bet_board_debug(game_id, "missing_rotations")
+                    raise Exception(
+                        f"Game {game_id} not visible on BetWar bet board "
+                        f"(GetLines has it; DOM does not)"
+                    )
+
+            moneyline_elem = self._find_moneyline_on_board(
+                game_id, lookup_name, moneyline_odd, team_no=team_no
+            )
+
+            if not moneyline_elem and lookup_name != team_name:
+                moneyline_elem = self._find_moneyline_on_board(
+                    game_id, team_name, moneyline_odd, team_no=team_no
+                )
 
             if not moneyline_elem:
                 self.logger.warning(
-                    f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, "
-                    "soft-refreshing board"
+                    f"Moneyline element not found on first pass for {lookup_name} @ "
+                    f"{moneyline_odd}, refreshing board"
                 )
-                self._soft_refresh_lines_context()
+                self._refresh_bet_board_for_game(game_id)
                 time.sleep(1.0)
-                moneyline_elem = self._find_moneyline_on_board(game_id, team_name, moneyline_odd)
+                moneyline_elem = self._find_moneyline_on_board(
+                    game_id, lookup_name, moneyline_odd, team_no=team_no
+                )
+                if not moneyline_elem and lookup_name != team_name:
+                    moneyline_elem = self._find_moneyline_on_board(
+                        game_id, team_name, moneyline_odd, team_no=team_no
+                    )
 
             if not moneyline_elem:
+                self._save_bet_board_debug(game_id, "missing_moneyline")
+                visible = self._board_rotation_numbers()
                 raise Exception(
-                    f"Moneyline element not found for {team_name} @ {moneyline_odd} (game_id={game_id})"
+                    f"Moneyline not found for {lookup_name} @ {moneyline_odd} "
+                    f"(game_id={game_id}; board rotations={visible[:12]})"
                 )
 
-            game_line, team_no = self._parse_game_line_from_button(moneyline_elem, game_id)
+            game_line, parsed_team_no = self._parse_game_line_from_button(
+                moneyline_elem, game_id
+            )
+            if team_no is None:
+                team_no = parsed_team_no
             if team_no is None:
                 team_no = self._infer_team_no(team_name, team_1, team_2)
 

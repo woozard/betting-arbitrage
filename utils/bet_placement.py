@@ -29,8 +29,10 @@ def format_bet_failure_reason(reason: str | None, bookmaker: str = "") -> str:
         )
     if "session expired" in lower or "please log in" in lower:
         return f"{book_label} session expired — re-login required"
-    if "moneyline element not found" in lower:
+    if "moneyline element not found" in lower or "moneyline not found" in lower:
         return text.replace("Message: ", "").strip()
+    if "not visible on betwar bet board" in lower:
+        return f"{book_label} game not loaded on bet board (API has lines, DOM does not)"
     if text.lower().startswith("message:"):
         text = text[8:].strip()
 
