@@ -496,11 +496,7 @@ class ArbitrageController:
             self.logger.info(alert)
             self.logger.info(f"========== Alert ==========")
 
-            alert_chat = (
-                TELEGRAM.get("ops")
-                if SEQUENTIAL_ARB_BETTING
-                else TELEGRAM.get("arbitrage")
-            )
+            alert_chat = TELEGRAM.get("arbitrage")
             if TELEGRAM_ALERTS_ASYNC:
                 threading.Thread(
                     target=lambda: asyncio.run(send_telegram_alert(alert, alert_chat)),

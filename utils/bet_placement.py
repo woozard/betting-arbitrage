@@ -41,24 +41,30 @@ def format_bet_failure_reason(reason: str | None, bookmaker: str = "") -> str:
     return text or "Bet not accepted by bookmaker"
 
 
-def _ops_telegram_chat(telegram_config: dict):
-    return telegram_config.get("ops")
+def _alerts_telegram_chat(telegram_config: dict):
+    """Scanner /scan and ===== Arbitrage ===== opportunity alerts."""
+    return telegram_config.get("arbitrage")
 
 
-def _send_ops_alert(logger, alert: str, ops_chat, label: str = "Alert") -> bool:
-    if not ops_chat:
-        logger.warning("TELEGRAM_CHAT_OPS not set — skipping Telegram alert")
+def _real_bets_telegram_chat(telegram_config: dict):
+    """Leg confirmed, partial arb, and arb complete (real money)."""
+    return telegram_config.get("real_bets")
+
+
+def _send_ops_alert(logger, alert: str, chat_id, label: str = "Alert") -> bool:
+    if not chat_id:
+        logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Telegram alert")
         return False
     logger.info(f"========== {label} ==========")
     logger.info(alert)
     logger.info(f"========== {label} ==========")
-    asyncio.run(send_telegram_alert(alert, ops_chat))
+    asyncio.run(send_telegram_alert(alert, chat_id))
     return True
 
 
-def _dispatch_ops_alert(logger, alert: str, ops_chat, label: str = "Alert") -> bool:
-    if not ops_chat:
-        logger.warning("TELEGRAM_CHAT_OPS not set — skipping Telegram alert")
+def _dispatch_ops_alert(logger, alert: str, chat_id, label: str = "Alert") -> bool:
+    if not chat_id:
+        logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Telegram alert")
         return False
     logger.info(f"========== {label} ==========")
     logger.info(alert)
@@ -66,11 +72,11 @@ def _dispatch_ops_alert(logger, alert: str, ops_chat, label: str = "Alert") -> b
     if TELEGRAM_ALERTS_ASYNC:
         threading.Thread(
             target=_send_ops_alert,
-            args=(logger, alert, ops_chat, label),
+            args=(logger, alert, chat_id, label),
             daemon=True,
         ).start()
         return True
-    return _send_ops_alert(logger, alert, ops_chat, label)
+    return _send_ops_alert(logger, alert, chat_id, label)
 
 
 def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
@@ -301,9 +307,9 @@ def maybe_notify_partial_arb_exposure(
     if cache.is_leg_placed(failed_bookmaker, bet_type, failed_game_id):
         return
 
-    ops_chat = _ops_telegram_chat(telegram_config)
+    real_bets_chat = _real_bets_telegram_chat(telegram_config)
     alert = _build_partial_arb_alert(arb, other_book, failed_bookmaker, stake, reason)
-    if _dispatch_ops_alert(logger, alert, ops_chat, label="Partial Arb Alert"):
+    if _dispatch_ops_alert(logger, alert, real_bets_chat, label="Partial Arb Alert"):
         cache.mark_partial_arb_alert_sent(pair_key)
 
 
@@ -373,7 +379,7 @@ def finalize_confirmed_bet(
     else:
         logger.warning("DB - Bet Not Saved")
 
-    ops_chat = _ops_telegram_chat(telegram_config)
+    real_bets_chat = _real_bets_telegram_chat(telegram_config)
 
     if not cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
         leg_alert = _build_leg_confirmed_alert(
@@ -386,7 +392,7 @@ def finalize_confirmed_bet(
             other_book,
             other_leg_placed,
         )
-        if _dispatch_ops_alert(logger, leg_alert, ops_chat, label="Leg Confirmed Alert"):
+        if _dispatch_ops_alert(logger, leg_alert, real_bets_chat, label="Leg Confirmed Alert"):
             cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
     else:
         logger.info(
@@ -401,7 +407,7 @@ def finalize_confirmed_bet(
             )
         else:
             complete_alert = _build_arb_complete_alert(arb, stake)
-            if _dispatch_ops_alert(logger, complete_alert, ops_chat, label="Arb Complete Alert"):
+            if _dispatch_ops_alert(logger, complete_alert, real_bets_chat, label="Arb Complete Alert"):
                 cache.mark_arb_complete_alert_sent(pair_key)
         return
 
@@ -424,7 +430,7 @@ def finalize_confirmed_bet(
             f"Stake: {stake}\n"
             f"Status: Confirmed by bookmaker\n"
         )
-        betting_chat = telegram_config.get("betting") or telegram_config.get("arbitrage")
+        betting_chat = _real_bets_telegram_chat(telegram_config) or telegram_config.get("betting")
         if TELEGRAM_ALERTS_ASYNC:
             threading.Thread(
                 target=lambda: asyncio.run(send_telegram_alert(alert, betting_chat)),

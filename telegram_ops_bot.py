@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram ops bot — responds to /scan in TELEGRAM_CHAT_OPS with live arb status."""
+"""Telegram ops bot — responds to /scan in TELEGRAM_CHAT_ARBITRAGE with live arb status."""
 
 import asyncio
 import time
@@ -37,20 +37,20 @@ async def _send_report(bot, chat_id: str, text: str):
 async def run_bot():
     logger = Logger.get_logger("telegram-ops-bot")
     token = TELEGRAM.get("bot_token")
-    ops_chat = TELEGRAM.get("ops")
+    alerts_chat = TELEGRAM.get("arbitrage")
 
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN not set")
-    if not ops_chat:
-        raise RuntimeError("TELEGRAM_CHAT_OPS not set")
+    if not alerts_chat:
+        raise RuntimeError("TELEGRAM_CHAT_ARBITRAGE not set")
 
     from telegram import Bot
 
     bot = Bot(token=token)
-    ops_chat_id = str(ops_chat)
+    alerts_chat_id = str(alerts_chat)
     offset = 0
 
-    logger.info(f"Telegram ops bot started (ops chat {ops_chat_id})")
+    logger.info(f"Telegram ops bot started (alerts chat {alerts_chat_id})")
 
     while True:
         try:
@@ -66,7 +66,7 @@ async def run_bot():
                     continue
 
                 chat_id = str(message.chat_id)
-                if chat_id != ops_chat_id:
+                if chat_id != alerts_chat_id:
                     logger.info(f"Ignoring message from unauthorized chat {chat_id}")
                     continue
 

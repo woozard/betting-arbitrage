@@ -44,6 +44,7 @@ TELEGRAM = {
     'betting': os.getenv('TELEGRAM_CHAT_BETTING'),
     'arbitrage_monitoring': os.getenv('TELEGRAM_CHAT_ARBITRAGE_MONITORING'),
     'ops': os.getenv('TELEGRAM_CHAT_OPS'),
+    'real_bets': os.getenv('TELEGRAM_CHAT_REAL_BETS') or os.getenv('TELEGRAM_CHAT_OPS'),
 }
 
 # Betting
