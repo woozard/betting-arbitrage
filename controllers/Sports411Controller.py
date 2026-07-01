@@ -32,6 +32,7 @@ from utils.bet_placement import (
     odds_tolerance_for_placement,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
+from utils.betting_watchdog import BettingLoopWatchdog
 from utils.stake_sizing import (
     BaseAmountStake,
     base_amount_stake_from_odds,
