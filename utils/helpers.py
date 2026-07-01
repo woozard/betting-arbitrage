@@ -11,7 +11,7 @@ from decimal import Decimal
 import pytz
 import asyncio
 import tracemalloc
-from utils.config import TELEGRAM, LOG_DIR
+from utils.config import TELEGRAM, LOG_DIR, telegram_health_chat_id
 
 
 # engine = create_engine('mysql://root@localhost/lockz')
@@ -308,9 +308,9 @@ async def send_monitoring_alert(website, account, ex, chat_id = None) -> None:
         if not token:
             print("Telegram monitoring disabled (no bot_token) - skipping alert for error")
             return
-        chat_id = chat_id or TELEGRAM.get('monitoring')
+        chat_id = chat_id or telegram_health_chat_id()
         if not chat_id:
-            print("No monitoring chat_id - skipping telegram error alert")
+            print("No health/monitoring chat_id - skipping telegram error alert")
             return
         timestamp = format_utc_timestamp()
 

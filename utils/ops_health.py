@@ -24,6 +24,7 @@ from utils.config import (
     OPS_ODDS_STALE_SECONDS,
     OPS_REMEDIATE_COOLDOWN_SECONDS,
     TELEGRAM,
+    telegram_health_chat_id,
 )
 
 BASE_PATH = Path(__file__).resolve().parent.parent
@@ -404,7 +405,7 @@ def remediate_issue(issue: HealthIssue) -> Optional[str]:
 
 async def send_ops_alert(message: str) -> None:
     token = TELEGRAM.get("bot_token")
-    chat_id = TELEGRAM.get("ops") or TELEGRAM.get("monitoring")
+    chat_id = telegram_health_chat_id()
     if not token or not chat_id:
         print(f"[ops] {message}")
         return

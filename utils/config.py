@@ -34,18 +34,36 @@ REDIS = {
     'decode_responses': True,
 }
 
-# Telegram
+# Telegram — channel routing:
+#   TELEGRAM_CHAT_HEALTH      → KC Arb Health Status (ops agent, scanner errors, system alerts)
+#   TELEGRAM_CHAT_REAL_BETS  → KC Arb Real Bets (confirmed legs, partial/complete arbs only)
+#   TELEGRAM_CHAT_ARBITRAGE   → arb opportunity alerts (/scan bot)
+_TELEGRAM_HEALTH = os.getenv('TELEGRAM_CHAT_HEALTH')
+
 TELEGRAM = {
     'bot_token': os.getenv('TELEGRAM_BOT_TOKEN'),
     'chat_id': os.getenv('TELEGRAM_CHAT_ID'),
-    'monitoring': os.getenv('TELEGRAM_CHAT_MONITORING'),
+    'health': _TELEGRAM_HEALTH,
+    'monitoring': os.getenv('TELEGRAM_CHAT_MONITORING') or _TELEGRAM_HEALTH,
     'testing': os.getenv('TELEGRAM_CHAT_TESTING'),
     'arbitrage': os.getenv('TELEGRAM_CHAT_ARBITRAGE'),
     'betting': os.getenv('TELEGRAM_CHAT_BETTING'),
-    'arbitrage_monitoring': os.getenv('TELEGRAM_CHAT_ARBITRAGE_MONITORING'),
-    'ops': os.getenv('TELEGRAM_CHAT_OPS'),
-    'real_bets': os.getenv('TELEGRAM_CHAT_REAL_BETS') or os.getenv('TELEGRAM_CHAT_OPS'),
+    'arbitrage_monitoring': (
+        os.getenv('TELEGRAM_CHAT_ARBITRAGE_MONITORING') or _TELEGRAM_HEALTH or os.getenv('TELEGRAM_CHAT_OPS')
+    ),
+    'ops': os.getenv('TELEGRAM_CHAT_OPS') or _TELEGRAM_HEALTH,
+    'real_bets': os.getenv('TELEGRAM_CHAT_REAL_BETS'),
 }
+
+
+def telegram_health_chat_id():
+    """Chat ID for health / ops / monitoring alerts (not real-money bet confirmations)."""
+    return (
+        TELEGRAM.get('health')
+        or TELEGRAM.get('ops')
+        or TELEGRAM.get('monitoring')
+        or TELEGRAM.get('arbitrage_monitoring')
+    )
 
 # Betting — base amount per arb leg ($20 default).
 # Minus odds → fill to-win box; plus odds → fill risk box (see utils/stake_sizing.py).
