@@ -913,7 +913,55 @@ def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None
     return None, None
 
 
-def is_plausible_moneyline_pair(ml_1, ml_2) -> bool:
+def sanitize_spread_odds(spread: dict) -> dict | None:
+    """Normalize spread juice orientation and reject impossible favorite/dog pairs."""
+    if not spread:
+        return None
+    sv = normalize_spread_value(spread.get("team_1_spread"))
+    if sv is None:
+        return None
+    try:
+        s1_raw = spread.get("team_1_odds")
+        s2_raw = spread.get("team_2_odds")
+        if s1_raw is None or s2_raw is None:
+            return None
+        s1 = float(str(s1_raw).replace("+", ""))
+        s2 = float(str(s2_raw).replace("+", ""))
+    except (TypeError, ValueError):
+        return None
+
+    s1, s2 = fix_spread_odds_orientation(sv, s1, s2)
+    if not is_plausible_spread_pair(sv, s1, s2):
+        return None
+
+    team_2_spread = spread.get("team_2_spread")
+    if normalize_spread_value(team_2_spread) is None:
+        team_2_spread = -sv
+    return {
+        "team_1_spread": sv,
+        "team_2_spread": normalize_spread_value(team_2_spread),
+        "team_1_odds": s1,
+        "team_2_odds": s2,
+    }
+
+
+def build_spread_odd_row(base: dict, spread: dict) -> dict | None:
+    cleaned = sanitize_spread_odds(spread)
+    if cleaned is None:
+        return None
+    return {
+        **base,
+        "bet_type": "spread",
+        "moneyline_team_1": None,
+        "moneyline_team_2": None,
+        "moneyline_draw": None,
+        "spread_team_1": to_decimal(cleaned["team_1_odds"]),
+        "spread_team_2": to_decimal(cleaned["team_2_odds"]),
+        "spread_value": to_decimal(cleaned["team_1_spread"]),
+        "total_points": None,
+        "over_odds": None,
+        "under_odds": None,
+    }
     """Reject obvious scrape glitches for 2-way American moneylines."""
     try:
         a = float(ml_1)
@@ -963,20 +1011,9 @@ def parse_odds(payload: dict) -> list[dict]:
         # SPREAD
         # -------------------
         if "spread" in match:
-            spread = match["spread"]
-            rows.append({
-                **base,
-                "bet_type": "spread",
-                "moneyline_team_1": None,
-                "moneyline_team_2": None,
-                "moneyline_draw": None,
-                "spread_team_1": to_decimal(spread.get("team_1_odds")),
-                "spread_team_2": to_decimal(spread.get("team_2_odds")),
-                "spread_value": to_decimal(spread.get("team_1_spread")),
-                "total_points": None,
-                "over_odds": None,
-                "under_odds": None,
-            })
+            spread_row = build_spread_odd_row(base, match["spread"])
+            if spread_row:
+                rows.append(spread_row)
 
         # -------------------
         # TOTAL

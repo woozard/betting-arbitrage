@@ -97,9 +97,9 @@ ODDS_WATCH_POLL_SECONDS = float(os.getenv("ODDS_WATCH_POLL_SEC", "5"))
 ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("ODDS_WATCH_FORCE_SCAN_SEC", "5"))
 
 # Spread arb sanity gates
-SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "3.0"))
+SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "2.0"))
 SPREAD_ODDS_MAX_AGE_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_AGE_SECONDS", "600"))
-SPREAD_ODDS_MAX_GAP_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_GAP_SECONDS", "120"))
+SPREAD_ODDS_MAX_GAP_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_GAP_SECONDS", "300"))
 ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(

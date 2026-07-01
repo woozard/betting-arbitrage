@@ -32,3 +32,6 @@ venv/
 /data/*
 !/data/.gitkeep
 aws/
+
+# Local Selenium/Chrome temp profiles
+tmp/

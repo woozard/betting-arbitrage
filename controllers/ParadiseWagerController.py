@@ -271,16 +271,18 @@ class ParadiseWagerController:
         if text.startswith("-") or text.startswith("+"):
             return int(abs(signed))
 
-        # Decimal odds encoded as integer cents (231 == 2.31, 265 == 2.65).
-        if 200 <= abs(signed) <= 999:
-            dec = abs(signed) / 100.0
+        val = int(abs(signed))
+        # Paradise encodes decimal odds as integer cents for larger values (231 == 2.31).
+        # Values under 200 are usually already American (+135), not 1.35.
+        if val >= 200:
+            dec = val / 100.0
             if 1.01 <= dec <= 5.0:
                 return abs(int(decimal_to_american(dec)))
 
-        if 1.0 < abs(signed) <= 10.0:
-            return abs(int(decimal_to_american(abs(signed))))
+        if 1.0 < val <= 10.0:
+            return abs(int(decimal_to_american(val)))
 
-        return int(abs(signed))
+        return val
 
     @staticmethod
     def _american_from_handicap_and_raw(handicap, raw) -> str | None:
@@ -819,6 +821,21 @@ class ParadiseWagerController:
                                 team_entries[1].get("spread_val"),
                             )
                         )
+                        from utils.helpers import sanitize_spread_odds
+                        cleaned = sanitize_spread_odds(
+                            {
+                                "team_1_spread": spread_val,
+                                "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                                "team_1_odds": spread_1_odds,
+                                "team_2_odds": spread_2_odds,
+                            }
+                        )
+                        if cleaned is None:
+                            spread_1_odds = spread_2_odds = None
+                        else:
+                            spread_val = cleaned["team_1_spread"]
+                            spread_1_odds = cleaned["team_1_odds"]
+                            spread_2_odds = cleaned["team_2_odds"]
 
                     row = {
                         "bookmaker": self.bookmaker,
