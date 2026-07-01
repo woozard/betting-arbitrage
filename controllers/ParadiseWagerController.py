@@ -37,6 +37,11 @@ from utils.betting_watchdog import (
     OddsScanHealthWatchdog,
     SessionUnauthorizedError,
 )
+from utils.stake_sizing import (
+    BaseAmountStake,
+    base_amount_stake_from_odds,
+    format_base_amount_stake,
+)
 from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -878,21 +883,18 @@ class ParadiseWagerController:
         return self._parse_schedule_response(raw)
 
     @staticmethod
-    def _risk_stake_to_paradise_win_amount(risk: float, american_odds) -> float:
+    def _paradise_api_amount(stake: BaseAmountStake) -> float:
         """Paradise SaveBet Amount uses to-win when AmountCalculation is 'A'."""
-        odds = int(float(american_odds))
-        if odds > 0:
-            return round(float(risk) * odds / 100.0, 2)
-        return round(float(risk) * 100.0 / abs(odds), 2)
+        return stake.to_win
 
     @staticmethod
-    def _build_straight_wager_payload(line_id, stake: float):
+    def _build_straight_wager_payload(line_id, api_amount: float):
         return [{
             "BetType": BET_TYPE_STRAIGHT,
             "TotalPicks": 1,
             "IdTeaser": 0,
             "IsFreePlay": False,
-            "Amount": float(stake),
+            "Amount": float(api_amount),
             "RoundRobinOptions": [],
             "Wagers": [{
                 "Id": line_id,
@@ -965,13 +967,13 @@ class ParadiseWagerController:
                 unique.append(err)
         return unique
 
-    def _place_bet_via_api(self, line_id, stake: float, american_odds=None, timeout: int = 45):
-        win_amount = self._risk_stake_to_paradise_win_amount(stake, american_odds or -110)
+    def _place_bet_via_api(self, line_id, stake: BaseAmountStake, timeout: int = 45):
+        api_amount = self._paradise_api_amount(stake)
         self.logger.info(
-            f"Paradise wager API | risk=${stake:.2f} | to-win=${win_amount:.2f} "
-            f"(odds={american_odds})"
+            f"Paradise wager API | {format_base_amount_stake(stake)} | "
+            f"api-amount(to-win)=${api_amount:.2f}"
         )
-        details = self._build_straight_wager_payload(line_id, win_amount)
+        details = self._build_straight_wager_payload(line_id, api_amount)
 
         add_result = self._api_call("POST", "/api/wager/AddBet/", details)
         if not add_result or not add_result.get("ok"):
@@ -1396,6 +1398,7 @@ class ParadiseWagerController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
 
         try:
             for attempt in range(1, 3):
@@ -1415,7 +1418,7 @@ class ParadiseWagerController:
                         self.__login()
                         continue
                     raise
-            return False, stake
+            return False, stake_plan
 
         except Exception as e:
             self._last_bet_error = str(e)
@@ -1425,7 +1428,7 @@ class ParadiseWagerController:
                     self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')
                 )
             )
-            return False, stake
+            return False, stake_plan
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -1438,9 +1441,10 @@ class ParadiseWagerController:
         team_1: str = None,
         team_2: str = None,
     ):
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         self.logger.info(
             f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-            f"Odds: {moneyline_odd} | Stake: {stake}"
+            f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
 
         self._refresh_session_before_wager()
@@ -1477,12 +1481,12 @@ class ParadiseWagerController:
                 except (TypeError, ValueError):
                     pass
 
-        confirmed, message = self._place_bet_via_api(line_id, stake, american_odds=moneyline_odd)
+        confirmed, message = self._place_bet_via_api(line_id, stake_plan)
         if not confirmed:
             raise Exception(message or "Bet not accepted by bookmaker")
 
         self.logger.info(f"Bet accepted by bookmaker: {message}")
-        return True, stake
+        return True, stake_plan
 
     def _quit_driver(self):
         driver = getattr(self, "driver", None)

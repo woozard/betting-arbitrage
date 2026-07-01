@@ -47,7 +47,8 @@ TELEGRAM = {
     'real_bets': os.getenv('TELEGRAM_CHAT_REAL_BETS') or os.getenv('TELEGRAM_CHAT_OPS'),
 }
 
-# Betting
+# Betting — base amount per arb leg ($20 default).
+# Minus odds → fill to-win box; plus odds → fill risk box (see utils/stake_sizing.py).
 BET_STAKE = float(os.getenv('BET_STAKE', '20'))
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in (
     '1', 'true', 'yes',

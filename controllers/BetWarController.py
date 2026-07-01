@@ -37,6 +37,13 @@ from utils.betting_watchdog import (
     OddsScanHealthWatchdog,
     SessionUnauthorizedError,
 )
+from utils.stake_sizing import (
+    BaseAmountStake,
+    base_amount_stake_from_odds,
+    format_base_amount_stake,
+    stake_matches_verification_amount,
+)
+from utils.stake_entry import fill_betslip_stake_input
 from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -1161,50 +1168,6 @@ class BetWarController:
         except Exception:
             pass
 
-    def _enter_betslip_stake(self, stake: float) -> bool:
-        self._ensure_betslip_expanded()
-        stake_input = None
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            for inp in self.driver.find_elements(
-                By.CSS_SELECTOR,
-                "#pills-betslip input.txtRiskAmount, #divBetSlip input.txtRiskAmount",
-            ):
-                if inp.is_displayed() and inp.is_enabled():
-                    stake_input = inp
-                    break
-            if stake_input:
-                break
-            time.sleep(0.3)
-
-        if not stake_input:
-            return False
-
-        stake_str = f"{stake:.2f}"
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center'});", stake_input
-        )
-        try:
-            stake_input.click()
-            stake_input.clear()
-            stake_input.send_keys(stake_str)
-        except Exception:
-            self.driver.execute_script(
-                """
-                var el = arguments[0];
-                var val = arguments[1];
-                el.focus();
-                el.value = val;
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                if (typeof calculateBStxtWin === 'function') calculateBStxtWin(el);
-                """,
-                stake_input,
-                stake_str,
-            )
-        self.logger.info(f"Stake entered: {stake_str}")
-        return True
-
     def _fill_wager_password_if_required(self) -> bool:
         """BetWar requires login password in #txtPassword before Place Bets."""
         self._ensure_betslip_expanded()
@@ -1313,13 +1276,13 @@ class BetWarController:
         last_word = team_name.strip().split()[-1].lower()
         return bool(last_word and last_word in desc.lower())
 
-    def _my_bets_has_wager(self, team_name: str, stake: float) -> bool:
+    def _my_bets_has_wager(self, team_name: str, stake) -> bool:
         text = self._my_bets_tab_text(timeout=12)
         for row in self._parse_my_bets_rows(text):
             if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
                 continue
             try:
-                if abs(float(row["risk_raw"]) - float(stake)) < 0.011:
+                if stake_matches_verification_amount(stake, row["risk_raw"]):
                     return True
             except (TypeError, ValueError):
                 continue
@@ -3483,11 +3446,16 @@ class BetWarController:
                     if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
                         continue
                     try:
-                        if abs(float(row["risk_raw"]) - float(stake)) < 0.011:
+                        if stake_matches_verification_amount(stake, row["risk_raw"]):
                             return True, "Open bet confirmed on My Bets tab"
                     except (TypeError, ValueError):
                         continue
-                return False, f"Team/stake ${stake:.2f} not found on My Bets tab"
+                stake_label = (
+                    format_base_amount_stake(stake)
+                    if isinstance(stake, BaseAmountStake)
+                    else f"${float(stake):.2f}"
+                )
+                return False, f"Team/stake {stake_label} not found on My Bets tab"
 
             return True, "Open bet confirmed on My Bets tab"
         except Exception as e:
@@ -3602,6 +3570,7 @@ class BetWarController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
 
         try:
             for attempt in range(1, 4):
@@ -3634,13 +3603,13 @@ class BetWarController:
                         self.__login()
                         self._ensure_bet_board_ready()
                     continue
-            return False, stake
+            return False, stake_plan
 
         except Exception as e:
             self._last_bet_error = format_bet_failure_reason(str(e), self.bookmaker)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
-            return False, stake
+            return False, stake_plan
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -3654,8 +3623,10 @@ class BetWarController:
         team_2: str = None,
     ):
         try:
+            stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
             self.logger.info(
-                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
+                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
+                f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
             )
 
             self._refresh_session_before_wager()
@@ -3744,8 +3715,11 @@ class BetWarController:
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
 
-            if not self._enter_betslip_stake(stake):
-                raise Exception("Could not locate interactable risk amount input in bet slip")
+            self._ensure_betslip_expanded()
+            if not fill_betslip_stake_input(
+                self.driver, stake_plan, self.logger, scope_css="#divBetSlip, #pills-betslip"
+            ):
+                raise Exception("Could not locate bet slip stake input for base amount")
 
             self._accept_line_changes()
             if not self._fill_wager_password_if_required():
@@ -3771,12 +3745,12 @@ class BetWarController:
                         matchup_1 = game.get("team_1") or matchup_1
                         matchup_2 = game.get("team_2") or matchup_2
                         break
-            confirmed, message = self._confirm_bet_accepted(team_name, matchup_1, matchup_2, stake)
+            confirmed, message = self._confirm_bet_accepted(team_name, matchup_1, matchup_2, stake_plan)
             if not confirmed:
                 raise Exception(message or "Bet not accepted by bookmaker")
 
             self.logger.info(f"Bet accepted by bookmaker: {message}")
-            return True, stake
+            return True, stake_plan
 
         except Exception:
             raise

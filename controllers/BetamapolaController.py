@@ -27,6 +27,11 @@ from utils.bet_placement import (
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.betting_watchdog import BettingLoopWatchdog
+from utils.stake_sizing import (
+    base_amount_stake_from_odds,
+    format_base_amount_stake,
+)
+from utils.stake_entry import fill_betslip_stake_input
 from utils.odds_watch import persist_moneyline_games
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
@@ -1656,6 +1661,7 @@ class BetamapolaController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
 
         try:
             for attempt in range(1, 3):
@@ -1676,13 +1682,13 @@ class BetamapolaController:
                         self.__ensure_sport_offering_loaded()
                         continue
                     raise
-            return False, stake
+            return False, stake_plan
 
         except Exception as e:
             self._last_bet_error = str(e)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
-            return False, stake
+            return False, stake_plan
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -1696,8 +1702,10 @@ class BetamapolaController:
         team_2: str = None,
     ):
         try:
+            stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
             self.logger.info(
-                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
+                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
+                f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
             )
 
             self._refresh_session_before_wager()
@@ -1757,37 +1765,10 @@ class BetamapolaController:
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
 
-            # ENTER STAKE - look for common risk/stake inputs (TicoSports style often uses input[id^=risk_] or ng-model risk)
-            stake_input = None
-            for selector in [
-                "input[id^='risk_']",
-                "input[name*='risk']",
-                "input[ng-model*='risk']",
-                "input[ng-model*='stake']",
-                "#betSlipDiv input[type='text']",
-                "#betSlipDiv input[type='number']"
-            ]:
-                try:
-                    elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if elems:
-                        stake_input = elems[0]
-                        break
-                except:
-                    continue
-
-            if not stake_input:
-                # Fallback: any visible text input in the bet slip area
-                for inp in self.driver.find_elements(By.CSS_SELECTOR, "#betSlipDiv input"):
-                    if inp.is_displayed():
-                        stake_input = inp
-                        break
-
-            if stake_input:
-                stake_input.clear()
-                stake_input.send_keys(f"{stake:.2f}")
-                self.logger.info(f"Stake entered: {stake:.2f}")
-            else:
-                self.logger.warning("Could not locate stake input - bet may use default")
+            if not fill_betslip_stake_input(
+                self.driver, stake_plan, self.logger, scope_css="#betSlipDiv"
+            ):
+                raise Exception("Could not locate bet slip stake input for base amount")
 
             self._accept_line_changes()
 
@@ -1817,12 +1798,12 @@ class BetamapolaController:
 
             matchup_1 = team_1 or game_line.get("Team1ID") or ""
             matchup_2 = team_2 or game_line.get("Team2ID") or ""
-            confirmed, message = self._confirm_bet_accepted(team_name, matchup_1, matchup_2, stake)
+            confirmed, message = self._confirm_bet_accepted(team_name, matchup_1, matchup_2, stake_plan)
             if not confirmed:
                 raise Exception(message or "Bet not accepted by bookmaker")
 
             self.logger.info(f"Bet accepted by bookmaker: {message}")
-            return True, stake
+            return True, stake_plan
 
         except Exception:
             raise

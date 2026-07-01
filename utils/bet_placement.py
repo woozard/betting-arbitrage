@@ -4,6 +4,22 @@ import threading
 
 from utils.config import SEQUENTIAL_ARB_BETTING, TELEGRAM_ALERTS_ASYNC, SECOND_LEG_ODDS_TOLERANCE, arb_pair_legs, required_first_leg_book
 from utils.helpers import send_telegram_alert, format_utc_timestamp
+from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
+
+
+def _format_stake_line(stake) -> str:
+    if isinstance(stake, BaseAmountStake):
+        return format_base_amount_stake(stake)
+    try:
+        return f"${float(stake):.2f}"
+    except (TypeError, ValueError):
+        return str(stake)
+
+
+def _stake_risk_amount(stake) -> float:
+    if isinstance(stake, BaseAmountStake):
+        return stake.risk
+    return float(stake)
 
 
 def format_bet_failure_reason(reason: str | None, bookmaker: str = "") -> str:
@@ -192,7 +208,7 @@ def _build_leg_confirmed_alert(
         f"Team: {team_name}\n"
         f"Bookmaker: {bookmaker}\n"
         f"Odds: {moneyline_odd}\n"
-        f"Stake: ${stake:.2f}\n"
+        f"Stake: {_format_stake_line(stake)}\n"
         f"Status: {status}\n"
     )
 
@@ -223,11 +239,11 @@ def _build_arb_complete_alert(arb: dict, stake: float) -> str:
         f"Leg 1: {team_1}\n"
         f"Bookmaker: {book_1}\n"
         f"Odds: {odds_1}\n"
-        f"Stake: ${stake:.2f}\n\n"
+        f"Stake: {_format_stake_line(stake)}\n\n"
         f"Leg 2: {team_2}\n"
         f"Bookmaker: {book_2}\n"
         f"Odds: {odds_2}\n"
-        f"Stake: ${stake:.2f}\n\n"
+        f"Stake: {_format_stake_line(stake)}\n\n"
         f"{profit_line}"
         f"Status: Both legs confirmed\n"
     )
@@ -266,7 +282,7 @@ def _build_partial_arb_alert(
         f"Bet Type: {bet_type}\n\n"
         f"CONFIRMED: {confirmed_team} on {confirmed_book}\n"
         f"Odds: {confirmed_odds}\n"
-        f"Stake: ${stake:.2f}\n\n"
+        f"Stake: {_format_stake_line(stake)}\n\n"
         f"FAILED: second leg on {failed_book}\n"
         f"Reason: {reason_text}\n"
         f"Status: Exposed — only one side placed; check books manually\n"
@@ -372,8 +388,11 @@ def finalize_confirmed_bet(
         "team_no": team_no,
         "team_name": team_name,
         "odds": moneyline_odd,
-        "stake": stake,
+        "stake": _stake_risk_amount(stake),
     }
+    if isinstance(stake, BaseAmountStake):
+        bet_data["to_win"] = stake.to_win
+        bet_data["base_amount"] = stake.base_amount
     if storage.save_bet(bet_data):
         logger.info("DB - Bet Saved")
     else:
@@ -427,7 +446,7 @@ def finalize_confirmed_bet(
             f"Team: {team_name}\n"
             f"Bookmaker: {bookmaker}\n"
             f"Odds: {moneyline_odd}\n"
-            f"Stake: {stake}\n"
+            f"Stake: {_format_stake_line(stake)}\n"
             f"Status: Confirmed by bookmaker\n"
         )
         betting_chat = _real_bets_telegram_chat(telegram_config) or telegram_config.get("betting")

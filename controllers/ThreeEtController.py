@@ -29,6 +29,7 @@ from utils.helpers import (
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
 from utils.storage import Storage
+from utils.stake_sizing import base_amount_stake_from_odds, format_base_amount_stake
 from utils.threeet_client import ThreeEtApiError, ThreeEtClient
 from utils.timing import time_it
 
@@ -615,6 +616,7 @@ class ThreeEtController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         try:
             for attempt in range(1, 3):
                 try:
@@ -630,7 +632,7 @@ class ThreeEtController:
                         self._login()
                         continue
                     raise
-            return False, stake
+            return False, stake_plan
         except Exception as e:
             self._last_bet_error = str(e)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
@@ -639,7 +641,7 @@ class ThreeEtController:
                     self.website, self.account_id, e, TELEGRAM.get("arbitrage_monitoring")
                 )
             )
-            return False, stake
+            return False, stake_plan
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -652,9 +654,10 @@ class ThreeEtController:
         team_1: str = None,
         team_2: str = None,
     ):
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         self.logger.info(
             f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-            f"Odds: {moneyline_odd} | Stake: {stake}"
+            f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
         self._ensure_session()
         game_row, team_no = self._find_game(game_id, team_name, team_1=team_1, team_2=team_2)
@@ -687,11 +690,11 @@ class ThreeEtController:
         if api_odds is None:
             raise ThreeEtApiError(f"No API odds for runner {runner_id}")
 
-        confirmed, message = self._place_bet_via_api(runner_id, stake, api_odds)
+        confirmed, message = self._place_bet_via_api(runner_id, stake_plan.risk, api_odds)
         if not confirmed:
             raise ThreeEtApiError(message or "Bet not accepted by bookmaker")
         self.logger.info(f"Bet accepted by bookmaker: {message}")
-        return True, stake
+        return True, stake_plan
 
     def betting(self, stake: float = 1.0):
         self.logger = Logger.get_logger(f"{self.bookmaker}-betting")

@@ -25,6 +25,11 @@ from utils.storage import Storage
 from utils.helpers import currency_to_float, determine_wager_on_spread, send_telegram_alert, send_monitoring_alert, \
     send_testing_alert, epoch_to_mysql_datetime, parse_odds
 from utils.helpers import detect_odds_type, decimal_to_american, american_to_decimal, odds_equal
+from utils.stake_sizing import (
+    base_amount_stake_from_odds,
+    format_base_amount_stake,
+)
+from utils.stake_entry import fill_betslip_stake_input
 from cache.arbitrage_cache import ArbitrageCache
 
 class Web5Controller:
@@ -659,9 +664,11 @@ class Web5Controller:
             stake: float = 1.0
     ):
         self.logger.info("========== Execute Bet (START) ==========")
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         try:
             self.logger.info(
-                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
+                f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
+                f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
             )
 
             tables = self.driver.find_elements(
@@ -793,25 +800,17 @@ class Web5Controller:
                 )
 
                 base_input.clear()
-                base_input.send_keys(str(stake))
-                self.logger.info(f"Entered stake in base field: {stake}")
+                base_input.send_keys(str(stake_plan.base_amount))
+                self.logger.info(
+                    f"Entered base amount in base field: {stake_plan.base_amount:.2f}"
+                )
 
                 self.driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", base_input)
             except Exception as e:
                 self.logger.warning(f"Could not find base input: {e}")
 
-                try:
-                    risk_input = self.wait.until(
-                        EC.presence_of_element_located(
-                            (By.CSS_SELECTOR, "input[name='risk'], input.risk")
-                        )
-                    )
-                    risk_input.clear()
-                    risk_input.send_keys(str(stake))
-                    self.logger.info(f"Entered stake in risk field: {stake}")
-                except Exception as e2:
-                    self.logger.error(f"Could not find any stake input: {e2}")
-                    raise Exception("No stake input field found")
+                if not fill_betslip_stake_input(self.driver, stake_plan, self.logger):
+                    raise Exception("No stake input field found for base amount")
 
             time.sleep(1)
 
@@ -850,13 +849,14 @@ class Web5Controller:
                 max_bet = currency_to_float(max_bet_el.text.strip())
 
                 self.logger.info(
-                    f"Bet Limits | Min Bet: {min_bet} | Max Bet: {max_bet} | Stake: {stake}"
+                    f"Bet Limits | Min Bet: {min_bet} | Max Bet: {max_bet} | "
+                    f"Risk: {stake_plan.risk:.2f}"
                 )
 
-                if stake < min_bet:
-                    raise Exception(f"Stake {stake} is below minimum bet {min_bet}")
-                if max_bet > 0 and stake > max_bet:
-                    raise Exception(f"Stake {stake} exceeds maximum bet {max_bet}")
+                if stake_plan.risk < min_bet:
+                    raise Exception(f"Risk {stake_plan.risk} is below minimum bet {min_bet}")
+                if max_bet > 0 and stake_plan.risk > max_bet:
+                    raise Exception(f"Risk {stake_plan.risk} exceeds maximum bet {max_bet}")
             except Exception as e:
                 self.logger.warning(f"Could not read min/max bet limits: {e}")
 
@@ -913,16 +913,16 @@ class Web5Controller:
 
                     time.sleep(2)
                     self.logger.info("Bet placement process completed")
-                    return True, stake
+                    return True, stake_plan
 
             except TimeoutException:
                 self.logger.info("No alert appeared after place bet → assuming success")
-                return True, stake
+                return True, stake_plan
 
         except Exception as e:
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             self._safe_send_monitoring_alert(e)
-            return False, stake
+            return False, stake_plan
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 

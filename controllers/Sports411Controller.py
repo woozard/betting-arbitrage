@@ -32,7 +32,13 @@ from utils.bet_placement import (
     odds_tolerance_for_placement,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
-from utils.betting_watchdog import BettingLoopWatchdog
+from utils.stake_sizing import (
+    BaseAmountStake,
+    base_amount_stake_from_odds,
+    format_base_amount_stake,
+    page_contains_stake_amount,
+)
+from utils.stake_entry import fill_betslip_stake_input
 from utils.timing import time_it
 from utils.chrome_temp import cleanup_stale_temp_dirs, handle_init_driver_failure
 from cache.arbitrage_cache import ArbitrageCache
@@ -2109,7 +2115,9 @@ class Sports411Controller:
             )
         return btn
 
-    def _stake_on_open_bets_page(self, page: str, stake: float) -> bool:
+    def _stake_on_open_bets_page(self, page: str, stake) -> bool:
+        if isinstance(stake, BaseAmountStake):
+            return page_contains_stake_amount(page, stake)
         page_l = page or ""
         patterns = (
             f"risk:${stake:.2f}",
@@ -2276,6 +2284,7 @@ class Sports411Controller:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
 
         try:
             for attempt in range(1, 3):
@@ -2287,13 +2296,13 @@ class Sports411Controller:
                     )
                 except Exception as e:
                     confirmed, open_msg = self._verify_open_bet_on_pending(
-                        team_name, stake
+                        team_name, stake_plan
                     )
                     if confirmed:
                         self.logger.info(
                             f"Bet on open bets despite error '{e}': {open_msg}"
                         )
-                        return True, stake
+                        return True, stake_plan
                     if attempt == 1 and self._message_requires_relogin(str(e)):
                         self.logger.warning(
                             f"Wager blocked by expired session ({e}); forcing re-login and retry"
@@ -2303,19 +2312,19 @@ class Sports411Controller:
                         self._return_to_sport_page()
                         continue
                     raise
-            return False, stake
+            return False, stake_plan
 
         except Exception as e:
             self._last_bet_error = str(e)
-            confirmed, pending_msg = self._recover_bet_from_open_bets(team_name, stake)
+            confirmed, pending_msg = self._recover_bet_from_open_bets(team_name, stake_plan)
             if confirmed:
                 self.logger.info(
                     f"Place Bet raised '{e}' but bet is on open bets: {pending_msg}"
                 )
-                return True, stake
+                return True, stake_plan
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
-            return False, stake
+            return False, stake_plan
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -2324,18 +2333,20 @@ class Sports411Controller:
         game_id: str,
         team_name: str,
         moneyline_odd: str,
-        stake: float = 1.0
+        stake: float = 1.0,
     ):
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         self.logger.info(
-            f"Placing Bet | Game ID: {game_id} | Team: {team_name} | Odds: {moneyline_odd} | Stake: {stake}"
+            f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
+            f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
 
-        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake)
+        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
         if already_open:
             self.logger.info(
                 f"Skipping placement — bet already on open bets: {open_msg}"
             )
-            return True, stake
+            return True, stake_plan
 
         self._refresh_session_before_wager()
 
@@ -2406,25 +2417,30 @@ class Sports411Controller:
             min_bet = currency_to_float(amounts[0].text.strip()) if len(amounts) > 0 else "N/A"
             max_bet = currency_to_float(amounts[1].text.strip()) if len(amounts) > 1 else "N/A"
             self.logger.info(
-                f"Bet Limits | Min Bet: {min_bet} | Max Bet: {max_bet} | Stake: {stake}"
+                f"Bet Limits | Min Bet: {min_bet} | Max Bet: {max_bet} | "
+                f"Risk: {stake_plan.risk:.2f}"
             )
-            if stake < min_bet:
-                raise Exception(f"Stake {stake} is below minimum bet {min_bet}")
-            if max_bet > 0 and stake > max_bet:
-                raise Exception(f"Stake {stake} exceeds maximum bet {max_bet}")
+            if stake_plan.risk < min_bet:
+                raise Exception(f"Risk {stake_plan.risk} is below minimum bet {min_bet}")
+            if max_bet > 0 and stake_plan.risk > max_bet:
+                raise Exception(f"Risk {stake_plan.risk} exceeds maximum bet {max_bet}")
         except Exception as e:
             self.logger.warning(f"Bet limits could not be determined: {e}")
 
-        stake_input = self.wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[id^='risk_']"))
-        )
         if self.use_xdotool and not self.xdotool_bet_only:
-            self._human_type(stake_input, f"{stake:.2f}", force_xdotool=True)
-        else:
-            stake_input.clear()
-            stake_input.send_keys(f"{stake:.2f}")
-            self._dispatch_stake_input_events(stake_input)
-        self.logger.info(f"Stake entered: {stake:.2f}")
+            win_sel = "input[id^='win_']"
+            risk_sel = "input[id^='risk_']"
+            css = win_sel if stake_plan.entry_field == "to_win" else risk_sel
+            stake_input = self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, css))
+            )
+            self._human_type(
+                stake_input, f"{stake_plan.entry_amount:.2f}", force_xdotool=True
+            )
+        elif not fill_betslip_stake_input(
+            self.driver, stake_plan, self.logger, scope_css="#betslip"
+        ):
+            raise Exception("Could not locate bet slip stake input for base amount")
 
         place_bet_btn = self._require_place_bet_ready(moneyline_odd)
 
@@ -2455,12 +2471,12 @@ class Sports411Controller:
                 "No wager network activity detected immediately after Place Bet click"
             )
 
-        confirmed, message = self._confirm_bet_accepted(team_name, stake)
+        confirmed, message = self._confirm_bet_accepted(team_name, stake_plan)
         if not confirmed:
             raise Exception(message or "Bet not accepted by bookmaker")
 
         self.logger.info(f"Bet accepted by bookmaker: {message}")
-        return True, stake
+        return True, stake_plan
 
     def _quit_driver(self):
         """Safely terminate only this controller's WebDriver session."""
