@@ -819,6 +819,19 @@ def align_cross_book_spreads(o1: dict, o2: dict):
     return None
 
 
+def is_plausible_moneyline_pair(ml_1, ml_2) -> bool:
+    """Reject obvious scrape glitches for 2-way American moneylines."""
+    try:
+        a = float(ml_1)
+        b = float(ml_2)
+    except (TypeError, ValueError):
+        return False
+    if a == 0.0 or b == 0.0:
+        return False
+    # One side must be the underdog (+) and the other the favorite (-).
+    return (a > 0 and b < 0) or (a < 0 and b > 0)
+
+
 def is_plausible_spread_pair(spread_value, spread_team_1, spread_team_2) -> bool:
     if normalize_spread_value(spread_value) is None:
         return False

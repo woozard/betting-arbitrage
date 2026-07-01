@@ -117,7 +117,10 @@ class ArbitrageController:
     # --------------------------------------------------------
     # Long Running
     # --------------------------------------------------------
-    def run(self, delay: int = 3):
+    def run(self, delay: float = None):
+        if delay is None:
+            from utils.config import ARB_SCAN_DELAY_SECONDS
+            delay = ARB_SCAN_DELAY_SECONDS
         self.logger.info("========== Arbitrage (START) ==========")
         try:
             while True:

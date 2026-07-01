@@ -37,7 +37,7 @@ MLB_RUN_LINE = 1.5
 
 class FourCastersController:
     ODDS_WATCH_POLL_SECONDS = float(os.getenv("FOURCASTERS_ODDS_POLL_SEC", "5"))
-    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("FOURCASTERS_ODDS_FORCE_SCAN_SEC", "30"))
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("FOURCASTERS_ODDS_FORCE_SCAN_SEC", "5"))
     ODDS_IDLE_POLL_SECONDS = float(os.getenv("FOURCASTERS_ODDS_IDLE_POLL_SEC", "5"))
 
     def __init__(self, account, site, sport="baseball"):
@@ -599,12 +599,15 @@ class FourCastersController:
             return
 
         self._last_saved_ml = {}
+        self._exposure_cleanup_at = 0.0
         self._poll_odds_watch_once(source="betting-start", force_relogin=False)
 
         try:
             while True:
                 watchdog.beat()
-                tick_exposure_cleanup(self.cache, self.logger, TELEGRAM)
+                self._exposure_cleanup_at = tick_exposure_cleanup(
+                    self.cache, self.logger, self._exposure_cleanup_at
+                )
                 self._maybe_poll_odds_while_idle()
 
                 arbs = self.cache.get_arbitrage(

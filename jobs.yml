@@ -48,6 +48,11 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 48
 
+  - name: ops_health_agent
+    script: ops_health_agent.py
+    interval_seconds: 120
+    start_offset_seconds: 10
+
   - name: telegram_ops_bot
     script: telegram_ops_bot.py
     interval_seconds: 300

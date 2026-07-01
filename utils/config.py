@@ -97,6 +97,17 @@ def min_arb_profit_pct_for_bet_type(bet_type: str) -> float:
 ODDS_WATCH_POLL_SECONDS = float(os.getenv("ODDS_WATCH_POLL_SEC", "5"))
 ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("ODDS_WATCH_FORCE_SCAN_SEC", "5"))
 
+# Arb scanner loop delay (seconds between DB scans). Target: arb → both legs < 5s.
+ARB_SCAN_DELAY_SECONDS = float(os.getenv("ARB_SCAN_DELAY_SEC", "2"))
+
+# Ops health agent — staleness thresholds and remediation cooldowns.
+OPS_ODDS_STALE_SECONDS = int(os.getenv("OPS_ODDS_STALE_SEC", "90"))
+OPS_ARB_SCAN_STALE_SECONDS = int(os.getenv("OPS_ARB_SCAN_STALE_SEC", "30"))
+OPS_REMEDIATE_COOLDOWN_SECONDS = int(os.getenv("OPS_REMEDIATE_COOLDOWN_SEC", "300"))
+OPS_HEALTH_CHECK_ENABLED = os.getenv("OPS_HEALTH_CHECK_ENABLED", "true").lower() in (
+    "1", "true", "yes",
+)
+
 # Spread arb sanity gates
 SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "2.0"))
 SPREAD_ODDS_MAX_AGE_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_AGE_SECONDS", "600"))

@@ -42,6 +42,8 @@ JOB_SPECS = [
     {"name": "betwar_betting", "pattern": "betwar_betting.py", "log": "betwar_betting.log", "label": "BetWar"},
     {"name": "lowvig_betting", "pattern": "lowvig_betting.py", "log": "lowvig_betting.log", "label": "LowVig"},
     {"name": "threeet_betting", "pattern": "threeet_betting.py", "log": "threeet_betting.log", "label": "3et"},
+    {"name": "fourcasters_betting", "pattern": "fourcasters_betting.py", "log": "fourcasters_betting.log", "label": "4casters"},
+    {"name": "ops_health_agent", "pattern": "ops_health_agent.py", "log": "ops_health_agent.log", "label": "Ops agent"},
     {"name": "polymarket_odds", "pattern": "polymarket_odds.py", "log": "polymarket_odds.log", "label": "Polymarket"},
     {"name": "telegram_ops_bot", "pattern": "telegram_ops_bot.py", "log": "telegram_ops_bot.log", "label": "Telegram bot"},
 ]
@@ -53,6 +55,7 @@ BOOK_LOG_MAP = {
     "betwar": "betwar_betting.log",
     "lowvig": "lowvig_betting.log",
     "3et": "threeet_betting.log",
+    "4casters": "fourcasters_betting.log",
 }
 
 POLL_PATTERNS = re.compile(
