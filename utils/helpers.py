@@ -927,16 +927,16 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
     """Compact KC Arb Alerts format with market type and spread context.
 
     Spread example:
-        Spread — run_line (+1.5)
-        St. Louis Cardinals vs Atlanta Braves | +1.06%
+        Spread — run_line (+1.5) · +1.07%
+        Cincinnati Reds vs Milwaukee Brewers
 
-        Cardinals +1.5 -135 3et
+        Reds +1.5 -135 3et
 
-        Braves -1.5 +130 s411
+        Brewers -1.5 +130 s411
 
     Moneyline example:
-        ML
-        St. Louis Cardinals vs Atlanta Braves | +1.06%
+        ML · +1.06%
+        St. Louis Cardinals vs Atlanta Braves
 
         Cardinals +120 4casters
 
@@ -964,19 +964,22 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
     short_2 = team_2.split()[-1] if team_2 else "team_2"
 
     header_lines = []
-    if bet_type == "spread":
-        market = spread_market_label(spread_value, sport)
-        header_lines.append(f"Spread — {market}")
-    else:
-        header_lines.append("ML")
-
-    matchup_line = f"{team_1} vs {team_2}"
+    profit_suffix = ""
     if profit_pct is not None:
         try:
-            matchup_line += f" | +{float(profit_pct):.2f}%"
+            pct = float(profit_pct)
+            sign = "+" if pct >= 0 else ""
+            profit_suffix = f" · {sign}{pct:.2f}%"
         except (TypeError, ValueError):
-            pass
-    header_lines.append(matchup_line)
+            profit_suffix = ""
+
+    if bet_type == "spread":
+        market = spread_market_label(spread_value, sport)
+        header_lines.append(f"Spread — {market}{profit_suffix}")
+    else:
+        header_lines.append(f"ML{profit_suffix}")
+
+    header_lines.append(f"{team_1} vs {team_2}")
     header_lines.append("")
 
     if bet_type == "spread" and spread_value is not None:
