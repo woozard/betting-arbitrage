@@ -2,9 +2,37 @@ import asyncio
 import re
 import threading
 
-from utils.config import SEQUENTIAL_ARB_BETTING, TELEGRAM_ALERTS_ASYNC, SECOND_LEG_ODDS_TOLERANCE, arb_pair_legs, required_first_leg_book
+from utils.config import (
+    REAL_MONEY_BETTING_ENABLED,
+    SEQUENTIAL_ARB_BETTING,
+    TELEGRAM_ALERTS_ASYNC,
+    SECOND_LEG_ODDS_TOLERANCE,
+    arb_pair_legs,
+    required_first_leg_book,
+)
 from utils.helpers import send_telegram_alert, format_utc_timestamp
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
+
+REAL_MONEY_BETTING_PAUSED_MSG = "Real money betting paused (REAL_MONEY_BETTING_ENABLED=false)"
+
+
+def real_money_betting_enabled() -> bool:
+    return REAL_MONEY_BETTING_ENABLED
+
+
+def block_real_money_bet(logger, stake: float):
+    """Return (False, stake) when real-money betting is paused; else None."""
+    if real_money_betting_enabled():
+        return None
+    logger.info(REAL_MONEY_BETTING_PAUSED_MSG)
+    return False, float(stake)
+
+
+def should_notify_failed_bet(last_error: str | None) -> bool:
+    """Skip partial-exposure alerts when we deliberately did not attempt a bet."""
+    if not last_error:
+        return True
+    return not last_error.startswith("Real money betting paused")
 
 
 def _format_stake_line(stake) -> str:

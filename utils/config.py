@@ -68,6 +68,9 @@ def telegram_health_chat_id():
 # Betting — base amount per arb leg ($20 default).
 # Minus odds → fill to-win box; plus odds → fill risk box (see utils/stake_sizing.py).
 BET_STAKE = float(os.getenv('BET_STAKE', '20'))
+REAL_MONEY_BETTING_ENABLED = os.getenv('REAL_MONEY_BETTING_ENABLED', 'true').lower() in (
+    '1', 'true', 'yes',
+)
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in (
     '1', 'true', 'yes',
 )
@@ -91,8 +94,8 @@ elif MIN_ARB_PROFIT_PCT != 0:
 else:
     ARB_MAX_TOTAL_PROB = 1.0
 
-# Spread/run-line alerts-only: wider threshold by default (-1.01% min profit).
-MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '-1.01'))
+# Spread/run-line uses same min profit threshold as ML by default (1.01%).
+MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '1.01'))
 if os.getenv('ARB_MAX_TOTAL_PROB_SPREAD') is not None:
     ARB_MAX_TOTAL_PROB_SPREAD = float(os.getenv('ARB_MAX_TOTAL_PROB_SPREAD'))
 else:

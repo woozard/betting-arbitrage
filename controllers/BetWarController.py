@@ -24,10 +24,13 @@ from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, teams_same
 from utils.team_registry import standard_team_name
 from utils.bet_placement import (
+    REAL_MONEY_BETTING_PAUSED_MSG,
+    block_real_money_bet,
     finalize_confirmed_bet,
     format_bet_failure_reason,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
+    should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
@@ -3570,6 +3573,10 @@ class BetWarController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        blocked = block_real_money_bet(self.logger, stake)
+        if blocked is not None:
+            self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
+            return blocked
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
 
         try:
@@ -3603,13 +3610,13 @@ class BetWarController:
                         self.__login()
                         self._ensure_bet_board_ready()
                     continue
-            return False, stake_plan
+            return False, stake
 
         except Exception as e:
             self._last_bet_error = format_bet_failure_reason(str(e), self.bookmaker)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
-            return False, stake_plan
+            return False, stake
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -4057,10 +4064,10 @@ class BetWarController:
                     )
                     continue
 
-                bet_placed, stake = self.__execute_bet(
+                bet_placed, stake_used = self.__execute_bet(
                     game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
                 )
-                if not bet_placed:
+                if not bet_placed and should_notify_failed_bet(self._last_bet_error):
                     maybe_notify_partial_arb_exposure(
                         self.cache,
                         self.logger,
@@ -4081,7 +4088,7 @@ class BetWarController:
                         team_no,
                         team_name,
                         game_id,
-                        stake,
+                        stake_used,
                         moneyline_odd,
                         TELEGRAM,
                     )

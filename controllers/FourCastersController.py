@@ -5,9 +5,12 @@ from datetime import datetime
 
 from cache.arbitrage_cache import ArbitrageCache
 from utils.bet_placement import (
+    REAL_MONEY_BETTING_PAUSED_MSG,
+    block_real_money_bet,
     finalize_confirmed_bet,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
+    should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
@@ -486,6 +489,10 @@ class FourCastersController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        blocked = block_real_money_bet(self.logger, stake)
+        if blocked is not None:
+            self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
+            return blocked
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         try:
             for attempt in range(1, 3):
@@ -502,7 +509,7 @@ class FourCastersController:
                         self._login()
                         continue
                     raise
-            return False, stake_plan
+            return False, stake
         except Exception as e:
             self._last_bet_error = str(e)
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
@@ -511,7 +518,7 @@ class FourCastersController:
                     self.website, self.account_id, e, TELEGRAM.get("arbitrage_monitoring")
                 )
             )
-            return False, stake_plan
+            return False, stake
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -696,15 +703,16 @@ class FourCastersController:
                             TELEGRAM,
                         )
                     else:
-                        maybe_notify_partial_arb_exposure(
-                            self.cache,
-                            self.logger,
-                            arb,
-                            self.bookmaker,
-                            stake,
-                            self._last_bet_error or "Bet not accepted by bookmaker",
-                            TELEGRAM,
-                        )
+                        if should_notify_failed_bet(self._last_bet_error):
+                            maybe_notify_partial_arb_exposure(
+                                self.cache,
+                                self.logger,
+                                arb,
+                                self.bookmaker,
+                                stake,
+                                self._last_bet_error or "Bet not accepted by bookmaker",
+                                TELEGRAM,
+                            )
         except KeyboardInterrupt:
             self.logger.info("4casters betting stopped by user")
         finally:

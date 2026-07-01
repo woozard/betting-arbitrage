@@ -25,9 +25,12 @@ from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, extract_spread_line_odds_from_label
 from utils.odds_watch import persist_moneyline_games
 from utils.bet_placement import (
+    REAL_MONEY_BETTING_PAUSED_MSG,
+    block_real_money_bet,
     finalize_confirmed_bet,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
+    should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
 )
@@ -2285,6 +2288,10 @@ class Sports411Controller:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        blocked = block_real_money_bet(self.logger, stake)
+        if blocked is not None:
+            self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
+            return blocked
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
 
         try:
@@ -2313,7 +2320,7 @@ class Sports411Controller:
                         self._return_to_sport_page()
                         continue
                     raise
-            return False, stake_plan
+            return False, stake
 
         except Exception as e:
             self._last_bet_error = str(e)
@@ -2325,7 +2332,7 @@ class Sports411Controller:
                 return True, stake_plan
             self.logger.error(f"Place Bet failed: {e}", exc_info=True)
             asyncio.run(send_monitoring_alert(self.website, self.account_id, e, TELEGRAM.get('arbitrage_monitoring')))
-            return False, stake_plan
+            return False, stake
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
@@ -2846,7 +2853,7 @@ class Sports411Controller:
                         f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
                     )
 
-                bet_placed, stake = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+                bet_placed, stake_used = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
 
                 if not bet_placed:
                     recovered, open_msg = self._recover_bet_from_open_bets(
@@ -2858,7 +2865,8 @@ class Sports411Controller:
                             f"{open_msg}"
                         )
                         bet_placed = True
-                    else:
+                        stake_used = stake
+                    elif should_notify_failed_bet(self._last_bet_error):
                         maybe_notify_partial_arb_exposure(
                             self.cache,
                             self.logger,
@@ -2907,7 +2915,7 @@ class Sports411Controller:
                         team_no,
                         team_name,
                         game_id,
-                        stake,
+                        stake_used,
                         moneyline_odd,
                         TELEGRAM,
                     )
