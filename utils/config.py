@@ -108,7 +108,9 @@ ACTIVE_ARB_BOOK_PAIRS = frozenset(
         "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
         "sports411:betwar,betamapola:betwar,paradisewager:betwar,"
         "sports411:lowvig,betamapola:lowvig,paradisewager:lowvig,betwar:lowvig,"
-        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et",
+        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et,"
+        "sports411:4casters,betamapola:4casters,paradisewager:4casters,"
+        "betwar:4casters,lowvig:4casters,3et:4casters",
     ).split(",")
     if part.strip() and ":" in part
 )
@@ -119,7 +121,9 @@ ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
         "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
         "sports411:betwar,betamapola:betwar,paradisewager:betwar,"
         "sports411:lowvig,betamapola:lowvig,paradisewager:lowvig,betwar:lowvig,"
-        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et",
+        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et,"
+        "sports411:4casters,betamapola:4casters,paradisewager:4casters,"
+        "betwar:4casters,lowvig:4casters,3et:4casters",
     ).split(",")
     if part.strip() and ":" in part
     for parts in [part.strip().split(":", 1)]
@@ -274,6 +278,13 @@ _4CASTERS = {
     'url': 'https://api.4casters.io',
     'bookmaker': '4casters'
 }
+FOURCASTERS = _4CASTERS
+
+FOURCASTERS_ACCOUNT = os.getenv('FOURCASTERS_ACCOUNT')
+FOURCASTERS_PASSWORD = os.getenv('FOURCASTERS_PASSWORD')
+FOURCASTERS_LABEL = os.getenv('FOURCASTERS_LABEL', 'Bettor')
+FOURCASTERS_API_BASE = os.getenv('FOURCASTERS_API_BASE', 'https://api.4casters.io')
+FOURCASTERS_MLB_LEAGUE = os.getenv('FOURCASTERS_MLB_LEAGUE', 'MLB')
 
 PLATINUMWAGER = {
     'website': 'platinumwager.com',
