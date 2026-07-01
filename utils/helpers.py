@@ -904,6 +904,59 @@ def spread_market_label(spread_value, sport: str | None = None) -> str:
     return f"spread ({line:+.1f})"
 
 
+BOOK_ALERT_LABELS = {
+    "sports411": "s411",
+    "betamapola": "amapola",
+    "paradisewager": "paradise",
+    "betwar": "betwar",
+    "lowvig": "lowvig",
+    "3et": "3et",
+    "4casters": "4casters",
+}
+
+
+def format_american_alert_odds(odds) -> str:
+    """Format American odds for compact Telegram alerts (+130, -135)."""
+    val = int(round(float(odds)))
+    if val > 0:
+        return f"+{val}"
+    return str(val)
+
+
+def format_arb_opportunity_alert(arb, spread_value=None) -> str:
+    """Compact KC Arb Alerts format.
+
+    Spread example:
+        +1.5 -135 3et
+
+        -1.5 +130 s411
+
+    Moneyline example:
+        +130 s411
+
+        -135 3et
+    """
+    book1 = BOOK_ALERT_LABELS.get(arb.team_1_bookmaker, arb.team_1_bookmaker)
+    book2 = BOOK_ALERT_LABELS.get(arb.team_2_bookmaker, arb.team_2_bookmaker)
+    odds1 = format_american_alert_odds(arb.team_1_odds)
+    odds2 = format_american_alert_odds(arb.team_2_odds)
+
+    bet_type = getattr(arb, "bet_type", None) or "moneyline"
+    if bet_type == "spread" and spread_value is not None:
+        line1 = normalize_spread_value(spread_value)
+        if line1 is None:
+            leg1 = f"{odds1} {book1}"
+            leg2 = f"{odds2} {book2}"
+        else:
+            leg1 = f"{line1:+.1f} {odds1} {book1}"
+            leg2 = f"{(-line1):+.1f} {odds2} {book2}"
+    else:
+        leg1 = f"{odds1} {book1}"
+        leg2 = f"{odds2} {book2}"
+
+    return f"{leg1}\n\n{leg2}"
+
+
 def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None]:
     """Parse handicap + American odds from a spread/run-line bet label."""
     import re

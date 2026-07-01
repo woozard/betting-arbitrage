@@ -36,6 +36,7 @@ from utils.helpers import (
     align_cross_book_moneylines,
     align_cross_book_spreads,
     spread_market_label,
+    format_arb_opportunity_alert,
 )
 from utils.timing import time_it
 from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
@@ -732,38 +733,7 @@ class ArbitrageController:
         try:
             self.logger.info("========== Arbitrage - Send Alerts (START) ==========")
 
-            bet_type = arb.bet_type
-            if bet_type == "spread":
-                market_label = spread_market_label(spread_value, arb.sport)
-                line_note = (
-                    f"Line: {float(spread_value):+.1f} / {float(-spread_value):+.1f}\n"
-                    if spread_value is not None
-                    else ""
-                )
-                bet_type_line = f"Bet Type: {market_label}\n{line_note}"
-                alert_note = "Alerts only — spread/run-line auto-betting is disabled.\n\n"
-            else:
-                bet_type_line = f"Bet Type: {bet_type}\n\n"
-                alert_note = ""
-
-            alert = (
-                f"===== Arbitrage =====\n"
-                f"Identified At: {format_utc_timestamp(identified_at)}\n"
-                f"Sport: {arb.sport}\n"
-                f"League: {arb.league}\n"
-                f"Date: {arb.game_date}\n"
-                f"Match: {arb.team_1} vs {arb.team_2}\n"
-                f"{bet_type_line}"
-                f"{alert_note}"
-                f"Team 1: {arb.team_1}\n"
-                f"Bookmaker: {arb.team_1_bookmaker}\n"
-                f"Odds: {arb.team_1_odds}\n\n"
-                f"Team 2: {arb.team_2}\n"
-                f"Bookmaker: {arb.team_2_bookmaker}\n"
-                f"Odds: {arb.team_2_odds}\n\n"
-                f"Total Probability: {arb.arb_total_prob}\n"
-                f"Estimated Profit: {arb.profit_pct}%\n"
-            )
+            alert = format_arb_opportunity_alert(arb, spread_value=spread_value)
 
             self.logger.info(f"========== Alert ==========")
             self.logger.info(alert)
