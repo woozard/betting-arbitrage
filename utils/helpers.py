@@ -924,37 +924,74 @@ def format_american_alert_odds(odds) -> str:
 
 
 def format_arb_opportunity_alert(arb, spread_value=None) -> str:
-    """Compact KC Arb Alerts format.
+    """Compact KC Arb Alerts format with market type and spread context.
 
     Spread example:
-        +1.5 -135 3et
+        Spread — run_line (+1.5)
+        St. Louis Cardinals vs Atlanta Braves | +1.06%
 
-        -1.5 +130 s411
+        Cardinals +1.5 -135 3et
+
+        Braves -1.5 +130 s411
 
     Moneyline example:
-        +130 s411
+        ML
+        St. Louis Cardinals vs Atlanta Braves | +1.06%
 
-        -135 3et
+        Cardinals +120 4casters
+
+        Braves -115 betwar
     """
-    book1 = BOOK_ALERT_LABELS.get(arb.team_1_bookmaker, arb.team_1_bookmaker)
-    book2 = BOOK_ALERT_LABELS.get(arb.team_2_bookmaker, arb.team_2_bookmaker)
-    odds1 = format_american_alert_odds(arb.team_1_odds)
-    odds2 = format_american_alert_odds(arb.team_2_odds)
+    def _attr(name, default=None):
+        if isinstance(arb, dict):
+            return arb.get(name, default)
+        return getattr(arb, name, default)
 
-    bet_type = getattr(arb, "bet_type", None) or "moneyline"
+    team_1 = _attr("team_1") or "team_1"
+    team_2 = _attr("team_2") or "team_2"
+    sport = _attr("sport")
+    bet_type = _attr("bet_type") or "moneyline"
+    profit_pct = _attr("profit_pct")
+    if spread_value is None:
+        spread_value = _attr("spread_value")
+
+    book1 = BOOK_ALERT_LABELS.get(_attr("team_1_bookmaker"), _attr("team_1_bookmaker"))
+    book2 = BOOK_ALERT_LABELS.get(_attr("team_2_bookmaker"), _attr("team_2_bookmaker"))
+    odds1 = format_american_alert_odds(_attr("team_1_odds"))
+    odds2 = format_american_alert_odds(_attr("team_2_odds"))
+
+    short_1 = team_1.split()[-1] if team_1 else "team_1"
+    short_2 = team_2.split()[-1] if team_2 else "team_2"
+
+    header_lines = []
+    if bet_type == "spread":
+        market = spread_market_label(spread_value, sport)
+        header_lines.append(f"Spread — {market}")
+    else:
+        header_lines.append("ML")
+
+    matchup_line = f"{team_1} vs {team_2}"
+    if profit_pct is not None:
+        try:
+            matchup_line += f" | +{float(profit_pct):.2f}%"
+        except (TypeError, ValueError):
+            pass
+    header_lines.append(matchup_line)
+    header_lines.append("")
+
     if bet_type == "spread" and spread_value is not None:
         line1 = normalize_spread_value(spread_value)
         if line1 is None:
-            leg1 = f"{odds1} {book1}"
-            leg2 = f"{odds2} {book2}"
+            leg1 = f"{short_1} {odds1} {book1}"
+            leg2 = f"{short_2} {odds2} {book2}"
         else:
-            leg1 = f"{line1:+.1f} {odds1} {book1}"
-            leg2 = f"{(-line1):+.1f} {odds2} {book2}"
+            leg1 = f"{short_1} {line1:+.1f} {odds1} {book1}"
+            leg2 = f"{short_2} {(-line1):+.1f} {odds2} {book2}"
     else:
-        leg1 = f"{odds1} {book1}"
-        leg2 = f"{odds2} {book2}"
+        leg1 = f"{short_1} {odds1} {book1}"
+        leg2 = f"{short_2} {odds2} {book2}"
 
-    return f"{leg1}\n\n{leg2}"
+    return "\n".join(header_lines + [leg1, "", leg2])
 
 
 def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None]:
