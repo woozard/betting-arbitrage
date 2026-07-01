@@ -10,7 +10,17 @@ from sqlalchemy.exc import IntegrityError
 from database.config import __get_db1_session__
 from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
-from utils.config import TELEGRAM, SEQUENTIAL_ARB_BETTING, is_active_arb_pair, ARB_MAX_TOTAL_PROB, TELEGRAM_ALERTS_ASYNC
+from utils.config import (
+    TELEGRAM,
+    SEQUENTIAL_ARB_BETTING,
+    is_active_arb_pair,
+    arb_max_total_prob_for_bet_type,
+    min_arb_profit_pct_for_bet_type,
+    TELEGRAM_ALERTS_ASYNC,
+    SPREAD_ARB_MAX_PROFIT_PCT,
+    SPREAD_ODDS_MAX_AGE_SECONDS,
+    SPREAD_ODDS_MAX_GAP_SECONDS,
+)
 from utils.logger import Logger
 from utils.helpers import (
     send_telegram_alert,
@@ -20,8 +30,12 @@ from utils.helpers import (
     parse_game_datetime,
     format_utc_timestamp,
     is_plausible_moneyline_pair,
+    is_plausible_spread_pair,
+    spread_odds_rows_fresh_for_arb,
     normalize_team,
     align_cross_book_moneylines,
+    align_cross_book_spreads,
+    spread_market_label,
 )
 from utils.timing import time_it
 from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
@@ -63,6 +77,42 @@ class ArbitrageController:
         if not odds_1 or not odds_2:
             return None
         return self.implied_prob(odds_1) + self.implied_prob(odds_2)
+
+    @staticmethod
+    def _spread_cross_book_trusted(
+        leg_1_odds,
+        leg_2_odds,
+        same_side_a,
+        same_side_b,
+        *,
+        max_same_side_gap: float = 100,
+        max_profit_pct: float | None = None,
+        arb_total=None,
+    ) -> bool:
+        """Reject spread arbs when books disagree on the same side or profit is unrealistic."""
+        if max_profit_pct is None:
+            max_profit_pct = SPREAD_ARB_MAX_PROFIT_PCT
+        try:
+            if same_side_a is not None and same_side_b is not None:
+                if abs(float(same_side_a) - float(same_side_b)) > max_same_side_gap:
+                    return False
+        except (TypeError, ValueError):
+            pass
+
+        if arb_total is None:
+            return True
+
+        profit_pct = float((Decimal(1) - arb_total) * 100)
+        return profit_pct <= max_profit_pct
+
+    @staticmethod
+    def _spread_pair_fresh_enough(o1: dict, o2: dict) -> bool:
+        return spread_odds_rows_fresh_for_arb(
+            o1.get("created_at"),
+            o2.get("created_at"),
+            max_age_seconds=SPREAD_ODDS_MAX_AGE_SECONDS,
+            max_gap_seconds=SPREAD_ODDS_MAX_GAP_SECONDS,
+        )
 
     # --------------------------------------------------------
     # Long Running
@@ -170,111 +220,254 @@ class ArbitrageController:
 
         return list(latest.values())
 
+    def get_recent_spread_odds_from_db(
+        self,
+        minutes: int = 60,
+        *,
+        keep_created_at: bool = False,
+        require_plausible_spread: bool = True,
+    ):
+        """Pull recent spread/run-line odds from DB."""
+        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+        rows = (
+            self.db.query(ArbitrageOdds)
+            .filter(ArbitrageOdds.bet_type == "spread")
+            .filter(ArbitrageOdds.created_at >= cutoff)
+            .order_by(ArbitrageOdds.created_at.desc())
+            .all()
+        )
+
+        results = []
+        for r in rows:
+            spread_1 = float(r.spread_team_1) if r.spread_team_1 is not None else None
+            spread_2 = float(r.spread_team_2) if r.spread_team_2 is not None else None
+            spread_value = float(r.spread_value) if r.spread_value is not None else None
+            if require_plausible_spread and not is_plausible_spread_pair(
+                spread_value, spread_1, spread_2
+            ):
+                continue
+            results.append({
+                "bookmaker": r.bookmaker,
+                "bet_type": r.bet_type,
+                "game_id": r.game_id,
+                "team_1": r.team_1,
+                "team_2": r.team_2,
+                "spread_team_1": spread_1,
+                "spread_team_2": spread_2,
+                "spread_value": spread_value,
+                "sport": r.sport,
+                "league": r.league,
+                "game_datetime": r.game_datetime.isoformat() if r.game_datetime else None,
+                "created_at": r.created_at,
+            })
+
+        attach_canonical_game_ids(self.db, results)
+
+        latest = {}
+        for o in results:
+            key = self._odds_dedup_key(o)
+            if key not in latest:
+                latest[key] = o
+            else:
+                latest[key] = self._prefer_odds_row(o, latest[key])
+
+        if not keep_created_at:
+            for o in latest.values():
+                o.pop("created_at", None)
+
+        return list(latest.values())
+
     # --------------------------------------------------------
     # Scan Opportunities
     # --------------------------------------------------------
+    def _scan_moneyline_opportunities(self):
+        all_odds = self.get_recent_moneyline_odds_from_db(minutes=60)
+        return self._scan_cross_book_opportunities(
+            all_odds,
+            bet_type="moneyline",
+            align_fn=align_cross_book_moneylines,
+        )
+
+    def _scan_spread_opportunities(self):
+        all_odds = self.get_recent_spread_odds_from_db(
+            minutes=60,
+            keep_created_at=True,
+        )
+        return self._scan_cross_book_opportunities(
+            all_odds,
+            bet_type="spread",
+            align_fn=align_cross_book_spreads,
+        )
+
+    def _scan_cross_book_opportunities(self, all_odds, bet_type: str, align_fn):
+        matches = {}
+        arb_found = 0
+        best_arb = None
+        best_match = None
+        max_total_prob = Decimal(str(arb_max_total_prob_for_bet_type(bet_type)))
+        min_profit_pct = min_arb_profit_pct_for_bet_type(bet_type)
+
+        if not all_odds:
+            return {
+                "bet_type": bet_type,
+                "odds_count": 0,
+                "match_count": 0,
+                "arb_found": 0,
+                "best_arb": None,
+                "best_match": None,
+                "min_profit_pct": min_profit_pct,
+                "max_total_prob": float(max_total_prob),
+            }
+
+        for o in all_odds:
+            key = self._matchup_group_key(o)
+            matches.setdefault(key, []).append(o)
+
+        for odds_group in matches.values():
+            for i in range(len(odds_group)):
+                for j in range(i + 1, len(odds_group)):
+                    o1 = odds_group[i]
+                    o2 = odds_group[j]
+
+                    if o1["bookmaker"] == o2["bookmaker"]:
+                        continue
+
+                    if not self._allowed_arb_book_pair(o1["bookmaker"], o2["bookmaker"]):
+                        continue
+
+                    aligned = align_fn(o1, o2)
+                    if not aligned:
+                        continue
+
+                    if bet_type == "spread":
+                        a_t1, a_t2, b_t1, b_t2, spread_value = aligned
+                        if not self._spread_pair_fresh_enough(o1, o2):
+                            continue
+                    else:
+                        a_t1, a_t2, b_t1, b_t2 = aligned
+                        spread_value = None
+
+                    arb_total = self.__calc_arb_total(a_t1, b_t2)
+                    if arb_total:
+                        if best_arb is None or arb_total < best_arb:
+                            best_arb = arb_total
+                            best_match = {
+                                "bet_type": bet_type,
+                                "spread_value": spread_value,
+                                "sport": o1.get("sport"),
+                                "team_1": o1["team_1"],
+                                "team_2": o1["team_2"],
+                                "book_1": o1["bookmaker"],
+                                "odds_1": a_t1,
+                                "book_2": o2["bookmaker"],
+                                "odds_2": b_t2,
+                            }
+                        if arb_total < max_total_prob:
+                            if bet_type != "spread" or self._spread_cross_book_trusted(
+                                a_t1, b_t2, a_t1, b_t1, arb_total=arb_total
+                            ):
+                                arb_found += 1
+                                self.__insert_arbitrage(
+                                    o1,
+                                    o2,
+                                    "o1",
+                                    "o2",
+                                    arb_total,
+                                    team_1_odds=a_t1,
+                                    team_2_odds=b_t2,
+                                    bet_type=bet_type,
+                                    spread_value=spread_value,
+                                )
+
+                    arb_total = self.__calc_arb_total(b_t1, a_t2)
+                    if arb_total:
+                        if best_arb is None or arb_total < best_arb:
+                            best_arb = arb_total
+                            best_match = {
+                                "bet_type": bet_type,
+                                "spread_value": spread_value,
+                                "sport": o1.get("sport"),
+                                "team_1": o1["team_1"],
+                                "team_2": o1["team_2"],
+                                "book_1": o2["bookmaker"],
+                                "odds_1": b_t1,
+                                "book_2": o1["bookmaker"],
+                                "odds_2": a_t2,
+                            }
+                        if arb_total < max_total_prob:
+                            if bet_type != "spread" or self._spread_cross_book_trusted(
+                                b_t1, a_t2, b_t1, a_t1, arb_total=arb_total
+                            ):
+                                arb_found += 1
+                                self.__insert_arbitrage(
+                                    o1,
+                                    o2,
+                                    "o2",
+                                    "o1",
+                                    arb_total,
+                                    team_1_odds=b_t1,
+                                    team_2_odds=a_t2,
+                                    bet_type=bet_type,
+                                    spread_value=spread_value,
+                                )
+
+        return {
+            "bet_type": bet_type,
+            "odds_count": len(all_odds),
+            "match_count": len(matches),
+            "arb_found": arb_found,
+            "best_arb": best_arb,
+            "best_match": best_match,
+            "linked": sum(1 for o in all_odds if o.get("canonical_game_id")),
+            "min_profit_pct": min_profit_pct,
+            "max_total_prob": float(max_total_prob),
+        }
+
     @time_it
     def scan_opportunities(self):
         self.logger.info("========== Arbitrage - Scan Opportunities (START) ==========")
         try:
-            # Pull from DB (not Redis cache) so we compare odds persisted by different controllers
-            all_odds = self.get_recent_moneyline_odds_from_db(minutes=60)
+            scan_results = [
+                self._scan_moneyline_opportunities(),
+                self._scan_spread_opportunities(),
+            ]
 
-            matches = {}
-            arb_found = 0
-
-            if all_odds:
-                for o in all_odds:
-                    key = self._matchup_group_key(o)
-                    matches.setdefault(key, []).append(o)
-
-                best_arb = None
-                best_match = None
-                for group_key, odds_group in matches.items():
-                    for i in range(len(odds_group)):
-                        for j in range(i + 1, len(odds_group)):
-                            o1 = odds_group[i]
-                            o2 = odds_group[j]
-
-                            if o1["bookmaker"] == o2["bookmaker"]:
-                                continue
-
-                            if not self._allowed_arb_book_pair(
-                                o1["bookmaker"], o2["bookmaker"]
-                            ):
-                                continue
-
-                            aligned = align_cross_book_moneylines(o1, o2)
-                            if not aligned:
-                                continue
-                            a_t1, a_t2, b_t1, b_t2 = aligned
-
-                            # Case 1: bet team_1 on o1's book, team_2 on o2's book
-                            arb_total = self.__calc_arb_total(a_t1, b_t2)
-                            if arb_total:
-                                if best_arb is None or arb_total < best_arb:
-                                    best_arb = arb_total
-                                    best_match = {
-                                        "team_1": o1["team_1"],
-                                        "team_2": o1["team_2"],
-                                        "book_1": o1["bookmaker"],
-                                        "odds_1": a_t1,
-                                        "book_2": o2["bookmaker"],
-                                        "odds_2": b_t2,
-                                    }
-                                if arb_total < Decimal(str(ARB_MAX_TOTAL_PROB)):
-                                    arb_found += 1
-                                    self.__insert_arbitrage(
-                                        o1, o2, "o1", "o2", arb_total,
-                                        team_1_odds=a_t1, team_2_odds=b_t2,
-                                    )
-
-                            # Case 2: bet team_1 on o2's book, team_2 on o1's book
-                            arb_total = self.__calc_arb_total(b_t1, a_t2)
-                            if arb_total:
-                                if best_arb is None or arb_total < best_arb:
-                                    best_arb = arb_total
-                                    best_match = {
-                                        "team_1": o1["team_1"],
-                                        "team_2": o1["team_2"],
-                                        "book_1": o2["bookmaker"],
-                                        "odds_1": b_t1,
-                                        "book_2": o1["bookmaker"],
-                                        "odds_2": a_t2,
-                                    }
-                                if arb_total < Decimal(str(ARB_MAX_TOTAL_PROB)):
-                                    arb_found += 1
-                                    self.__insert_arbitrage(
-                                        o1, o2, "o2", "o1", arb_total,
-                                        team_1_odds=b_t1, team_2_odds=a_t2,
-                                    )
-
-                msg = f"Odds: {len(all_odds)} - Matches: {len(matches)} - Arbs: {arb_found}"
-                linked = sum(1 for o in all_odds if o.get("canonical_game_id"))
-                if linked:
-                    msg += f" (canonical-linked: {linked}/{len(all_odds)})"
-                if arb_found == 0 and best_arb is not None:
-                    msg += f" (closest total prob: {float(best_arb):.4f})"
+            for result in scan_results:
+                bet_type = result["bet_type"]
+                msg = (
+                    f"{bet_type.title()}: Odds: {result['odds_count']} - "
+                    f"Matches: {result['match_count']} - Arbs: {result['arb_found']} "
+                    f"(min profit {result['min_profit_pct']:.2f}%)"
+                )
+                if result.get("linked"):
+                    msg += f" (canonical-linked: {result['linked']}/{result['odds_count']})"
+                if result["arb_found"] == 0 and result["best_arb"] is not None:
+                    msg += f" (closest total prob: {float(result['best_arb']):.4f})"
                 self.logger.info(msg)
 
-                # Log near-miss opportunities at or above break-even but below 1.02
+                best_arb = result["best_arb"]
+                best_match = result["best_match"]
+                close_ceiling = min(Decimal("1.02"), Decimal(str(result["max_total_prob"])) + Decimal("0.01"))
                 if (
                     best_arb is not None
-                    and Decimal("1") <= best_arb < Decimal("1.02")
+                    and Decimal("1") <= best_arb < close_ceiling
                     and best_match is not None
                 ):
+                    market = best_match.get("bet_type", bet_type)
+                    spread_value = best_match.get("spread_value")
+                    market_label = (
+                        spread_market_label(spread_value, best_match.get("sport"))
+                        if market == "spread"
+                        else market
+                    )
                     self.logger.info("========== Close Arb Opportunity (START) ==========")
                     self.logger.info(
-                        f"Match: {best_match['team_1']} vs {best_match['team_2']} | Total Prob: {float(best_arb):.4f}"
+                        f"Market: {market_label} | Match: {best_match['team_1']} vs "
+                        f"{best_match['team_2']} | Total Prob: {float(best_arb):.4f}"
                     )
                     self.logger.info(f"  {best_match['book_1']}: {best_match['odds_1']}")
                     self.logger.info(f"  {best_match['book_2']}: {best_match['odds_2']}")
                     self.logger.info("========== Close Arb Opportunity (END) ==========")
-
-            else:
-                self.logger.info(
-                    f"Odds: 0 - Matches: 0 - Arbs: 0"
-                )
 
             self.db.commit()
 
@@ -294,10 +487,28 @@ class ArbitrageController:
         t2 = o1 if t2_from == "o1" else o2
         return t1, t2
 
-    def __build_arb_data(self, o1, o2, t1_from, t2_from, arb_total, team_1_odds=None, team_2_odds=None):
+    def __build_arb_data(
+        self,
+        o1,
+        o2,
+        t1_from,
+        t2_from,
+        arb_total,
+        team_1_odds=None,
+        team_2_odds=None,
+        bet_type: str = "moneyline",
+        spread_value=None,
+    ):
         t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
         game_dt = parse_game_datetime(o1.get("game_datetime"))
         game_date = game_dt.date() if game_dt else datetime.utcnow().date()
+
+        if bet_type == "spread":
+            default_t1_odds = t1.get("spread_team_1")
+            default_t2_odds = t2.get("spread_team_2")
+        else:
+            default_t1_odds = t1.get("moneyline_team_1")
+            default_t2_odds = t2.get("moneyline_team_2")
 
         return {
             "sport": o1["sport"],
@@ -309,17 +520,18 @@ class ArbitrageController:
             "team_1_bookmaker": t1["bookmaker"],
             "team_1_game_id": t1["game_id"],
             "team_1_odds": float(
-                team_1_odds if team_1_odds is not None else t1["moneyline_team_1"]
+                team_1_odds if team_1_odds is not None else default_t1_odds
             ),
 
             "team_2": o1["team_2"],
             "team_2_bookmaker": t2["bookmaker"],
             "team_2_game_id": t2["game_id"],
             "team_2_odds": float(
-                team_2_odds if team_2_odds is not None else t2["moneyline_team_2"]
+                team_2_odds if team_2_odds is not None else default_t2_odds
             ),
 
-            "bet_type": "moneyline",
+            "bet_type": bet_type,
+            "spread_value": spread_value,
             "arb_total_prob": float(arb_total),
             "profit_pct": float(round((Decimal(1) - arb_total) * 100, 2)),
             "read": False,
@@ -327,14 +539,26 @@ class ArbitrageController:
         }
 
     def __store_arbitrage_cache(self, arb_data):
+        bet_type = arb_data.get("bet_type", "moneyline")
         self.cache.add_arbitrage(
-            arb_data["team_1_bookmaker"], "moneyline", arb_data["team_1_game_id"], arb_data
+            arb_data["team_1_bookmaker"], bet_type, arb_data["team_1_game_id"], arb_data
         )
         self.cache.add_arbitrage(
-            arb_data["team_2_bookmaker"], "moneyline", arb_data["team_2_game_id"], arb_data
+            arb_data["team_2_bookmaker"], bet_type, arb_data["team_2_game_id"], arb_data
         )
 
-    def __insert_arbitrage(self, new_odds, existing, t1_from, t2_from, arb_total, team_1_odds=None, team_2_odds=None):
+    def __insert_arbitrage(
+        self,
+        new_odds,
+        existing,
+        t1_from,
+        t2_from,
+        arb_total,
+        team_1_odds=None,
+        team_2_odds=None,
+        bet_type: str = "moneyline",
+        spread_value=None,
+    ):
         o1 = new_odds
         o2 = existing
         t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
@@ -349,25 +573,46 @@ class ArbitrageController:
         game_dt = parse_game_datetime(o1.get("game_datetime"))
         game_date = game_dt.date() if game_dt else datetime.utcnow().date()
         if self.cache.is_arb_scan_locked(
-            o1["team_1"], o1["team_2"], t1["bookmaker"], t2["bookmaker"], str(game_date)
+            o1["team_1"],
+            o1["team_2"],
+            t1["bookmaker"],
+            t2["bookmaker"],
+            str(game_date),
+            bet_type=bet_type,
+            spread_value=spread_value,
         ):
             self.logger.info(
                 f"Skipping arb (scan locked in Redis after prior leg) - "
-                f"{o1['team_1']} vs {o1['team_2']} | {t1['bookmaker']} vs {t2['bookmaker']}"
+                f"{bet_type} {o1['team_1']} vs {o1['team_2']} | "
+                f"{t1['bookmaker']} vs {t2['bookmaker']}"
             )
             return None
 
         arb_data = self.__build_arb_data(
-            o1, o2, t1_from, t2_from, arb_total,
-            team_1_odds=team_1_odds, team_2_odds=team_2_odds,
+            o1,
+            o2,
+            t1_from,
+            t2_from,
+            arb_total,
+            team_1_odds=team_1_odds,
+            team_2_odds=team_2_odds,
+            bet_type=bet_type,
+            spread_value=spread_value,
         )
 
         try:
+            if bet_type == "spread":
+                default_t1_odds = t1.get("spread_team_1")
+                default_t2_odds = t2.get("spread_team_2")
+            else:
+                default_t1_odds = t1.get("moneyline_team_1")
+                default_t2_odds = t2.get("moneyline_team_2")
+
             t1_odds = Decimal(
-                team_1_odds if team_1_odds is not None else t1["moneyline_team_1"]
+                team_1_odds if team_1_odds is not None else default_t1_odds
             )
             t2_odds = Decimal(
-                team_2_odds if team_2_odds is not None else t2["moneyline_team_2"]
+                team_2_odds if team_2_odds is not None else default_t2_odds
             )
             profit_pct = round((Decimal(1) - arb_total) * 100, 2)
             game_dt = parse_game_datetime(o1.get("game_datetime"))
@@ -379,7 +624,7 @@ class ArbitrageController:
 
                 team_1=o1["team_1"],
                 team_2=o1["team_2"],
-                bet_type="moneyline",
+                bet_type=bet_type,
 
                 team_1_bookmaker=t1["bookmaker"],
                 team_1_game_id=t1["game_id"],
@@ -397,10 +642,15 @@ class ArbitrageController:
             self.db.add(arb)
             self.db.flush()
 
+            market_label = (
+                spread_market_label(spread_value, o1.get("sport"))
+                if bet_type == "spread"
+                else bet_type
+            )
             self.logger.info(
-                f"DB - Arbitrage Saved - "
+                f"DB - Arbitrage Saved - {market_label} - "
                 f"{t1['bookmaker']} vs {t2['bookmaker']} - "
-                f"{o1['team_1']} vs {o1['team_2']}" 
+                f"{o1['team_1']} vs {o1['team_2']}"
             )
 
             self.__store_arbitrage_cache(arb_data)
@@ -411,19 +661,24 @@ class ArbitrageController:
                 arb.team_1_bookmaker,
                 arb.team_2_bookmaker,
                 game_date_str,
+                bet_type=bet_type,
+                spread_value=spread_value,
             ):
                 self.logger.info(
-                    f"Skipping duplicate arb opportunity Telegram alert - {arb.team_1} vs {arb.team_2} | "
+                    f"Skipping duplicate arb opportunity Telegram alert - "
+                    f"{market_label} {arb.team_1} vs {arb.team_2} | "
                     f"{arb.team_1_bookmaker} vs {arb.team_2_bookmaker}"
                 )
             else:
-                self.__send_alert(arb, arb_data.get("identified_at"))
+                self.__send_alert(arb, arb_data.get("identified_at"), spread_value=spread_value)
                 self.cache.mark_arb_opportunity_alert_sent(
                     arb.team_1,
                     arb.team_2,
                     arb.team_1_bookmaker,
                     arb.team_2_bookmaker,
                     game_date_str,
+                    bet_type=bet_type,
+                    spread_value=spread_value,
                 )
 
             return arb
@@ -470,9 +725,23 @@ class ArbitrageController:
     # --------------------------------------------------------
     # Send Alert
     # --------------------------------------------------------
-    def __send_alert(self, arb, identified_at=None):
+    def __send_alert(self, arb, identified_at=None, spread_value=None):
         try:
             self.logger.info("========== Arbitrage - Send Alerts (START) ==========")
+
+            bet_type = arb.bet_type
+            if bet_type == "spread":
+                market_label = spread_market_label(spread_value, arb.sport)
+                line_note = (
+                    f"Line: {float(spread_value):+.1f} / {float(-spread_value):+.1f}\n"
+                    if spread_value is not None
+                    else ""
+                )
+                bet_type_line = f"Bet Type: {market_label}\n{line_note}"
+                alert_note = "Alerts only — spread/run-line auto-betting is disabled.\n\n"
+            else:
+                bet_type_line = f"Bet Type: {bet_type}\n\n"
+                alert_note = ""
 
             alert = (
                 f"===== Arbitrage =====\n"
@@ -481,7 +750,8 @@ class ArbitrageController:
                 f"League: {arb.league}\n"
                 f"Date: {arb.game_date}\n"
                 f"Match: {arb.team_1} vs {arb.team_2}\n"
-                f"Bet Type: {arb.bet_type}\n\n"
+                f"{bet_type_line}"
+                f"{alert_note}"
                 f"Team 1: {arb.team_1}\n"
                 f"Bookmaker: {arb.team_1_bookmaker}\n"
                 f"Odds: {arb.team_1_odds}\n\n"

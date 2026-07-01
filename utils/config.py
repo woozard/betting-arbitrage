@@ -57,19 +57,57 @@ TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',
 )
 SECOND_LEG_ODDS_TOLERANCE = int(os.getenv('SECOND_LEG_ODDS_TOLERANCE', '2'))
+
+
+def profit_pct_to_max_total_prob(profit_pct: float) -> float:
+    """Convert min profit % to max total implied probability for arb detection."""
+    return 1.0 - (profit_pct / 100.0)
+
+
 MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '0'))
 if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
     ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))
 elif MIN_ARB_PROFIT_PCT != 0:
-    ARB_MAX_TOTAL_PROB = 1.0 - (MIN_ARB_PROFIT_PCT / 100.0)
+    ARB_MAX_TOTAL_PROB = profit_pct_to_max_total_prob(MIN_ARB_PROFIT_PCT)
 else:
     ARB_MAX_TOTAL_PROB = 1.0
+
+# Spread/run-line alerts-only: wider threshold by default (-1.01% min profit).
+MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '-1.01'))
+if os.getenv('ARB_MAX_TOTAL_PROB_SPREAD') is not None:
+    ARB_MAX_TOTAL_PROB_SPREAD = float(os.getenv('ARB_MAX_TOTAL_PROB_SPREAD'))
+else:
+    ARB_MAX_TOTAL_PROB_SPREAD = profit_pct_to_max_total_prob(MIN_ARB_PROFIT_PCT_SPREAD)
+
+
+def arb_max_total_prob_for_bet_type(bet_type: str) -> float:
+    if (bet_type or 'moneyline').lower() == 'spread':
+        return ARB_MAX_TOTAL_PROB_SPREAD
+    return ARB_MAX_TOTAL_PROB
+
+
+def min_arb_profit_pct_for_bet_type(bet_type: str) -> float:
+    if (bet_type or 'moneyline').lower() == 'spread':
+        return MIN_ARB_PROFIT_PCT_SPREAD
+    return MIN_ARB_PROFIT_PCT
+
+
+# Odds watch — shared defaults (ML + spread); override per-book via env if needed.
+ODDS_WATCH_POLL_SECONDS = float(os.getenv("ODDS_WATCH_POLL_SEC", "5"))
+ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("ODDS_WATCH_FORCE_SCAN_SEC", "5"))
+
+# Spread arb sanity gates
+SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "3.0"))
+SPREAD_ODDS_MAX_AGE_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_AGE_SECONDS", "600"))
+SPREAD_ODDS_MAX_GAP_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_GAP_SECONDS", "120"))
 ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
         "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
-        "sports411:betwar,betamapola:betwar,paradisewager:betwar",
+        "sports411:betwar,betamapola:betwar,paradisewager:betwar,"
+        "sports411:lowvig,betamapola:lowvig,paradisewager:lowvig,betwar:lowvig,"
+        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et",
     ).split(",")
     if part.strip() and ":" in part
 )
@@ -78,7 +116,9 @@ ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
         "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
-        "sports411:betwar,betamapola:betwar,paradisewager:betwar",
+        "sports411:betwar,betamapola:betwar,paradisewager:betwar,"
+        "sports411:lowvig,betamapola:lowvig,paradisewager:lowvig,betwar:lowvig,"
+        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et",
     ).split(",")
     if part.strip() and ":" in part
     for parts in [part.strip().split(":", 1)]
@@ -135,6 +175,37 @@ ODDSMARKET_WS_PREMATCH_URL = os.getenv('ODDSMARKET_WS_PREMATCH_URL')
 ODDSMARKET_WS_LIVE_URL = os.getenv('ODDSMARKET_WS_LIVE_URL')
 
 # Proxy
+BRIGHTDATA_CUSTOMER = os.getenv('BRIGHTDATA_CUSTOMER', 'hl_70fad530')
+BRIGHTDATA_ZONE_PASSWORD = os.getenv('BRIGHTDATA_ZONE_PASSWORD', 'truzviha7wip')
+BRIGHTDATA_PROXY_ZONE = os.getenv('BRIGHTDATA_PROXY_ZONE', 'arbitrage_bot')
+# Scraping Browser / Browser API zone (NOT the same as proxy zone — create in Bright Data dashboard)
+BRIGHTDATA_BROWSER_ZONE = os.getenv('BRIGHTDATA_BROWSER_ZONE')
+
+
+def brightdata_selenium_endpoint(zone: str = None) -> str | None:
+    """Selenium Remote URL for Bright Data Browser API (port 9515)."""
+    explicit = os.getenv("BRIGHTDATA_SELENIUM_URL")
+    if explicit:
+        return explicit
+    z = zone or BRIGHTDATA_BROWSER_ZONE
+    if not z or not BRIGHTDATA_ZONE_PASSWORD:
+        return None
+    auth = f"brd-customer-{BRIGHTDATA_CUSTOMER}-zone-{z}:{BRIGHTDATA_ZONE_PASSWORD}"
+    return f"https://{auth}@brd.superproxy.io:9515"
+
+
+def brightdata_cdp_endpoint(zone: str = None) -> str | None:
+    """Playwright/Puppeteer CDP URL for Bright Data Browser API (port 9222)."""
+    explicit = os.getenv("BRIGHTDATA_SBR_CDP")
+    if explicit:
+        return explicit
+    z = zone or BRIGHTDATA_BROWSER_ZONE
+    if not z or not BRIGHTDATA_ZONE_PASSWORD:
+        return None
+    auth = f"brd-customer-{BRIGHTDATA_CUSTOMER}-zone-{z}:{BRIGHTDATA_ZONE_PASSWORD}"
+    return f"wss://{auth}@brd.superproxy.io:9222"
+
+
 PROXY1 = {
     'host': os.getenv('PROXY1_HOST'),
     'port': os.getenv('PROXY1_PORT')
@@ -173,6 +244,16 @@ BETAMAPOLA = {
 BETAMAPOLA_ACCOUNT = os.getenv('BETAMAPOLA_ACCOUNT')
 BETAMAPOLA_PASSWORD = os.getenv('BETAMAPOLA_PASSWORD')
 BETAMAPOLA_LABEL = os.getenv('BETAMAPOLA_LABEL', 'Bettor')
+
+LOWVIG = {
+    'website': 'lowvig.ag',
+    'url': 'https://www.lowvig.ag',
+    'bookmaker': 'lowvig',
+}
+
+LOWVIG_ACCOUNT = os.getenv('LOWVIG_ACCOUNT')
+LOWVIG_PASSWORD = os.getenv('LOWVIG_PASSWORD')
+LOWVIG_LABEL = os.getenv('LOWVIG_LABEL', 'Bettor')
 
 PARADISEWAGER = {
     'website': 'paradisewager.com',
@@ -424,6 +505,18 @@ BETWAR = {
 BETWAR_ACCOUNT = os.getenv('BETWAR_ACCOUNT')
 BETWAR_PASSWORD = os.getenv('BETWAR_PASSWORD')
 BETWAR_LABEL = os.getenv('BETWAR_LABEL', 'Bettor')
+
+THREEET = {
+    'website': '3et.com',
+    'url': 'https://www.3et.com',
+    'bookmaker': '3et',
+}
+
+THREEET_ACCOUNT = os.getenv('THREEET_ACCOUNT')
+THREEET_PASSWORD = os.getenv('THREEET_PASSWORD')
+THREEET_LABEL = os.getenv('THREEET_LABEL', 'Bettor')
+THREEET_API_BASE = os.getenv('THREEET_API_BASE', 'https://sports.3et.com')
+THREEET_MLB_COMPETITION_ID = int(os.getenv('THREEET_MLB_COMPETITION_ID', '4309'))
 
 EBET2 = {
     'website': 'ebet2.com',

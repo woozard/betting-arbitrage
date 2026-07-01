@@ -121,11 +121,14 @@ class ArbitrageCache:
         self.redis.delete(key)
 
     @staticmethod
-    def matchup_pair_key(team_1, team_2, book_1, book_2, game_date=None):
+    def matchup_pair_key(team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None):
         teams = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
         books = tuple(sorted([(book_1 or "").strip().lower(), (book_2 or "").strip().lower()]))
         date = str(game_date or "")[:10]
-        return f"{date}:{teams[0]}:{teams[1]}:{books[0]}:{books[1]}"
+        bt = (bet_type or "moneyline").strip().lower()
+        if bt == "spread" and spread_value is not None:
+            return f"{date}:{teams[0]}:{teams[1]}:{books[0]}:{books[1]}:{bt}:{spread_value}"
+        return f"{date}:{teams[0]}:{teams[1]}:{books[0]}:{books[1]}:{bt}"
 
     @staticmethod
     def parse_matchup_pair_key(pair_key):
@@ -152,17 +155,23 @@ class ArbitrageCache:
     def _bet_confirmed_alert_key(self, bookmaker, bet_type, game_id):
         return f"bet_confirmed_alert_sent:{bookmaker}:{bet_type}:{game_id}"
 
-    def is_arb_scan_locked(self, team_1, team_2, book_1, book_2, game_date=None):
+    def is_arb_scan_locked(self, team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None):
         """Stop surfacing NEW arb alerts for this event + bookmaker pair."""
-        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        pair_key = self.matchup_pair_key(
+            team_1, team_2, book_1, book_2, game_date, bet_type=bet_type, spread_value=spread_value
+        )
         return bool(self.redis.get(self._arb_scan_locked_key(pair_key)))
 
-    def lock_arb_scan(self, team_1, team_2, book_1, book_2, game_date=None):
-        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    def lock_arb_scan(self, team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None):
+        pair_key = self.matchup_pair_key(
+            team_1, team_2, book_1, book_2, game_date, bet_type=bet_type, spread_value=spread_value
+        )
         self.redis.set(self._arb_scan_locked_key(pair_key), {"locked_at": "now"}, ttl=self.lock_ttl)
 
-    def unlock_arb_scan(self, team_1, team_2, book_1, book_2, game_date=None):
-        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    def unlock_arb_scan(self, team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None):
+        pair_key = self.matchup_pair_key(
+            team_1, team_2, book_1, book_2, game_date, bet_type=bet_type, spread_value=spread_value
+        )
         self.redis.delete(self._arb_scan_locked_key(pair_key))
 
     def clear_leg_placed(self, bookmaker, bet_type, game_id):
@@ -179,13 +188,21 @@ class ArbitrageCache:
             ttl=self.lock_ttl,
         )
 
-    def arb_opportunity_alert_already_sent(self, team_1, team_2, book_1, book_2, game_date=None):
+    def arb_opportunity_alert_already_sent(
+        self, team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None
+    ):
         """Scanner ===== Arbitrage ===== Telegram dedup (per event + book pair per day)."""
-        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+        pair_key = self.matchup_pair_key(
+            team_1, team_2, book_1, book_2, game_date, bet_type=bet_type, spread_value=spread_value
+        )
         return bool(self.redis.get(self._arb_opportunity_alert_key(pair_key)))
 
-    def mark_arb_opportunity_alert_sent(self, team_1, team_2, book_1, book_2, game_date=None):
-        pair_key = self.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    def mark_arb_opportunity_alert_sent(
+        self, team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None
+    ):
+        pair_key = self.matchup_pair_key(
+            team_1, team_2, book_1, book_2, game_date, bet_type=bet_type, spread_value=spread_value
+        )
         self.redis.set(self._arb_opportunity_alert_key(pair_key), {"sent_at": "now"}, ttl=self.lock_ttl)
 
     def bet_confirmed_alert_already_sent(self, bookmaker, bet_type, game_id):

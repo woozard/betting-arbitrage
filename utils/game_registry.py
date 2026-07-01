@@ -210,23 +210,33 @@ def attach_canonical_game_ids(db: Session, rows: list[dict]) -> int:
 def odds_dedup_key(row: dict) -> tuple:
     """Latest-odds dedup key: one row per book per canonical game when linked."""
     bookmaker = row.get("bookmaker")
+    bet_type = row.get("bet_type") or "moneyline"
+    spread_value = row.get("spread_value")
     canonical_game_id = row.get("canonical_game_id")
     if canonical_game_id:
-        return bookmaker, "cg", canonical_game_id
+        if bet_type == "spread":
+            return bookmaker, "cg", canonical_game_id, bet_type, spread_value
+        return bookmaker, "cg", canonical_game_id, bet_type
 
     team_a, team_b = sorted(
         [normalize_team_slug(row.get("team_1") or ""), normalize_team_slug(row.get("team_2") or "")]
     )
     dt = row.get("game_datetime") or ""
     date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-    return bookmaker, "mk", team_a, team_b, date_key
+    if bet_type == "spread":
+        return bookmaker, "mk", team_a, team_b, date_key, bet_type, spread_value
+    return bookmaker, "mk", team_a, team_b, date_key, bet_type
 
 
 def matchup_group_key(row: dict) -> tuple:
-    """Group odds from different books that refer to the same game."""
+    """Group odds from different books that refer to the same game (and spread line)."""
+    bet_type = row.get("bet_type") or "moneyline"
+    spread_value = row.get("spread_value")
     canonical_game_id = row.get("canonical_game_id")
     if canonical_game_id:
-        return ("cg", canonical_game_id)
+        if bet_type == "spread":
+            return ("cg", canonical_game_id, bet_type, spread_value)
+        return ("cg", canonical_game_id, bet_type)
 
     sport = row.get("sport") or "baseball"
     league = row.get("league") or "mlb"
@@ -237,7 +247,9 @@ def matchup_group_key(row: dict) -> tuple:
         row.get("team_2") or "",
         row.get("game_datetime"),
     )
-    return ("mk", matchup_key)
+    if bet_type == "spread":
+        return ("mk", matchup_key, bet_type, spread_value)
+    return ("mk", matchup_key, bet_type)
 
 
 def normalize_team_slug(name: str) -> str:

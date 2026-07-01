@@ -49,10 +49,11 @@ class BetWarController:
         "session expired",
         "logged out",
     )
-    ODDS_WATCH_POLL_SECONDS = float(os.getenv("BETWAR_ODDS_POLL_SEC", "1.5"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("BETWAR_ODDS_POLL_SEC", "5"))
     ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("BETWAR_ODDS_FORCE_SCAN_SEC", "5"))
-    ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETWAR_ODDS_IDLE_POLL_SEC", "2"))
-    GETLINES_MIN_GAMES = int(os.getenv("BETWAR_GETLINES_MIN_GAMES", "5"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETWAR_ODDS_IDLE_POLL_SEC", "5"))
+    ODDS_OBSERVER_SELECTORS = ["#GameLines", "#gamesAccordion", ".btnPSLine", "body"]
+    GETLINES_MIN_GAMES = int(os.getenv("BETWAR_GETLINES_MIN_GAMES", "1"))
     GETLINES_HEALTH_WINDOW_SEC = float(os.getenv("BETWAR_GETLINES_HEALTH_SEC", "45"))
     GETLINES_SOFT_RETRIES = int(os.getenv("BETWAR_GETLINES_SOFT_RETRIES", "2"))
 
@@ -578,22 +579,21 @@ class BetWarController:
             raise
 
     def __inject_mutation_observer(self):
-        # Kept for parity (not strictly required for current SPA)
-        self.logger.info("Injecting Mutation Observer (JS)")
-        script = """
-        if (!window.oddsObserverInstalled) {
-            window.oddsObserverInstalled = true;
-            window.oddsBuffer = [];
-            const target = document.getElementById('GameLines') || document.getElementById('gamesAccordion');
-            if (!target) { console.log("Observer: target not found"); return; }
-            const observer = new MutationObserver((mutations) => {
-                window.oddsBuffer.push(target.innerHTML);
-            });
-            observer.observe(target, { childList: true, subtree: true, characterData: true });
-            console.log("MutationObserver installed");
-        }
-        """
-        self.driver.execute_script(script)
+        from utils.odds_observer import install_mutation_observer
+        self.logger.info("Injecting MutationObserver on player game lines (JS)")
+        install_mutation_observer(self.driver, self.ODDS_OBSERVER_SELECTORS, self.logger)
+
+    def _ensure_odds_mutation_observer(self) -> bool:
+        from utils.odds_observer import ensure_mutation_observer
+        return ensure_mutation_observer(
+            self.driver, self.ODDS_OBSERVER_SELECTORS, self.logger
+        )
+
+    def _tick_odds_on_idle(self, last_force_scan: float, idle_label: str = "betting-idle"):
+        from utils.odds_watch_tick import tick_controller_odds_watch
+        return tick_controller_odds_watch(
+            self, last_force_scan, idle_label=idle_label
+        )
 
     # ===================================================================
     # Direct API access (GetSportOffering) - the reliable path
@@ -700,12 +700,99 @@ class BetWarController:
             self.logger.warning(f"Could not save bet board debug: {e}")
 
     def _pick_moneyline_click_target(self, ml_card):
+        if (ml_card.get_attribute("data-linekey") or "").strip():
+            return ml_card
         if ml_card.get_attribute("onclick"):
             return ml_card
+        try:
+            return ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@data-linekey][1]")
+        except Exception:
+            pass
         try:
             return ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@onclick][1]")
         except Exception:
             return ml_card
+
+    @staticmethod
+    def _linekey_team_segment(linekey: str) -> int | None:
+        parts = (linekey or "").split("-")
+        if len(parts) >= 3 and parts[2] in ("1", "2"):
+            return int(parts[2])
+        return None
+
+    @staticmethod
+    def _linekey_is_full_game_moneyline(linekey: str) -> bool:
+        """Full-game ML keys use {GameNum}-1-{team}-1-{period}; F5 uses -8- in segment 2."""
+        parts = (linekey or "").split("-")
+        return len(parts) >= 5 and parts[1] == "1" and parts[3] == "1"
+
+    def _extract_data_linekey(self, elem):
+        if not elem:
+            return None
+        lk = (elem.get_attribute("data-linekey") or "").strip()
+        if lk:
+            return lk
+        try:
+            for child in elem.find_elements(By.CSS_SELECTOR, "[data-linekey]"):
+                lk = (child.get_attribute("data-linekey") or "").strip()
+                if lk:
+                    return lk
+        except Exception:
+            pass
+        try:
+            parent = elem.find_element(By.XPATH, "./ancestor-or-self::*[@data-linekey][1]")
+            return (parent.get_attribute("data-linekey") or "").strip() or None
+        except Exception:
+            return None
+
+    def _parse_game_line_from_linekey(self, linekey: str, rotations: list | None = None):
+        parts = (linekey or "").split("-")
+        if not parts or not str(parts[0]).isdigit():
+            return None, None
+        rot1 = rotations[0] if rotations and len(rotations) > 0 else ""
+        rot2 = rotations[1] if rotations and len(rotations) > 1 else ""
+        team_no = self._linekey_team_segment(linekey)
+        game_line = {
+            "GameNum": int(parts[0]),
+            "PeriodNumber": int(parts[-1]) if str(parts[-1]).isdigit() else 0,
+            "Team1RotNum": rot1,
+            "Team2RotNum": rot2,
+            "LineKey": linekey,
+        }
+        return game_line, team_no
+
+    def _invoke_add_line_to_bet_slip(self, elem) -> bool:
+        """Modern BetWar portal adds picks via global addLineToBetSlip(el)."""
+        try:
+            return bool(self.driver.execute_script("""
+                var el = arguments[0];
+                if (!el) return false;
+                if (typeof addLineToBetSlip === 'function') {
+                    addLineToBetSlip(el);
+                    return true;
+                }
+                if (typeof el.onclick === 'function') {
+                    el.onclick.call(el);
+                    return true;
+                }
+                el.click();
+                return true;
+            """, elem))
+        except Exception as e:
+            self.logger.warning(f"addLineToBetSlip invoke failed: {e}")
+            return False
+
+    def _find_ml_element_by_linekey(self, game_num, team_no: int):
+        if not game_num or team_no not in (1, 2):
+            return None
+        needle = f"{game_num}-1-{team_no}-1-"
+        for elem in self.driver.find_elements(
+            By.CSS_SELECTOR, "div.btnMLLine[data-linekey], div.gc-line.btnMLLine[data-linekey]"
+        ):
+            lk = (elem.get_attribute("data-linekey") or "").strip()
+            if lk.startswith(str(game_num)) and needle in lk:
+                return elem
+        return None
 
     def _moneyline_cards_for_rotation_row(self, rot_span):
         team_row = rot_span.find_element(
@@ -763,11 +850,19 @@ class BetWarController:
             time.sleep(0.3)
 
             for ml_card in self._moneyline_cards_for_rotation_row(rot_span):
+                linekey = (ml_card.get_attribute("data-linekey") or "").strip()
+                if linekey and not self._linekey_is_full_game_moneyline(linekey):
+                    continue
+                if team_no in (1, 2):
+                    seg = self._linekey_team_segment(linekey)
+                    if seg is not None and seg != team_no:
+                        continue
                 txt = (ml_card.text or "").strip()
+                target = self._pick_moneyline_click_target(ml_card)
                 if self._odds_text_matches(txt, moneyline_odd):
-                    return self._pick_moneyline_click_target(ml_card)
-                if fallback is None:
-                    fallback = self._pick_moneyline_click_target(ml_card)
+                    return target
+                if fallback is None and (linekey or ml_card.get_attribute("onclick")):
+                    fallback = target
 
             if fallback is not None and (
                 getattr(self, "_odds_tolerance", 0) or not moneyline_odd
@@ -838,10 +933,18 @@ class BetWarController:
         }
 
     def _parse_game_line_from_button(self, elem, game_id: str):
-        """Extract GameNum/team_no from a Player portal moneyline button when available."""
+        """Extract GameNum/team_no from portal moneyline element (linekey or legacy id)."""
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        linekey = self._extract_data_linekey(elem)
+        if linekey and not self._linekey_is_full_game_moneyline(linekey):
+            linekey = None
+        if linekey:
+            game_line, team_no = self._parse_game_line_from_linekey(linekey, rotations)
+            if game_line:
+                return game_line, team_no
+
         elem_id = (elem.get_attribute("id") or "").strip()
         match = re.match(r"M(\d)_(\d+)_(\d+)", elem_id, re.I)
-        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
         if match:
             team_no = int(match.group(1))
             return {
@@ -851,6 +954,48 @@ class BetWarController:
                 "Team2RotNum": rotations[1] if len(rotations) > 1 else "",
             }, team_no
         return self._minimal_game_line_from_rotations(rotations), None
+
+    def _resolve_game_line_for_bet(
+        self, game_id: str, team_name: str, moneyline_elem, team_no: int | None = None,
+    ):
+        """Build a GameLine dict with GameNum for bet-slip handlers."""
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        game_line = None
+        parsed_team_no = None
+
+        if moneyline_elem:
+            game_line, parsed_team_no = self._parse_game_line_from_button(
+                moneyline_elem, game_id
+            )
+            if team_no is None:
+                team_no = parsed_team_no
+            if game_line and game_line.get("GameNum") is not None:
+                return game_line, team_no
+
+        try:
+            api_gl, api_team_no = self._lookup_game_line_from_api(game_id, team_name)
+            if api_gl and api_gl.get("GameNum") is not None:
+                if team_no is None:
+                    team_no = api_team_no
+                return api_gl, team_no
+        except SessionUnauthorizedError:
+            raise
+        except Exception as e:
+            self.logger.warning(f"GetSportOffering game-line lookup failed: {e}")
+
+        if game_line and game_line.get("GameNum") and team_no in (1, 2):
+            keyed_elem = self._find_ml_element_by_linekey(game_line["GameNum"], team_no)
+            if keyed_elem:
+                lk = self._extract_data_linekey(keyed_elem)
+                gl, tn = self._parse_game_line_from_linekey(lk, rotations)
+                if gl:
+                    if team_no is None:
+                        team_no = tn
+                    return gl, team_no
+
+        if game_line:
+            return game_line, team_no
+        return self._minimal_game_line_from_rotations(rotations), team_no
 
     def _infer_team_no(self, team_name: str, team_1: str = None, team_2: str = None) -> int | None:
         if team_1 and self._team_name_matches(team_1, team_name):
@@ -975,10 +1120,16 @@ class BetWarController:
         return ""
 
     def _betslip_has_team(self, team_name: str) -> bool:
-        slip = self._betslip_text().lower()
-        if not slip or "bet slip is empty" in slip:
+        slip = self._betslip_text()
+        slip_l = slip.lower()
+        if not slip or "bet slip is empty" in slip_l or "no bets" in slip_l:
             return False
-        return team_name.lower() in slip
+        if team_name.lower() in slip_l:
+            return True
+        last_word = team_name.strip().split()[-1].lower() if team_name.strip() else ""
+        if last_word and last_word in slip_l:
+            return True
+        return False
 
     def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
         deadline = time.time() + timeout
@@ -1054,16 +1205,241 @@ class BetWarController:
         self.logger.info(f"Stake entered: {stake_str}")
         return True
 
-    def _fill_wager_password_if_required(self):
+    def _fill_wager_password_if_required(self) -> bool:
+        """BetWar requires login password in #txtPassword before Place Bets."""
+        self._ensure_betslip_expanded()
+        pwd_input = None
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            for inp in self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "#div-betSlip #txtPassword, #pills-betslip #txtPassword, #txtPassword",
+            ):
+                if inp.is_displayed() and inp.is_enabled():
+                    pwd_input = inp
+                    break
+            if pwd_input:
+                break
+            time.sleep(0.3)
+
+        if not pwd_input:
+            return True  # field not shown on this account/view
+
+        password = self.password or ""
+        if not password:
+            self.logger.error("BetWar confirm password required but account password is empty")
+            return False
+
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", pwd_input
+        )
         try:
-            pwd_input = self.driver.find_element(By.CSS_SELECTOR, "#txtPassword")
-            if not pwd_input.is_displayed():
-                return
+            pwd_input.click()
             pwd_input.clear()
-            pwd_input.send_keys(self.password or "")
-            self.logger.info("Wager password confirmation entered")
+            pwd_input.send_keys(password)
         except Exception:
             pass
+
+        self.driver.execute_script(
+            """
+            var el = arguments[0];
+            var val = arguments[1];
+            el.focus();
+            el.value = val;
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            el.dispatchEvent(new Event('blur', {bubbles: true}));
+            """,
+            pwd_input,
+            password,
+        )
+        time.sleep(0.3)
+
+        filled_len = len(pwd_input.get_attribute("value") or "")
+        if filled_len < len(password):
+            self.logger.error(
+                f"BetWar confirm password field not populated (len={filled_len})"
+            )
+            return False
+
+        self.logger.info("Wager password confirmation entered")
+        return True
+
+    def _betslip_shows_wager_confirmed(self) -> bool:
+        slip = self._betslip_text()
+        slip_l = slip.lower()
+        if any(
+            marker in slip_l
+            for marker in (
+                "wager(s) confirmed",
+                "wagers confirmed",
+                "your selections are now active",
+            )
+        ):
+            return True
+        # Do not match bare "REFERENCE ID" placeholder; require an actual ticket number.
+        return bool(re.search(r"reference\s*id\s*#?\s*\d+", slip_l, re.I))
+
+    def _parse_my_bets_rows(self, text: str) -> list:
+        """Parse BetWar pending rows like '2.00 / 2.82' then 'NY Mets ML +141'."""
+        rows = []
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        skip = {"description", "risk / win", "my bets", "loading", "loading..."}
+        i = 0
+        while i < len(lines):
+            ln = lines[i]
+            if ln.lower() in skip:
+                i += 1
+                continue
+            if re.match(r"^\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?$", ln.replace(",", "")):
+                risk_raw = ln.split("/")[0].strip()
+                desc = lines[i + 1] if i + 1 < len(lines) else ""
+                if desc.lower() not in skip:
+                    rows.append({"risk_raw": risk_raw, "description": desc, "risk_win": ln})
+                    i += 2
+                    continue
+            i += 1
+        return rows
+
+    @staticmethod
+    def _my_bets_row_matches_team(description: str, team_name: str) -> bool:
+        desc = (description or "").strip()
+        if not desc or not team_name:
+            return False
+        if team_name.lower() in desc.lower():
+            return True
+        if teams_same(desc, team_name):
+            return True
+        last_word = team_name.strip().split()[-1].lower()
+        return bool(last_word and last_word in desc.lower())
+
+    def _my_bets_has_wager(self, team_name: str, stake: float) -> bool:
+        text = self._my_bets_tab_text(timeout=12)
+        for row in self._parse_my_bets_rows(text):
+            if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
+                continue
+            try:
+                if abs(float(row["risk_raw"]) - float(stake)) < 0.011:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _betslip_shows_insufficient_available(self) -> bool:
+        return "insufficient available" in self._betslip_text().lower()
+
+    def _submit_place_bets_with_retries(self, max_attempts: int = 10) -> bool:
+        """
+        BetWar sometimes shows transient 'Insufficient available' on first Place Bets click.
+        Retry processWagers until the slip shows Wager(s) Confirmed or a hard rejection.
+        """
+        last_slip = ""
+        for attempt in range(1, max_attempts + 1):
+            if not self._click_place_bets_button():
+                raise Exception("Place Bets button not found")
+
+            time.sleep(1.2)
+
+            if self._betslip_shows_wager_confirmed():
+                self.logger.info(f"Wager confirmed in bet slip (attempt {attempt}/{max_attempts})")
+                return True
+
+            last_slip = self._betslip_text()
+            if self._betslip_shows_insufficient_available():
+                self.logger.warning(
+                    f"BetWar 'Insufficient available' on attempt {attempt}/{max_attempts}; "
+                    "retrying Place Bets"
+                )
+                continue
+
+            rejected, reject_msg = self._scan_hard_rejection_ui()
+            if rejected:
+                raise Exception(reject_msg)
+
+            time.sleep(1.0)
+            if self._betslip_shows_wager_confirmed():
+                self.logger.info(
+                    f"Wager confirmed in bet slip after wait (attempt {attempt}/{max_attempts})"
+                )
+                return True
+
+        if self._betslip_shows_insufficient_available():
+            raise Exception(
+                "BetWar Insufficient available persisted after Place Bets retries: "
+                f"{last_slip[:200]}"
+            )
+        return False
+
+    def _click_favorites_mlb(self) -> bool:
+        """Load MLB via the Favorites shortcut when visible (faster than full sidebar nav)."""
+        if self.sport_name != "MLB":
+            return False
+
+        self._ensure_player_portal()
+
+        for fav in self.driver.find_elements(By.CSS_SELECTOR, ".sport-favorites"):
+            if (fav.get_attribute("data-is-open") or "").lower() != "true":
+                self._portal_click(fav)
+                time.sleep(0.5)
+
+        keywords = self._league_keywords()
+        for menu in self.driver.find_elements(By.CSS_SELECTOR, ".divSportFavoritesMenu"):
+            if "d-none" in (menu.get_attribute("class") or ""):
+                continue
+            for elem in menu.find_elements(By.CSS_SELECTOR, ".sport-ssl-item"):
+                label = (elem.get_attribute("data-sportname") or "").strip().lower()
+                spans = elem.find_elements(By.CSS_SELECTOR, "span.lblLeagueName")
+                if spans:
+                    label = (spans[0].text or "").strip().lower()
+                if not label or not any(kw in label for kw in keywords):
+                    continue
+            self._portal_click(elem)
+            self.logger.info("Clicked MLB in Favorites shortcut")
+            self._wait_for_postback()
+            self._wait_for_loading_hidden()
+            self._ensure_straights_tab()
+            if self._wait_for_player_game_lines(timeout=15):
+                self.logger.info("MLB lines visible after Favorites shortcut")
+                return True
+            if self._click_game_subleague_item():
+                return True
+            # Favorites often sets menuItemsSelected even when the period sub-menu is absent.
+            try:
+                preview = self._fetch_lines_via_getlines_api()
+                if preview:
+                    self.logger.info(
+                        f"GetLines returned {len(preview)} games after Favorites MLB click"
+                    )
+                    return True
+            except Exception as e:
+                self.logger.debug(f"GetLines preview after Favorites failed: {e}")
+            return False
+        return False
+
+    def _scan_hard_rejection_ui(self):
+        reject_markers = (
+            "error", "rejected", "not accepted", "another user has taken",
+            "insufficient funds", "insufficient balance",
+            "failed to place", "wager declined", "unable to place",
+            "line changed", "odds changed", "session expired", "logged out",
+        )
+        try:
+            slip = self._betslip_text().lower()
+            for marker in reject_markers:
+                if marker in slip:
+                    return True, f"Bet slip rejection: {self._betslip_text()[:300]}"
+        except Exception:
+            pass
+
+        try:
+            page_l = (self.driver.page_source or "").lower()
+            page_markers = tuple(m for m in reject_markers if m != "error")
+            for marker in page_markers:
+                if marker in page_l:
+                    return True, f"Page rejection marker: {marker}"
+        except Exception:
+            pass
+        return False, ""
 
     def _click_place_bets_button(self):
         for selector in ("#btnBSSaveWagers", "button.btnBSSaveSelections"):
@@ -1072,8 +1448,15 @@ class BetWarController:
                 if btn.is_displayed():
                     self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                     time.sleep(0.2)
-                    self.driver.execute_script("arguments[0].click();", btn)
-                    self.logger.info("Place Bets clicked")
+                    submitted = self.driver.execute_script("""
+                        if (typeof processWagers === 'function') {
+                            processWagers();
+                            return 'processWagers';
+                        }
+                        arguments[0].click();
+                        return 'click';
+                    """, btn)
+                    self.logger.info(f"Place Bets clicked ({submitted})")
                     return True
             except Exception:
                 continue
@@ -1085,7 +1468,10 @@ class BetWarController:
             btn_text = (btn.text or "").lower()
             if "processwagers" in onclick or "place bet" in btn_text or "submit" in btn_text:
                 if btn.is_displayed():
-                    self.driver.execute_script("arguments[0].click();", btn)
+                    self.driver.execute_script("""
+                        if (typeof processWagers === 'function') { processWagers(); }
+                        else { arguments[0].click(); }
+                    """, btn)
                     self.logger.info("Place Bets clicked (fallback)")
                     return True
         return False
@@ -1096,18 +1482,58 @@ class BetWarController:
     ) -> bool:
         """Click DOM and/or Angular until the bet slip actually contains the team."""
         game_num = game_line.get("GameNum")
+        linekey = self._extract_data_linekey(moneyline_elem) if moneyline_elem else None
 
         if moneyline_elem:
-            self.logger.info(f"Moneyline element located: {moneyline_elem.get_attribute('id')}")
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", moneyline_elem)
+            elem_label = (
+                moneyline_elem.get_attribute("id")
+                or linekey
+                or moneyline_elem.get_attribute("class")
+            )
+            self.logger.info(f"Moneyline element located: {elem_label}")
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", moneyline_elem
+            )
             time.sleep(0.4)
+
+            if linekey or moneyline_elem.get_attribute("onclick"):
+                self.logger.info(
+                    f"Invoking addLineToBetSlip (linekey={linekey or 'onclick'})"
+                )
+                if self._invoke_add_line_to_bet_slip(moneyline_elem):
+                    if self._wait_for_betslip_team(team_name, timeout=5):
+                        return True
+                self.logger.warning(
+                    f"addLineToBetSlip did not populate bet slip for {linekey or elem_label}"
+                )
+
             self.driver.execute_script("arguments[0].click();", moneyline_elem)
             self.logger.info("Moneyline element clicked")
             if self._wait_for_betslip_team(team_name, timeout=4):
                 return True
             self.logger.warning(
-                f"DOM click on M{team_no}_{game_num}_0 did not populate bet slip; trying Angular"
+                f"DOM click on M{team_no}_{game_num}_0 did not populate bet slip; trying fallbacks"
             )
+
+        if game_num and team_no in (1, 2):
+            keyed_elem = self._find_ml_element_by_linekey(game_num, team_no)
+            if keyed_elem and keyed_elem != moneyline_elem:
+                lk = self._extract_data_linekey(keyed_elem)
+                self.logger.info(f"Retrying addLineToBetSlip via linekey match {lk}")
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", keyed_elem
+                )
+                time.sleep(0.3)
+                if self._invoke_add_line_to_bet_slip(keyed_elem):
+                    if self._wait_for_betslip_team(team_name, timeout=5):
+                        return True
+
+        if game_num is not None and team_no in (1, 2):
+            btn = self._wait_for_moneyline_button(game_num, team_no, timeout=3)
+            if btn:
+                self.driver.execute_script("arguments[0].click();", btn)
+                if self._wait_for_betslip_team(team_name, timeout=4):
+                    return True
 
         if self._click_moneyline_via_angular(game_line, team_no):
             if self._wait_for_betslip_team(team_name, timeout=6):
@@ -1339,14 +1765,36 @@ class BetWarController:
         if not stl_items:
             stl_items = self.driver.find_elements(By.CSS_SELECTOR, ".sport-stl-item")
 
+        def _is_full_game_elem(elem) -> bool:
+            label = (elem.text or "").strip().lower()
+            data_val = (elem.get_attribute("data-value") or "").strip()
+            if label in ("game", "games", "full game"):
+                return True
+            if re.search(r"/0,1(?:\b|$)", data_val):
+                return True
+            return False
+
         target = None
         for elem in stl_items:
-            label = (elem.text or "").strip().lower()
-            if label in ("game", "games", "full game") or "game" in label:
+            if _is_full_game_elem(elem):
                 target = elem
                 break
-        if target is None and stl_items:
-            target = stl_items[0]
+
+        if target is None:
+            for elem in self.driver.find_elements(By.CSS_SELECTOR, ".sport-stl-item"):
+                if _is_full_game_elem(elem):
+                    target = elem
+                    break
+
+        if not target:
+            for elem in stl_items:
+                label = (elem.text or "").strip()
+                if label:
+                    target = elem
+                    self.logger.warning(
+                        f"Full game period unavailable; loading lines via {label[:40]}"
+                    )
+                    break
 
         if not target:
             self.logger.warning(f"No sport-stl-item found under {sport_name}")
@@ -1461,6 +1909,42 @@ class BetWarController:
                 pass
 
         return None
+
+    @staticmethod
+    def _parse_betwar_ps_line_text(text: str) -> tuple[float | None, str | None]:
+        """Parse BetWar point-spread/run-line text like '+1½-230' or '+1.5 -110'."""
+        raw = (text or "").strip()
+        if not raw:
+            return None, None
+        normalized = raw.replace("½", ".5").replace(" ", "")
+        match = re.match(r"^([+-]?\d+(?:\.\d+)?)([+-]\d+)$", normalized)
+        if not match:
+            return None, None
+        try:
+            spread = float(match.group(1))
+            odds = match.group(2)
+            if spread == 0.0:
+                return None, None
+            return spread, odds
+        except (TypeError, ValueError):
+            return None, None
+
+    def _get_side_spread_from_getlines(self, side: dict) -> tuple[float | None, str | None]:
+        """Extract run-line handicap + American odds from a GetLines side object."""
+        sp_obj = side.get("spread") or {}
+        line_txt = (sp_obj.get("line") or "").strip()
+        if line_txt:
+            spread, odds = self._parse_betwar_ps_line_text(line_txt)
+            if spread is not None and odds:
+                normalized = self._normalize_ml_odds(odds)
+                if normalized is not None:
+                    return spread, normalized
+
+        odds_val = (sp_obj.get("odds") or {}).get("OddsValue")
+        if odds_val in (None, "", 0):
+            return None, None
+        # Odds without handicap text are ambiguous (often means RL not posted).
+        return None, None
 
     def _get_side_moneyline_odds(self, side: dict) -> str:
         """Extract moneyline odds from a GetLines side object."""
@@ -1665,6 +2149,12 @@ class BetWarController:
             if attempt < max_attempts and self._soft_refresh_lines_context():
                 time.sleep(0.5)
                 continue
+            if games:
+                self.logger.info(
+                    f"GetLines partial board accepted on final attempt: {len(games)} games"
+                )
+                self._record_getlines_success(len(games))
+                return games
             break
         return []
 
@@ -1679,10 +2169,7 @@ class BetWarController:
                 return False
         ok = self._relogin_after_recovery()
         if ok and hasattr(self, "_scan_health"):
-            games, src = self._fetch_games_for_odds(
-                allow_dom_fallback=True,
-                use_sport_offering_fallback=True,
-            )
+            games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
             if games:
                 self._scan_health.mark_success(len(games))
         elif hasattr(self, "_scan_health"):
@@ -1704,9 +2191,32 @@ class BetWarController:
                     if (typeof menuItemsSelected !== 'undefined' && menuItemsSelected.length) {
                         menuItems = menuItemsSelected;
                     } else {
-                        const active = document.querySelector(
-                            '.sport-ssl-item.active, .sport-stl-item.active'
-                        );
+                        const activeSelectors = [
+                            '.sport-ssl-item.active',
+                            '.sport-stl-item.active',
+                            '.divSportFavoritesMenu .sport-ssl-item',
+                            '.sport-ssl-item[data-sportname="MLB"]',
+                            '.sport-ssl-item[data-sportname="NBA"]',
+                        ];
+                        let active = null;
+                        for (const sel of activeSelectors) {
+                            active = document.querySelector(sel);
+                            if (active) break;
+                        }
+                        if (!active) {
+                            const sslItems = document.querySelectorAll('.sport-ssl-item');
+                            for (const item of sslItems) {
+                                const name = (
+                                    item.getAttribute('data-sportname')
+                                    || item.textContent
+                                    || ''
+                                ).trim().toLowerCase();
+                                if (name === 'mlb' || name === 'nba' || name.includes('major league')) {
+                                    active = item;
+                                    break;
+                                }
+                            }
+                        }
                         if (active) {
                             menuItems = [{
                                 idSport: active.getAttribute('data-value'),
@@ -1803,11 +2313,25 @@ class BetWarController:
             team2 = self._standardize_team_name((s2.get("name") or "").strip())
             ml1 = self._get_side_moneyline_odds(s1)
             ml2 = self._get_side_moneyline_odds(s2)
+            sp1_line, sp1_odds = self._get_side_spread_from_getlines(s1)
+            sp2_line, sp2_odds = self._get_side_spread_from_getlines(s2)
 
             if not rot1 or not rot2 or not team1 or not team2 or not ml1 or not ml2:
                 continue
 
             normalized_dt = self._parse_betwar_game_datetime(ev.get("dateandtime"))
+
+            spread = {
+                "team_1_spread": None, "team_2_spread": None,
+                "team_1_odds": None, "team_2_odds": None,
+            }
+            if sp1_line is not None and sp2_line is not None and sp1_odds and sp2_odds:
+                spread = {
+                    "team_1_spread": sp1_line,
+                    "team_2_spread": sp2_line,
+                    "team_1_odds": sp1_odds,
+                    "team_2_odds": sp2_odds,
+                }
 
             games.append({
                 "bookmaker": self.bookmaker,
@@ -1819,10 +2343,7 @@ class BetWarController:
                 "team_1": team1,
                 "team_2": team2,
                 "moneyline": {"team_1": ml1, "team_2": ml2},
-                "spread": {
-                    "team_1_spread": None, "team_2_spread": None,
-                    "team_1_odds": None, "team_2_odds": None,
-                },
+                "spread": spread,
                 "total": {
                     "over_total": None, "under_total": None,
                     "over_odds": None, "under_odds": None,
@@ -1830,6 +2351,69 @@ class BetWarController:
             })
 
         self.logger.info(f"Parsed {len(games)} games from GetLines API")
+        return games
+
+    def _parse_player_portal_spread_by_rotation(self, html: str = None) -> dict:
+        """Map rotation number -> (handicap, American odds) from btnPSLine cells."""
+        source = html if html is not None else (self.driver.page_source or "")
+        soup = BeautifulSoup(source, "html.parser")
+        by_rot = {}
+        for row in soup.select("div.divTeamContent, div.divGameTeam"):
+            rot_el = row.select_one("span.lblRotation")
+            ps_el = row.select_one(".btnPSLine, .divPSLine")
+            if not rot_el or not ps_el:
+                continue
+            rot = rot_el.get_text(strip=True)
+            if not rot:
+                continue
+            spread, odds = self._parse_betwar_ps_line_text(ps_el.get_text(strip=True))
+            if spread is None or not odds:
+                continue
+            normalized = self._normalize_ml_odds(odds)
+            if normalized is not None:
+                by_rot[rot] = (spread, normalized)
+        return by_rot
+
+    def _enrich_games_with_spreads(self, games: list) -> list:
+        """Fill run-line odds from Player portal DOM (GetLines API often omits spread.line)."""
+        if not games:
+            return games
+
+        try:
+            by_rot = self._parse_player_portal_spread_by_rotation()
+        except Exception as e:
+            self.logger.debug(f"Spread DOM enrichment skipped: {e}")
+            return games
+
+        if not by_rot:
+            return games
+
+        enriched = 0
+        for game in games:
+            spread = game.get("spread") or {}
+            if spread.get("team_1_odds") is not None:
+                continue
+            game_id = str(game.get("game_id") or "")
+            parts = [p.strip() for p in game_id.split("-", 1)]
+            if len(parts) != 2:
+                continue
+            rot1, rot2 = parts
+            r1 = by_rot.get(rot1)
+            r2 = by_rot.get(rot2)
+            if not r1 or not r2:
+                continue
+            game["spread"] = {
+                "team_1_spread": r1[0],
+                "team_2_spread": r2[0],
+                "team_1_odds": r1[1],
+                "team_2_odds": r2[1],
+            }
+            enriched += 1
+
+        if enriched:
+            self.logger.info(
+                f"Enriched {enriched}/{len(games)} games with spread/run-line from Player portal DOM"
+            )
         return games
 
     def _parse_player_portal_dom(self, html: str) -> list:
@@ -1899,6 +2483,28 @@ class BetWarController:
         self.logger.info(f"Ensuring {self.sport_name} offering is loaded in Player portal...")
 
         self._ensure_player_portal()
+        lines_ready = False
+
+        if self._click_favorites_mlb():
+            lines_ready = self._wait_for_player_game_lines(timeout=20)
+            if lines_ready:
+                self.logger.info(f"{self.sport_name} lines loaded via Favorites shortcut")
+                self._ensure_odds_mutation_observer()
+                return True
+            try:
+                games = self._fetch_lines_via_getlines_api()
+                if games:
+                    self.logger.info(
+                        f"{self.sport_name} GetLines ready via Favorites ({len(games)} games)"
+                    )
+                    self._ensure_odds_mutation_observer()
+                    return True
+            except Exception as e:
+                self.logger.debug(f"GetLines after Favorites failed: {e}")
+            self.logger.warning(
+                f"Favorites MLB navigation did not populate lines; falling back to sidebar"
+            )
+
         self._open_sports_sidebar()
         self._click_sidebar_sport()
         self._click_league_or_subleague()
@@ -1920,6 +2526,7 @@ class BetWarController:
                 f"{self.sport_name} lines not populated after navigation; saved {debug_file}"
             )
 
+        self._ensure_odds_mutation_observer()
         return lines_ready
 
     def _fetch_game_lines_via_api(self, raise_session_error: bool = True):
@@ -2092,28 +2699,13 @@ class BetWarController:
         allow_dom_fallback: bool = False,
         use_sport_offering_fallback: bool = False,
     ):
+        """BetWar Player portal: GetLines API is the reliable path (not GetSportOffering)."""
+        _ = use_sport_offering_fallback  # legacy arg; BetOnline API does not apply here
+
         games = self._fetch_getlines_games()
         if games:
-            return games, "GetLines"
-
-        if use_sport_offering_fallback:
-            try:
-                api_lines = self._fetch_game_lines_via_api(
-                    raise_session_error=not self._getlines_recently_healthy()
-                )
-            except SessionUnauthorizedError:
-                if self._getlines_recently_healthy():
-                    self.logger.warning(
-                        "GetSportOffering failed after recent healthy GetLines; "
-                        "skipping full session recovery"
-                    )
-                    api_lines = []
-                else:
-                    raise
-            if api_lines:
-                games = self._parse_api_game_lines(api_lines)
-                if games:
-                    return games, "GetSportOffering"
+            games = self._enrich_games_with_spreads(games)
+            return games, "GetLines+Spread"
 
         if allow_dom_fallback:
             if not self._player_lines_populated():
@@ -2126,12 +2718,11 @@ class BetWarController:
 
         return [], "none"
 
-    def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch") -> int:
+    def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch", **kwargs) -> int:
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
         fetch_kwargs = {
-            "allow_dom_fallback": force_scan,
-            "use_sport_offering_fallback": force_scan,
+            "allow_dom_fallback": True,
         }
         try:
             games, src = self._fetch_games_for_odds(**fetch_kwargs)
@@ -2144,19 +2735,13 @@ class BetWarController:
                         if hasattr(self, "_scan_health"):
                             self._scan_health.mark_failure(str(retry_err))
                         return 0
-                    games, src = self._fetch_games_for_odds(
-                        allow_dom_fallback=True,
-                        use_sport_offering_fallback=True,
-                    )
+                    games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
             elif not self._recover_odds_session(str(e), recover_driver=False):
                 if hasattr(self, "_scan_health"):
                     self._scan_health.mark_failure(str(e))
                 return 0
             else:
-                games, src = self._fetch_games_for_odds(
-                    allow_dom_fallback=True,
-                    use_sport_offering_fallback=True,
-                )
+                games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
 
         if games:
             self._consecutive_odds_failures = 0
@@ -2176,10 +2761,7 @@ class BetWarController:
                 )
                 self._consecutive_odds_failures = 0
                 try:
-                    games, src = self._fetch_games_for_odds(
-                        allow_dom_fallback=True,
-                        use_sport_offering_fallback=True,
-                    )
+                    games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
                     if games and hasattr(self, "_scan_health"):
                         self._scan_health.mark_success(len(games))
                 except SessionUnauthorizedError as e:
@@ -2211,14 +2793,15 @@ class BetWarController:
         return self._soft_refresh_lines_context()
 
     def _maybe_poll_odds_while_idle(self):
-        if not hasattr(self, "_last_idle_odds_poll"):
-            self._last_idle_odds_poll = 0.0
-        now = time.monotonic()
-        if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
-            return
-        self._last_idle_odds_poll = now
+        if not hasattr(self, "_last_odds_force_scan"):
+            self._last_odds_force_scan = 0.0
         try:
-            self._poll_odds_watch_once(source="betting-idle")
+            self._last_odds_force_scan, processed = self._tick_odds_on_idle(
+                self._last_odds_force_scan,
+                idle_label="betting-idle",
+            )
+            if not processed:
+                return
         except SessionUnauthorizedError as e:
             if self._try_soft_odds_recovery(e):
                 try:
@@ -2315,21 +2898,17 @@ class BetWarController:
                     time.sleep(3)
                     continue
 
-                now = time.monotonic()
-                force_scan = (
-                    last_force_scan == 0.0
-                    or (now - last_force_scan) >= force_scan_interval
-                )
-                if force_scan:
-                    self.logger.info("Odds watch — force scan")
-                    last_force_scan = now
-
                 try:
-                    self._poll_odds_watch_once(force_scan=force_scan, source="watch")
+                    last_force_scan, processed = self._tick_odds_on_idle(
+                        last_force_scan, idle_label="watch"
+                    )
                 except SessionUnauthorizedError as e:
                     self.logger.warning(f"Odds watch poll unauthorized: {e}")
                     self._recover_odds_session(str(e), recover_driver=True)
-                time.sleep(poll_interval)
+                    processed = False
+
+                if not processed:
+                    time.sleep(poll_interval)
 
         except KeyboardInterrupt:
             self.logger.info("BetWar odds watch stopped by user")
@@ -2890,25 +3469,25 @@ class BetWarController:
             text_l = text.lower()
             self.logger.info(f"My Bets tab preview: {text[:250]}")
 
-            if team_name.lower() not in text_l:
+            team_found = team_name.lower() in text_l
+            if not team_found:
+                team_found = teams_same(team_name, text)
+            if not team_found:
+                last_word = team_name.strip().split()[-1].lower() if team_name.strip() else ""
+                team_found = bool(last_word and last_word in text_l)
+            if not team_found:
                 return False, "Team not found on My Bets tab"
 
             if stake is not None:
-                team_idx = text_l.find(team_name.lower())
-                team_section = text[team_idx:team_idx + 120] if team_idx >= 0 else text
-                stake_variants = (
-                    f"{stake:.2f}",
-                    f"{stake:.0f}",
-                    f"${stake:.2f}",
-                    f"${stake:.0f}",
-                )
-                if any(variant in team_section for variant in stake_variants):
-                    return True, "Open bet confirmed on My Bets tab"
-                if any(variant in text for variant in stake_variants):
-                    return True, "Open bet confirmed on My Bets tab (stake matched)"
-                if "risk" in text_l or "to win" in text_l or "/" in team_section:
-                    return True, "Open bet confirmed on My Bets tab (team matched)"
-                return False, "Team on My Bets but stake not verified"
+                for row in self._parse_my_bets_rows(text):
+                    if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
+                        continue
+                    try:
+                        if abs(float(row["risk_raw"]) - float(stake)) < 0.011:
+                            return True, "Open bet confirmed on My Bets tab"
+                    except (TypeError, ValueError):
+                        continue
+                return False, f"Team/stake ${stake:.2f} not found on My Bets tab"
 
             return True, "Open bet confirmed on My Bets tab"
         except Exception as e:
@@ -2916,29 +3495,9 @@ class BetWarController:
 
 
     def _scan_rejection_ui(self):
-        reject_markers = (
-            "error", "rejected", "not accepted", "another user has taken",
-            "insufficient funds", "insufficient balance", "failed to place",
-            "wager declined", "unable to place", "line changed", "odds changed",
-            "session expired", "logged out",
-        )
-        try:
-            slip = self._betslip_text().lower()
-            for marker in reject_markers:
-                if marker in slip:
-                    return True, f"Bet slip rejection: {self._betslip_text()[:300]}"
-        except Exception:
-            pass
-
-        try:
-            page_l = (self.driver.page_source or "").lower()
-            page_markers = tuple(m for m in reject_markers if m != "error")
-            for marker in page_markers:
-                if marker in page_l:
-                    return True, f"Page rejection marker: {marker}"
-        except Exception:
-            pass
-        return False, ""
+        if self._betslip_shows_insufficient_available():
+            return True, f"Bet slip rejection: {self._betslip_text()[:300]}"
+        return self._scan_hard_rejection_ui()
 
     def _accept_line_changes(self):
         accepted = False
@@ -2982,7 +3541,7 @@ class BetWarController:
         self.logger.info("Confirming wager via My Bets tab")
 
         while time.time() < deadline:
-            rejected, reject_msg = self._scan_rejection_ui()
+            rejected, reject_msg = self._scan_hard_rejection_ui()
             if rejected:
                 if self._message_requires_relogin(reject_msg):
                     self._invalidate_wager_session()
@@ -3155,27 +3714,26 @@ class BetWarController:
                     f"(game_id={game_id}; board rotations={visible[:12]})"
                 )
 
-            game_line, parsed_team_no = self._parse_game_line_from_button(
-                moneyline_elem, game_id
+            game_line, parsed_team_no = self._resolve_game_line_for_bet(
+                game_id, team_name, moneyline_elem, team_no=team_no
             )
             if team_no is None:
                 team_no = parsed_team_no
             if team_no is None:
                 team_no = self._infer_team_no(team_name, team_1, team_2)
 
+            if game_line.get("GameNum") is not None:
+                self.logger.info(
+                    f"Resolved GameNum={game_line.get('GameNum')} "
+                    f"(linekey={game_line.get('LineKey')}) for {game_id}"
+                )
+
             slip_populated = False
             if game_line and team_no in (1, 2):
                 slip_populated = self._add_moneyline_to_slip(
-                    game_line, team_no, team_name, moneyline_elem=moneyline_elem
+                    game_line, team_no, lookup_name or team_name,
+                    moneyline_elem=moneyline_elem,
                 )
-
-            if not slip_populated:
-                self.driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", moneyline_elem
-                )
-                time.sleep(0.4)
-                self.driver.execute_script("arguments[0].click();", moneyline_elem)
-                self.logger.info("Player portal moneyline odds clicked")
 
             if not self._wait_for_betslip_team(team_name, timeout=8):
                 slip_preview = self._betslip_text()[:200]
@@ -3190,7 +3748,8 @@ class BetWarController:
                 raise Exception("Could not locate interactable risk amount input in bet slip")
 
             self._accept_line_changes()
-            self._fill_wager_password_if_required()
+            if not self._fill_wager_password_if_required():
+                raise Exception("BetWar confirm password required but could not be entered")
 
             if self._page_has_login_required_marker():
                 self._invalidate_wager_session()
@@ -3198,11 +3757,11 @@ class BetWarController:
 
             self._install_wager_network_hook()
             self._accept_line_changes()
-            if not self._click_place_bets_button():
-                raise Exception("Place Bets button not found")
+            if not self._submit_place_bets_with_retries():
+                raise Exception("Place Bets did not confirm in bet slip")
 
-            self.logger.info("Place Bets clicked; confirming on My Bets tab")
-            time.sleep(2)
+            self.logger.info("Place Bets confirmed in bet slip; verifying on My Bets tab")
+            time.sleep(1.5)
 
             matchup_1 = team_1 or ""
             matchup_2 = team_2 or ""
@@ -3352,10 +3911,7 @@ class BetWarController:
             try:
                 # Step 1: Ensure logged-in session (login only when invalid)
                 self._ensure_betting_session()
-                games, src = self._fetch_games_for_odds(
-                    allow_dom_fallback=True,
-                    use_sport_offering_fallback=True,
-                )
+                games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
                 if games:
                     self._scan_health.mark_success(len(games))
 

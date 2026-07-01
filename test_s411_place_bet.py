@@ -4,8 +4,12 @@ One-off Sports411 end-to-end placement test.
 Lists live MLB moneylines, places $25 using LIVE board odds,
 then saves to DB and sends the ===== Moneyline Bet ===== Telegram alert.
 """
-import argparse
 import os
+
+# Allow running placement test without local/docker MySQL (bet still places on S411).
+os.environ.setdefault("SKIP_DB_BOOTSTRAP", "1")
+
+import argparse
 import re
 import sys
 import time
@@ -124,6 +128,12 @@ def main():
     parser.add_argument("--xdotool-full", action="store_true", help="xdotool for moneyline+stake+place bet")
     parser.add_argument("--allow-live", action="store_true", help="Allow betting on started/live games")
     args = parser.parse_args()
+
+    if args.production:
+        args.attach = True
+        args.no_proxy = False
+        args.headless = False
+        os.environ.setdefault("SPORTS411_XDOTOOL_BET_ONLY", "1")
 
     if args.xdotool_full:
         os.environ["SPORTS411_XDOTOOL_BET_ONLY"] = "0"
@@ -268,20 +278,23 @@ def main():
             "identified_at": time.time(),
         }
 
-        finalize_confirmed_bet(
-            cache,
-            storage,
-            logger,
-            arb,
-            "sports411",
-            team_no,
-            team_name,
-            game["game_id"],
-            stake,
-            live_odd,
-            TELEGRAM,
-        )
-        print("DB save + Telegram alert sent (===== Moneyline Bet =====).")
+        try:
+            finalize_confirmed_bet(
+                cache,
+                storage,
+                logger,
+                arb,
+                "sports411",
+                team_no,
+                team_name,
+                game["game_id"],
+                stake,
+                live_odd,
+                TELEGRAM,
+            )
+            print("DB save + Telegram alert sent (===== Moneyline Bet =====).")
+        except Exception as notify_err:
+            print(f"Bet placed on S411 but DB/Telegram step failed: {notify_err}")
         return 0
 
     finally:

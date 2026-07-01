@@ -22,7 +22,8 @@ import undetected_chromedriver as uc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, extract_spread_line_odds_from_label
+from utils.odds_watch import persist_moneyline_games
 from utils.bet_placement import (
     finalize_confirmed_bet,
     maybe_notify_partial_arb_exposure,
@@ -52,7 +53,7 @@ class Sports411Controller:
     PLACE_BET_READY_TIMEOUT = 20
     MAX_SOFT_NAV_FAILURES = 3
     ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("SPORTS411_ODDS_FORCE_SCAN_SEC", "5"))
-    ODDS_WATCH_POLL_SECONDS = float(os.getenv("SPORTS411_ODDS_POLL_SEC", "0.5"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("SPORTS411_ODDS_POLL_SEC", "5"))
 
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override
@@ -236,14 +237,21 @@ class Sports411Controller:
             self._debug_port = port
             self._debug_chrome_proc = None
             return port
-        chrome_bin = "google-chrome-stable"
-        for candidate in ("google-chrome-stable", "google-chrome", "chromium-browser"):
+        chrome_bin = None
+        mac_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.isfile(mac_chrome):
+            chrome_bin = mac_chrome
+        for candidate in ("google-chrome-stable", "google-chrome", "chromium-browser", "chromium"):
+            if chrome_bin:
+                break
             try:
-                subprocess.check_output([candidate, "--version"])
+                subprocess.check_output([candidate, "--version"], stderr=subprocess.DEVNULL)
                 chrome_bin = candidate
                 break
             except Exception:
                 continue
+        if not chrome_bin:
+            raise RuntimeError("Chrome/Chromium binary not found for attach mode")
 
         cmd = [
             chrome_bin,
@@ -889,48 +897,31 @@ class Sports411Controller:
 
 
     def __inject_mutation_observer(self):
+        from utils.odds_observer import install_mutation_observer
         self.logger.info("Injecting MutationObserver on schedule (JS)")
-        script = """
-        window.oddsBuffer = window.oddsBuffer || [];
-        if (window.oddsObserverHandle) {
-            try { window.oddsObserverHandle.disconnect(); } catch (e) {}
-        }
-        window.oddsObserverInstalled = false;
-        const target = document.querySelector('app-american-schedule')
-            || document.querySelector('.sports-league-games')
-            || document.body;
-        if (!target) {
-            return false;
-        }
-        window.oddsObserverHandle = new MutationObserver(() => {
-            if (window.oddsFlushTimer) {
-                return;
-            }
-            window.oddsFlushTimer = setTimeout(() => {
-                window.oddsBuffer.push(target.innerHTML);
-                window.oddsFlushTimer = null;
-            }, 250);
-        });
-        window.oddsObserverHandle.observe(target, {
-            childList: true,
-            subtree: true,
-            characterData: true,
-            attributes: true,
-        });
-        window.oddsObserverInstalled = true;
-        return true;
-        """
-        return bool(self.driver.execute_script(script))
+        install_mutation_observer(
+            self.driver,
+            [
+                "app-american-schedule",
+                ".sports-league-games",
+                "body",
+            ],
+            self.logger,
+        )
 
     def _ensure_odds_mutation_observer(self) -> bool:
+        from utils.odds_observer import ensure_mutation_observer, mutation_observer_installed
         try:
-            installed = self.driver.execute_script("return !!window.oddsObserverInstalled")
-            if installed:
-                return True
-            return self.__inject_mutation_observer()
-        except Exception as e:
-            self.logger.warning(f"Could not install odds MutationObserver: {e}")
-            return False
+            installed = mutation_observer_installed(self.driver)
+        except Exception:
+            installed = False
+        if installed:
+            return True
+        return ensure_mutation_observer(
+            self.driver,
+            ["app-american-schedule", ".sports-league-games", "body"],
+            self.logger,
+        )
 
     def _drain_odds_mutation_buffer(self) -> list:
         try:
@@ -980,6 +971,50 @@ class Sports411Controller:
             return match.group(1).strip(), match.group(2).strip()
         return None, None
 
+    @staticmethod
+    def _extract_spread_from_game(game) -> dict:
+        spread = {
+            "team_1_spread": None,
+            "team_2_spread": None,
+            "team_1_odds": None,
+            "team_2_odds": None,
+        }
+
+        # Current S411 MLB DOM: run line lives under .hdp (handicap) cells.
+        hdp_labels = game.select(".hdp label.bet-indicator")
+        if len(hdp_labels) >= 2:
+            spread_1, odds_1 = extract_spread_line_odds_from_label(hdp_labels[0])
+            spread_2, odds_2 = extract_spread_line_odds_from_label(hdp_labels[1])
+            if spread_1 is not None and spread_2 is not None and odds_1 and odds_2:
+                spread["team_1_spread"] = spread_1
+                spread["team_2_spread"] = spread_2
+                spread["team_1_odds"] = odds_1
+                spread["team_2_odds"] = odds_2
+                return spread
+
+        selectors = (
+            (".hdp-1 label.bet-indicator", ".hdp-2 label.bet-indicator"),
+            (".psline-1 label.bet-indicator", ".psline-2 label.bet-indicator"),
+            (".sline-1 label.bet-indicator", ".sline-2 label.bet-indicator"),
+            (".spread-1 label.bet-indicator", ".spread-2 label.bet-indicator"),
+            (".runline-1 label.bet-indicator", ".runline-2 label.bet-indicator"),
+        )
+        for sel1, sel2 in selectors:
+            line1 = game.select_one(sel1)
+            line2 = game.select_one(sel2)
+            if not line1 or not line2:
+                continue
+            spread_1, odds_1 = extract_spread_line_odds_from_label(line1)
+            spread_2, odds_2 = extract_spread_line_odds_from_label(line2)
+            if spread_1 is None or spread_2 is None or not odds_1 or not odds_2:
+                continue
+            spread["team_1_spread"] = spread_1
+            spread["team_2_spread"] = spread_2
+            spread["team_1_odds"] = odds_1
+            spread["team_2_odds"] = odds_2
+            return spread
+        return spread
+
     def _parse_games_from_html(self, html: str) -> list:
         soup = BeautifulSoup(html or "", "html.parser")
         games = []
@@ -1012,10 +1047,7 @@ class Sports411Controller:
                     "team_1": team_1,
                     "team_2": team_2,
                     "moneyline": {"team_1": team_1_ml, "team_2": team_2_ml},
-                    "spread": {
-                        "team_1_spread": None, "team_2_spread": None,
-                        "team_1_odds": None, "team_2_odds": None,
-                    },
+                    "spread": self._extract_spread_from_game(game),
                     "total": {
                         "over_total": None, "under_total": None,
                         "over_odds": None, "under_odds": None,
@@ -1032,48 +1064,18 @@ class Sports411Controller:
         return games
 
     def _persist_games_odds(self, games: list, source: str = "scan") -> int:
-        if not games:
-            return 0
-
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
-
-        odds_data = {
-            "sport": self.sport_name,
-            "league": self.league,
-            "total_matches": len(games),
-            "matches": games,
-            "timestamp": datetime.now().isoformat(),
-        }
-        parsed_odds = parse_odds(odds_data)
-        saved = 0
-        for odd_row in parsed_odds:
-            if odd_row.get("bet_type") != "moneyline":
-                continue
-            sig = (
-                odd_row.get("moneyline_team_1"),
-                odd_row.get("moneyline_team_2"),
-            )
-            game_id = odd_row.get("game_id")
-            if self._last_saved_ml.get(game_id) == sig:
-                continue
-            self._last_saved_ml[game_id] = sig
-            self.cache.add_odds(odd_row)
-            try:
-                self.storage.save_odds(odd_row)
-            except Exception as db_err:
-                error_str = str(db_err).lower()
-                if "arbitrage_odds" in error_str or "doesn't exist" in error_str or "1146" in error_str:
-                    self.logger.warning("⚠️ Table 'arbitrage_odds' issue - continuing")
-                else:
-                    self.logger.warning(f"DB save failed: {db_err}")
-            saved += 1
-
-        if saved:
-            self.logger.info(
-                f"Published {saved} moneyline update(s) from {len(games)} games ({source})"
-            )
-        return saved
+        return persist_moneyline_games(
+            self.cache,
+            self.storage,
+            self.logger,
+            games,
+            self.sport_name,
+            self.league,
+            self._last_saved_ml,
+            source=source,
+        )
 
     def _prepare_odds_watch_page(self) -> bool:
         self._ensure_odds_session()
@@ -1414,9 +1416,10 @@ class Sports411Controller:
             updates = [self.driver.page_source]
             last_force_scan = now
         else:
-            updates = self._drain_odds_mutation_buffer()
-            if not updates:
+            changed = self._drain_odds_mutation_buffer()
+            if not changed:
                 return last_force_scan, False
+            updates = [self.driver.page_source]
 
         for html_chunk in updates:
             games = self._parse_games_from_html(html_chunk)

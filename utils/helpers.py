@@ -259,15 +259,29 @@ def format_website(url):
     return website.split('/')[0]  # Return only the domain
 
 
-def format_utc_timestamp(ts=None) -> str:
-    """Format a Unix timestamp (or now) for Telegram/log alerts."""
-    from datetime import datetime, timezone
+TELEGRAM_TZ = pytz.timezone("America/New_York")
 
-    if ts is None:
-        dt = datetime.now(timezone.utc)
+
+def _as_eastern(ts=None, dt=None):
+    """Normalize unix timestamp or datetime to US Eastern (handles naive UTC datetimes)."""
+    if dt is not None:
+        if dt.tzinfo is None:
+            dt = pytz.UTC.localize(dt)
+        else:
+            dt = dt.astimezone(pytz.UTC)
+    elif ts is None:
+        dt = datetime.now(pytz.UTC)
     else:
-        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        dt = datetime.fromtimestamp(float(ts), tz=pytz.UTC)
+    return dt.astimezone(TELEGRAM_TZ)
+
+
+def format_utc_timestamp(ts=None, *, dt=None, time_only: bool = False) -> str:
+    """Format a timestamp for Telegram alerts in US Eastern Time (EST/EDT)."""
+    eastern = _as_eastern(ts=ts, dt=dt)
+    if time_only:
+        return eastern.strftime("%H:%M:%S %Z")
+    return eastern.strftime("%Y-%m-%d %H:%M:%S %Z")
 
 async def send_telegram_alert(alert, chat_id = None) -> None:
     tracemalloc.start()
@@ -298,7 +312,7 @@ async def send_monitoring_alert(website, account, ex, chat_id = None) -> None:
         if not chat_id:
             print("No monitoring chat_id - skipping telegram error alert")
             return
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = format_utc_timestamp()
 
         exception_msg = f"{str(ex)}"
         tb_list = traceback.format_exception(type(ex), ex, ex.__traceback__, limit=3)
@@ -750,6 +764,153 @@ def align_cross_book_moneylines(o1: dict, o2: dict):
             o2["moneyline_team_1"],
         )
     return None
+
+
+def normalize_spread_value(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def spread_values_match(a, b, tolerance: float = 0.01) -> bool:
+    left = normalize_spread_value(a)
+    right = normalize_spread_value(b)
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= tolerance
+
+
+def align_cross_book_spreads(o1: dict, o2: dict):
+    """
+    Return spread juice on o1's team_1/team_2 orientation:
+    (o1_t1_spread_odds, o1_t2_spread_odds, o2_t1_spread_odds, o2_t2_spread_odds, spread_value)
+    or None if teams/lines do not match.
+    """
+    line_1 = normalize_spread_value(o1.get("spread_value"))
+    line_2 = normalize_spread_value(o2.get("spread_value"))
+    if line_1 is None or line_2 is None:
+        return None
+
+    if teams_same(o1["team_1"], o2["team_1"]) and teams_same(o1["team_2"], o2["team_2"]):
+        if not spread_values_match(line_1, line_2):
+            return None
+        return (
+            o1.get("spread_team_1"),
+            o1.get("spread_team_2"),
+            o2.get("spread_team_1"),
+            o2.get("spread_team_2"),
+            line_1,
+        )
+
+    if teams_same(o1["team_1"], o2["team_2"]) and teams_same(o1["team_2"], o2["team_1"]):
+        if not spread_values_match(line_1, -line_2):
+            return None
+        return (
+            o1.get("spread_team_1"),
+            o1.get("spread_team_2"),
+            o2.get("spread_team_2"),
+            o2.get("spread_team_1"),
+            line_1,
+        )
+
+    return None
+
+
+def is_plausible_spread_pair(spread_value, spread_team_1, spread_team_2) -> bool:
+    if normalize_spread_value(spread_value) is None:
+        return False
+    try:
+        a = float(spread_team_1)
+        b = float(spread_team_2)
+    except (TypeError, ValueError):
+        return False
+    if a == 0.0 or b == 0.0:
+        return False
+    if not ((a > 0 and b < 0) or (a < 0 and b > 0)):
+        return False
+    return spread_odds_match_line_side(spread_value, spread_team_1, spread_team_2)
+
+
+def spread_odds_match_line_side(spread_value, spread_team_1, spread_team_2) -> bool:
+    """Favorite (negative line on team_1) should have negative juice; dog positive."""
+    sv = normalize_spread_value(spread_value)
+    if sv is None:
+        return False
+    try:
+        t1 = float(spread_team_1)
+        t2 = float(spread_team_2)
+    except (TypeError, ValueError):
+        return False
+    if sv < 0:
+        return t1 < 0 and t2 > 0
+    if sv > 0:
+        return t1 > 0 and t2 < 0
+    return False
+
+
+def fix_spread_odds_orientation(spread_value, spread_team_1, spread_team_2):
+    """Swap spread odds when they contradict spread_value / favorite side."""
+    if spread_odds_match_line_side(spread_value, spread_team_1, spread_team_2):
+        return spread_team_1, spread_team_2
+    if spread_odds_match_line_side(spread_value, spread_team_2, spread_team_1):
+        return spread_team_2, spread_team_1
+    return spread_team_1, spread_team_2
+
+
+def spread_odds_rows_fresh_for_arb(
+    created_at_1,
+    created_at_2,
+    *,
+    max_age_seconds: int,
+    max_gap_seconds: int,
+    now=None,
+) -> bool:
+    """Both spread snapshots must be recent and close in time."""
+    if created_at_1 is None or created_at_2 is None:
+        return False
+    if now is None:
+        now = datetime.utcnow()
+    age_1 = max(0.0, (now - created_at_1).total_seconds())
+    age_2 = max(0.0, (now - created_at_2).total_seconds())
+    if age_1 > max_age_seconds or age_2 > max_age_seconds:
+        return False
+    gap = abs((created_at_1 - created_at_2).total_seconds())
+    return gap <= max_gap_seconds
+
+
+def spread_market_label(spread_value, sport: str | None = None) -> str:
+    line = normalize_spread_value(spread_value)
+    sport_l = (sport or "").strip().lower()
+    if sport_l in ("mlb", "baseball") and line is not None and abs(abs(line) - 1.5) <= 0.01:
+        return f"run_line ({line:+.1f})"
+    if line is None:
+        return "spread"
+    return f"spread ({line:+.1f})"
+
+
+def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None]:
+    """Parse handicap + American odds from a spread/run-line bet label."""
+    import re
+
+    if label is None:
+        return None, None
+    text = (label.get("title") if hasattr(label, "get") else None) or getattr(label, "text", "") or ""
+    text = str(text).strip()
+    match = re.search(r"([+-]?\d+(?:\.\d+)?)\s+([+-]?\d+)\s*$", text)
+    if match:
+        try:
+            spread = float(match.group(1))
+            odds = match.group(2)
+            # S411 shows "Team 0 0" when run line is not posted yet.
+            if spread == 0.0 and odds.lstrip("+-") == "0":
+                return None, None
+            return spread, odds
+        except (TypeError, ValueError):
+            return None, None
+    return None, None
 
 
 def is_plausible_moneyline_pair(ml_1, ml_2) -> bool:

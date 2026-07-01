@@ -57,9 +57,10 @@ class ParadiseWagerController:
         "invalid token",
         "http 401",
     )
-    ODDS_WATCH_POLL_SECONDS = float(os.getenv("PARADISE_ODDS_POLL_SEC", "2.5"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("PARADISE_ODDS_POLL_SEC", "5"))
     ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("PARADISE_ODDS_FORCE_SCAN_SEC", "5"))
-    ODDS_IDLE_POLL_SECONDS = float(os.getenv("PARADISE_ODDS_IDLE_POLL_SEC", "2.5"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("PARADISE_ODDS_IDLE_POLL_SEC", "5"))
+    ODDS_OBSERVER_SELECTORS = ["app-root", "app-schedule", ".schedule-container", "body"]
 
     def __init__(self, account, site, sport="baseball"):
         self.account_id = account.account
@@ -254,6 +255,113 @@ class ParadiseWagerController:
             text = str(odds).strip()
             return text if text.startswith(("+", "-")) else f"+{text}"
 
+    @staticmethod
+    def _decode_paradise_spread_magnitude(raw) -> int | None:
+        """Decode Paradise spread price to unsigned American odds magnitude."""
+        from utils.helpers import decimal_to_american
+
+        if raw is None or raw == "":
+            return None
+        try:
+            text = str(raw).strip()
+            signed = float(text.replace("+", ""))
+        except (TypeError, ValueError):
+            return None
+
+        if text.startswith("-") or text.startswith("+"):
+            return int(abs(signed))
+
+        # Decimal odds encoded as integer cents (231 == 2.31, 265 == 2.65).
+        if 200 <= abs(signed) <= 999:
+            dec = abs(signed) / 100.0
+            if 1.01 <= dec <= 5.0:
+                return abs(int(decimal_to_american(dec)))
+
+        if 1.0 < abs(signed) <= 10.0:
+            return abs(int(decimal_to_american(abs(signed))))
+
+        return int(abs(signed))
+
+    @staticmethod
+    def _american_from_handicap_and_raw(handicap, raw) -> str | None:
+        mag = ParadiseWagerController._decode_paradise_spread_magnitude(raw)
+        if mag is None:
+            return None
+        try:
+            h = float(handicap)
+        except (TypeError, ValueError):
+            return ParadiseWagerController._normalize_us_odds(raw)
+
+        if h < 0:
+            return str(-mag)
+        if h > 0:
+            return ParadiseWagerController._normalize_us_odds(mag)
+        return ParadiseWagerController._normalize_us_odds(raw)
+
+    @staticmethod
+    def _normalize_paradise_spread_american_odds(
+        odds_1,
+        odds_2,
+        handicap_1=None,
+        handicap_2=None,
+    ):
+        """Paradise spread API uses decimal*100 or unsigned American — use handicaps for sign."""
+        def to_float(raw):
+            if raw is None or raw == "":
+                return None
+            try:
+                return float(str(raw).replace("+", ""))
+            except (TypeError, ValueError):
+                return None
+
+        o1, o2 = to_float(odds_1), to_float(odds_2)
+        if o1 is None or o2 is None:
+            return odds_1, odds_2
+
+        if (o1 > 0 and o2 < 0) or (o1 < 0 and o2 > 0):
+            return (
+                ParadiseWagerController._normalize_us_odds(o1),
+                ParadiseWagerController._normalize_us_odds(o2),
+            )
+
+        if handicap_1 is not None or handicap_2 is not None:
+            a1 = ParadiseWagerController._american_from_handicap_and_raw(handicap_1, odds_1)
+            a2 = ParadiseWagerController._american_from_handicap_and_raw(handicap_2, odds_2)
+            if a1 is not None and a2 is not None:
+                return a1, a2
+
+        if 1.0 < o1 <= 10.0 and 1.0 < o2 <= 10.0:
+            from utils.helpers import decimal_to_american
+            a1 = int(decimal_to_american(o1))
+            a2 = int(decimal_to_american(o2))
+            return (
+                ParadiseWagerController._normalize_us_odds(a1),
+                ParadiseWagerController._normalize_us_odds(a2),
+            )
+
+        hi = max(abs(o1), abs(o2))
+        lo = min(abs(o1), abs(o2))
+        if hi >= 250 and lo >= 100:
+            from utils.helpers import decimal_to_american
+            d1, d2 = abs(o1) / 100.0, abs(o2) / 100.0
+            if 1.2 <= d1 <= 5.0 and 1.2 <= d2 <= 5.0:
+                a1 = int(decimal_to_american(d1))
+                a2 = int(decimal_to_american(d2))
+                return (
+                    ParadiseWagerController._normalize_us_odds(a1),
+                    ParadiseWagerController._normalize_us_odds(a2),
+                )
+
+        m1 = ParadiseWagerController._decode_paradise_spread_magnitude(odds_1)
+        m2 = ParadiseWagerController._decode_paradise_spread_magnitude(odds_2)
+        if m1 is None or m2 is None:
+            return odds_1, odds_2
+        if m1 == m2:
+            return str(int(o1)), str(int(o2))
+        if m1 < m2:
+            return str(-m1), ParadiseWagerController._normalize_us_odds(m2)
+        return ParadiseWagerController._normalize_us_odds(m1), str(-m2)
+
     def _odds_text_matches(self, displayed: str, expected) -> bool:
         disp = self._normalize_us_odds((displayed or "").strip())
         exp = self._normalize_us_odds(expected)
@@ -422,6 +530,7 @@ class ParadiseWagerController:
 
             self.driver.get(self.schedule_url)
             time.sleep(3)
+            self._ensure_odds_mutation_observer()
             self.logger.info("Login Successful (player-api token acquired)")
             return True
 
@@ -622,6 +731,30 @@ class ParadiseWagerController:
 
         return parse_to_mysql_datetime(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tz_name=tz_name)
 
+    @staticmethod
+    def _extract_team_spread_entry(team: dict):
+        line_sets = (team.get("ls") or {})
+        for key in ("s", "sp", "ps", "rl"):
+            spreads = line_sets.get(key) or []
+            if not spreads:
+                continue
+            entry = spreads[0] if isinstance(spreads, list) else spreads
+            if not isinstance(entry, dict):
+                continue
+            handicap = entry.get("h")
+            if handicap is None:
+                handicap = entry.get("p")
+            if handicap is None:
+                handicap = entry.get("line")
+            odds = entry.get("o")
+            if handicap is None or odds is None:
+                continue
+            try:
+                return float(handicap), str(odds)
+            except (TypeError, ValueError):
+                continue
+        return None, None
+
     def _parse_schedule_response(self, schedule_data: list):
         games = []
         parsed_rows = []
@@ -650,11 +783,14 @@ class ParadiseWagerController:
                         rotation = str(team.get("rn") or "").strip()
                         moneylines = (team.get("ls") or {}).get("m") or []
                         ml = moneylines[0] if moneylines else {}
+                        spread_val, spread_odds = self._extract_team_spread_entry(team)
                         team_entries.append({
                             "name": name,
                             "rotation": rotation,
                             "line_id": ml.get("i"),
                             "odds": ml.get("o"),
+                            "spread_val": spread_val,
+                            "spread_odds": spread_odds,
                         })
 
                     if not team_entries[0]["rotation"] or not team_entries[1]["rotation"]:
@@ -666,6 +802,23 @@ class ParadiseWagerController:
                     game_dt = self._format_game_datetime(
                         league_date, game.get("t") or game.get("to") or "", tz_name
                     )
+
+                    spread_val = team_entries[0].get("spread_val")
+                    spread_1_odds = team_entries[0].get("spread_odds")
+                    spread_2_odds = team_entries[1].get("spread_odds")
+                    if spread_val is None:
+                        spread_val = team_entries[1].get("spread_val")
+                        if spread_val is not None:
+                            spread_val = -float(spread_val)
+                    if spread_1_odds is not None and spread_2_odds is not None:
+                        spread_1_odds, spread_2_odds = (
+                            self._normalize_paradise_spread_american_odds(
+                                spread_1_odds,
+                                spread_2_odds,
+                                team_entries[0].get("spread_val"),
+                                team_entries[1].get("spread_val"),
+                            )
+                        )
 
                     row = {
                         "bookmaker": self.bookmaker,
@@ -681,8 +834,10 @@ class ParadiseWagerController:
                             "team_2": str(team_entries[1]["odds"]),
                         },
                         "spread": {
-                            "team_1_spread": None, "team_2_spread": None,
-                            "team_1_odds": None, "team_2_odds": None,
+                            "team_1_spread": spread_val,
+                            "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                            "team_1_odds": spread_1_odds,
+                            "team_2_odds": spread_2_odds,
                         },
                         "total": {
                             "over_total": None, "under_total": None,
@@ -997,10 +1152,28 @@ class ParadiseWagerController:
                 self._scan_health.mark_failure(str(e))
             return False
 
-    def _poll_odds_watch_once(self, source: str = "watch", force_relogin: bool = False) -> int:
+    def _ensure_odds_mutation_observer(self) -> bool:
+        from utils.odds_observer import ensure_mutation_observer
+        return ensure_mutation_observer(
+            self.driver, self.ODDS_OBSERVER_SELECTORS, self.logger
+        )
+
+    def _tick_odds_on_idle(self, last_force_scan: float, idle_label: str = "betting-idle"):
+        from utils.odds_watch_tick import tick_controller_odds_watch
+        return tick_controller_odds_watch(
+            self, last_force_scan, idle_label=idle_label
+        )
+
+    def _poll_odds_watch_once(
+        self,
+        source: str = "watch",
+        force_relogin: bool = False,
+        force_scan: bool = False,
+        **kwargs,
+    ) -> int:
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
-        if force_relogin or self._force_wager_relogin or not self._access_token:
+        if force_relogin or force_scan or self._force_wager_relogin or not self._access_token:
             self.__login()
         try:
             games = self._refresh_schedule_cache()
@@ -1048,18 +1221,19 @@ class ParadiseWagerController:
         )
 
     def _maybe_poll_odds_while_idle(self):
-        if not hasattr(self, "_last_idle_odds_poll"):
-            self._last_idle_odds_poll = 0.0
-        now = time.monotonic()
-        if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
-            return
-        self._last_idle_odds_poll = now
+        if not hasattr(self, "_last_odds_force_scan"):
+            self._last_odds_force_scan = 0.0
         try:
-            self._poll_odds_watch_once(source="betting-idle")
+            self._last_odds_force_scan, processed = self._tick_odds_on_idle(
+                self._last_odds_force_scan,
+                idle_label="betting-idle",
+            )
+            if not processed:
+                return
         except SessionUnauthorizedError as e:
             self._recover_odds_session(str(e), recover_driver=True)
             try:
-                self._poll_odds_watch_once(source="betting-idle-relogin")
+                self._poll_odds_watch_once(source="betting-idle-relogin", force_relogin=True)
             except Exception as relogin_err:
                 self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
         except Exception as e:
@@ -1067,7 +1241,7 @@ class ParadiseWagerController:
             if "401" in msg or "unauthorized" in msg:
                 self._recover_odds_session(str(e), recover_driver=True)
                 try:
-                    self._poll_odds_watch_once(source="betting-idle-relogin")
+                    self._poll_odds_watch_once(source="betting-idle-relogin", force_relogin=True)
                 except Exception as relogin_err:
                     self.logger.warning(f"Idle odds poll after re-login failed: {relogin_err}")
             else:
@@ -1118,30 +1292,23 @@ class ParadiseWagerController:
         try:
             while True:
                 watchdog.beat()
-                now = time.monotonic()
-                force_scan = (
-                    last_force_scan == 0.0
-                    or (now - last_force_scan) >= force_scan_interval
-                )
-                if force_scan:
-                    self.logger.info("Odds watch — scheduled refresh")
-                    last_force_scan = now
-
                 try:
-                    self._poll_odds_watch_once(
-                        source="watch-refresh" if force_scan else "watch",
-                        force_relogin=force_scan,
+                    last_force_scan, processed = self._tick_odds_on_idle(
+                        last_force_scan, idle_label="watch"
                     )
                 except SessionUnauthorizedError as e:
                     self.logger.warning(f"Odds watch poll unauthorized: {e}")
                     self._recover_odds_session(str(e), recover_driver=True)
+                    processed = False
                 except Exception as e:
                     msg = str(e).lower()
                     self.logger.warning(f"Odds watch poll failed: {e}")
                     if "401" in msg or "unauthorized" in msg:
                         self._recover_odds_session(str(e), recover_driver=True)
+                    processed = False
 
-                time.sleep(poll_interval)
+                if not processed:
+                    time.sleep(poll_interval)
 
         except KeyboardInterrupt:
             self.logger.info("Paradise odds watch stopped by user")

@@ -41,7 +41,10 @@ engine1 = create_engine(
 Session1 = sessionmaker(bind=engine1, autoflush=False, autocommit=False)
 session1 = Session1()
 
-Base.metadata.create_all(bind=engine1)
+import os as _os
+
+if _os.getenv("SKIP_DB_BOOTSTRAP") != "1":
+    Base.metadata.create_all(bind=engine1)
 
 
 def __get_db1_session__():

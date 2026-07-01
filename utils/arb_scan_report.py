@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 
 from controllers.ArbitrageController import ArbitrageController
 from utils.config import ACTIVE_ARB_BOOKMAKERS, ACTIVE_ARB_BOOK_PAIRS, ARB_MAX_TOTAL_PROB, MIN_ARB_PROFIT_PCT
-from utils.helpers import is_plausible_moneyline_pair, normalize_team, teams_same
+from utils.helpers import format_utc_timestamp, is_plausible_moneyline_pair, normalize_team, teams_same
 from utils.game_registry import matchup_group_key
 
 SCAN_ODDS_WINDOW_MINUTES = 10
@@ -19,6 +19,8 @@ BOOK_LABELS = {
     "betamapola": "Amapola",
     "paradisewager": "Paradise",
     "betwar": "BetWar",
+    "lowvig": "LowVig",
+    "3et": "3et",
 }
 
 
@@ -76,7 +78,9 @@ def _book_freshness_lines(odds: list) -> List[str]:
         ts = latest_by_book[book]
         age_s = max(0, int((now - ts).total_seconds()))
         label = BOOK_LABELS.get(book, book)
-        lines.append(f"  {label:<9} {ts.strftime('%H:%M:%S')} UTC ({age_s}s ago)")
+        lines.append(
+            f"  {label:<9} {format_utc_timestamp(dt=ts, time_only=True)} ({age_s}s ago)"
+        )
     return lines
 
 
@@ -228,7 +232,7 @@ def _build_scan_report_with_db(db, minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> s
             continue
         _store_matchup_row(by_matchup, row)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now = format_utc_timestamp()
     if MIN_ARB_PROFIT_PCT != 0:
         threshold_line = (
             f"Execute when profit >= {MIN_ARB_PROFIT_PCT:.2f}% "

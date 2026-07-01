@@ -135,8 +135,7 @@ class Storage:
             self.logger.warning("DB - No odds to save")
             return False
         
-        # Only save if bet_type is 'moneyline'
-        if odd.get("bet_type") != "moneyline":
+        if odd.get("bet_type") not in ("moneyline", "spread"):
             self.logger.info(f"DB - Skipping odds with bet_type = {odd.get('bet_type')}")
             self.logger.info("========== Save Odds (END) ==========")
             return False

@@ -32,6 +32,17 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 35
 
+  # LowVig: Browser API connects + login form loads; password entry blocked until Bright Data KYC approval.
+  # - name: lowvig_betting
+  #   script: lowvig_betting.py
+  #   interval_seconds: 30
+  #   start_offset_seconds: 40
+
+  - name: threeet_betting
+    script: threeet_betting.py
+    interval_seconds: 30
+    start_offset_seconds: 42
+
   - name: telegram_ops_bot
     script: telegram_ops_bot.py
     interval_seconds: 300

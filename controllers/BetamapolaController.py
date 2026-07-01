@@ -39,9 +39,10 @@ class BetamapolaController:
         "session expired",
         "logged out",
     )
-    ODDS_WATCH_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_POLL_SEC", "1.5"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_POLL_SEC", "5"))
     ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("BETAMAPOLA_ODDS_FORCE_SCAN_SEC", "5"))
-    ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_IDLE_POLL_SEC", "2"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_IDLE_POLL_SEC", "5"))
+    ODDS_OBSERVER_SELECTORS = ["#GameLines", "#gamesAccordion", "#GameLinesCtrl"]
 
     # ===================================================================
     # Betamapola.com - uses identical browser/scraping stack as Sports411
@@ -342,22 +343,21 @@ class BetamapolaController:
             raise
 
     def __inject_mutation_observer(self):
-        # Kept for parity (not strictly required for current SPA)
-        self.logger.info("Injecting Mutation Observer (JS)")
-        script = """
-        if (!window.oddsObserverInstalled) {
-            window.oddsObserverInstalled = true;
-            window.oddsBuffer = [];
-            const target = document.getElementById('GameLines') || document.getElementById('gamesAccordion');
-            if (!target) { console.log("Observer: target not found"); return; }
-            const observer = new MutationObserver((mutations) => {
-                window.oddsBuffer.push(target.innerHTML);
-            });
-            observer.observe(target, { childList: true, subtree: true, characterData: true });
-            console.log("MutationObserver installed");
-        }
-        """
-        self.driver.execute_script(script)
+        from utils.odds_observer import install_mutation_observer
+        self.logger.info("Injecting MutationObserver on game lines (JS)")
+        install_mutation_observer(self.driver, self.ODDS_OBSERVER_SELECTORS, self.logger)
+
+    def _ensure_odds_mutation_observer(self) -> bool:
+        from utils.odds_observer import ensure_mutation_observer
+        return ensure_mutation_observer(
+            self.driver, self.ODDS_OBSERVER_SELECTORS, self.logger
+        )
+
+    def _tick_odds_on_idle(self, last_force_scan: float, idle_label: str = "betting-idle"):
+        from utils.odds_watch_tick import tick_controller_odds_watch
+        return tick_controller_odds_watch(
+            self, last_force_scan, idle_label=idle_label
+        )
 
     # ===================================================================
     # Direct API access (GetSportOffering) - the reliable path
@@ -735,6 +735,7 @@ class BetamapolaController:
         else:
             self.logger.warning(f"{self.sport_name} lines not visible in DOM or API after navigation")
 
+        self._ensure_odds_mutation_observer()
         return lines_ready
 
     def _fetch_game_lines_via_api(self):
@@ -862,7 +863,8 @@ class BetamapolaController:
             if games:
                 return games, "api"
 
-        if allow_dom_fallback and self._sport_games_present():
+        use_dom = allow_dom_fallback or self._sport_games_present()
+        if use_dom and self._sport_games_present():
             html = self.driver.page_source
             soup = BeautifulSoup(html, "html.parser")
             games = []
@@ -913,7 +915,7 @@ class BetamapolaController:
             return match.group(1).strip(), match.group(2).strip()
         return None, None
 
-    def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch") -> int:
+    def _poll_odds_watch_once(self, force_scan: bool = False, source: str = "watch", **kwargs) -> int:
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
         games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
@@ -932,17 +934,18 @@ class BetamapolaController:
         )
 
     def _maybe_poll_odds_while_idle(self):
-        """Same-browser odds poll while betting loop waits (avoids second login session)."""
-        if not hasattr(self, "_last_idle_odds_poll"):
-            self._last_idle_odds_poll = 0.0
-        now = time.monotonic()
-        if now - self._last_idle_odds_poll < self.ODDS_IDLE_POLL_SECONDS:
-            return
-        self._last_idle_odds_poll = now
+        """DOM-triggered or timed ML + spread poll while betting loop is idle."""
+        if not hasattr(self, "_last_odds_force_scan"):
+            self._last_odds_force_scan = 0.0
         if not self._is_session_valid():
             return
         try:
-            self._poll_odds_watch_once(source="betting-idle")
+            self._last_odds_force_scan, processed = self._tick_odds_on_idle(
+                self._last_odds_force_scan,
+                idle_label="betting-idle",
+            )
+            if not processed:
+                return
         except Exception as e:
             self.logger.warning(f"Idle odds poll failed: {e}")
 
@@ -1009,16 +1012,11 @@ class BetamapolaController:
 
                 consecutive_recoveries = 0
                 now = time.monotonic()
-                force_scan = (
-                    last_force_scan == 0.0
-                    or (now - last_force_scan) >= force_scan_interval
+                last_force_scan, processed = self._tick_odds_on_idle(
+                    last_force_scan, idle_label="watch"
                 )
-                if force_scan:
-                    self.logger.info("Odds watch — force scan")
-                    last_force_scan = now
-
-                self._poll_odds_watch_once(force_scan=force_scan, source="watch")
-                time.sleep(poll_interval)
+                if not processed:
+                    time.sleep(poll_interval)
 
         except KeyboardInterrupt:
             self.logger.info("Betamapola odds watch stopped by user")
