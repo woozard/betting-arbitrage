@@ -25,6 +25,7 @@ from utils.helpers import (
     send_monitoring_alert,
     teams_same,
     arb_live_odds_acceptable,
+    american_odds_to_int,
 )
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
@@ -550,15 +551,15 @@ class FourCastersController:
             )
 
         try:
-            american_odds = int(str(moneyline_odd).replace("+", ""))
-        except ValueError as e:
+            american_odds = american_odds_to_int(moneyline_odd)
+        except (TypeError, ValueError) as e:
             raise FourCastersApiError(f"Invalid American odds: {moneyline_odd}") from e
 
         use_odds = american_odds
         if live_odds is not None:
             try:
-                use_odds = int(str(live_odds).replace("+", ""))
-            except ValueError:
+                use_odds = american_odds_to_int(live_odds)
+            except (TypeError, ValueError):
                 use_odds = american_odds
 
         confirmed, message = self._place_bet_via_api(
