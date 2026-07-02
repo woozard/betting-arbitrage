@@ -54,6 +54,19 @@ from cache.arbitrage_cache import ArbitrageCache
 
 
 class BetWarController:
+    # Alternate-period markers in bet slip / My Bets (F5, halves, etc.) — not full-game ML.
+    _NON_FULL_GAME_ML_MARKERS = (
+        "(1st5)",
+        "1st5",
+        "1st half",
+        "2nd half",
+        "first 5",
+        "f5 innings",
+        "(1h)",
+        "(2h)",
+        " 1h ",
+        " 2h ",
+    )
     WAGER_SESSION_EXPIRED_MARKERS = (
         "please log in",
         "session expired",
@@ -710,18 +723,41 @@ class BetWarController:
             self.logger.warning(f"Could not save bet board debug: {e}")
 
     def _pick_moneyline_click_target(self, ml_card):
-        if (ml_card.get_attribute("data-linekey") or "").strip():
+        linekey = (ml_card.get_attribute("data-linekey") or "").strip()
+        if linekey:
+            if not self._linekey_is_full_game_moneyline(linekey):
+                return None
             return ml_card
         if ml_card.get_attribute("onclick"):
+            try:
+                ancestor = ml_card.find_element(
+                    By.XPATH, "./ancestor-or-self::*[@data-linekey][1]"
+                )
+                lk = (ancestor.get_attribute("data-linekey") or "").strip()
+                if lk and not self._linekey_is_full_game_moneyline(lk):
+                    return None
+            except Exception:
+                pass
             return ml_card
         try:
-            return ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@data-linekey][1]")
+            ancestor = ml_card.find_element(
+                By.XPATH, "./ancestor-or-self::*[@data-linekey][1]"
+            )
+            lk = (ancestor.get_attribute("data-linekey") or "").strip()
+            if lk and self._linekey_is_full_game_moneyline(lk):
+                return ancestor
         except Exception:
             pass
         try:
-            return ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@onclick][1]")
+            onclick_parent = ml_card.find_element(
+                By.XPATH, "./ancestor-or-self::*[@onclick][1]"
+            )
+            lk = self._extract_data_linekey(onclick_parent)
+            if lk and not self._linekey_is_full_game_moneyline(lk):
+                return None
+            return onclick_parent
         except Exception:
-            return ml_card
+            return None
 
     @staticmethod
     def _linekey_team_segment(linekey: str) -> int | None:
@@ -735,6 +771,37 @@ class BetWarController:
         """Full-game ML keys use {GameNum}-1-{team}-1-{period}; F5 uses -8- in segment 2."""
         parts = (linekey or "").split("-")
         return len(parts) >= 5 and parts[1] == "1" and parts[3] == "1"
+
+    def _element_is_full_game_moneyline(self, elem) -> bool:
+        """True only when the DOM target is a full-game moneyline (not F5 / half / alt period)."""
+        if not elem:
+            return False
+        linekey = self._extract_data_linekey(elem)
+        if linekey:
+            return self._linekey_is_full_game_moneyline(linekey)
+        elem_id = (elem.get_attribute("id") or "").strip()
+        match = re.match(r"M(\d)_(\d+)_(\d+)", elem_id, re.I)
+        if match:
+            return int(match.group(3)) == 0
+        return False
+
+    @classmethod
+    def _text_indicates_non_full_game_ml(cls, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(marker in lowered for marker in cls._NON_FULL_GAME_ML_MARKERS)
+
+    def _assert_betslip_is_full_game_moneyline(self, team_name: str) -> None:
+        """Abort before wagering if the slip shows an alternate-period market."""
+        slip = self._betslip_text()
+        if not slip:
+            return
+        if self._text_indicates_non_full_game_ml(slip):
+            raise Exception(
+                f"Bet slip shows alternate-period market (not full-game ML) for {team_name}: "
+                f"{slip[:250]}"
+            )
 
     def _extract_data_linekey(self, elem):
         if not elem:
@@ -871,9 +938,9 @@ class BetWarController:
                         continue
                 txt = (ml_card.text or "").strip()
                 target = self._pick_moneyline_click_target(ml_card)
-                if self._odds_text_matches(txt, moneyline_odd):
+                if target and self._odds_text_matches(txt, moneyline_odd):
                     return target
-                if fallback is None and (linekey or ml_card.get_attribute("onclick")):
+                if fallback is None and target and (linekey or ml_card.get_attribute("onclick")):
                     fallback = target
 
             if fallback is not None and (
@@ -975,7 +1042,7 @@ class BetWarController:
         game_line = None
         parsed_team_no = None
 
-        if moneyline_elem:
+        if moneyline_elem and self._element_is_full_game_moneyline(moneyline_elem):
             game_line, parsed_team_no = self._parse_game_line_from_button(
                 moneyline_elem, game_id
             )
@@ -983,6 +1050,12 @@ class BetWarController:
                 team_no = parsed_team_no
             if game_line and game_line.get("GameNum") is not None:
                 return game_line, team_no
+        elif moneyline_elem:
+            lk = self._extract_data_linekey(moneyline_elem)
+            self.logger.warning(
+                f"Ignoring non-full-game moneyline element (linekey={lk}) for {team_name}; "
+                "resolving full-game line via API/linekey lookup"
+            )
 
         try:
             api_gl, api_team_no = self._lookup_game_line_from_api(game_id, team_name)
@@ -1009,11 +1082,36 @@ class BetWarController:
             return game_line, team_no
         return self._minimal_game_line_from_rotations(rotations), team_no
 
-    def _infer_team_no(self, team_name: str, team_1: str = None, team_2: str = None) -> int | None:
-        if team_1 and self._team_name_matches(team_1, team_name):
-            return 1
-        if team_2 and self._team_name_matches(team_2, team_name):
-            return 2
+    def _find_moneyline_by_linekey_first(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd,
+        team_no: int | None = None,
+    ):
+        """Prefer exact full-game linekey match (safest for ML placement)."""
+        try:
+            api_gl, api_team_no = self._lookup_game_line_from_api(game_id, team_name)
+            if not api_gl or api_gl.get("GameNum") is None:
+                return None
+            tn = team_no if team_no in (1, 2) else api_team_no
+            if tn not in (1, 2):
+                return None
+            keyed = self._find_ml_element_by_linekey(api_gl["GameNum"], tn)
+            if not keyed:
+                return None
+            txt = (keyed.text or "").strip()
+            tol = getattr(self, "_odds_tolerance", 0) or 0
+            if self._odds_text_matches(txt, moneyline_odd) or tol > 0:
+                self.logger.info(
+                    f"Full-game ML via linekey {self._extract_data_linekey(keyed)} "
+                    f"for {team_name} @ {moneyline_odd}"
+                )
+                return keyed
+        except SessionUnauthorizedError:
+            raise
+        except Exception as e:
+            self.logger.debug(f"Linekey-first moneyline lookup failed: {e}")
         return None
 
     def _find_moneyline_on_board(
@@ -1023,18 +1121,33 @@ class BetWarController:
         moneyline_odd,
         team_no: int | None = None,
     ):
-        """Locate a clickable moneyline using only the loaded Player portal DOM."""
+        """Locate a clickable full-game moneyline on the loaded Player portal DOM."""
+        elem = self._find_moneyline_by_linekey_first(
+            game_id, team_name, moneyline_odd, team_no=team_no
+        )
+        if elem:
+            return elem
         elem = self._find_moneyline_by_rotation(
             game_id, team_name, moneyline_odd, team_no=team_no
         )
-        if elem:
+        if elem and self._element_is_full_game_moneyline(elem):
             return elem
         elem = self._find_player_moneyline_element(game_id, team_name, moneyline_odd)
-        if elem:
+        if elem and self._element_is_full_game_moneyline(elem):
             return elem
-        return self._find_moneyline_element(
+        elem = self._find_moneyline_element(
             game_id, team_name, moneyline_odd, team_no=team_no
         )
+        if elem and self._element_is_full_game_moneyline(elem):
+            return elem
+        return None
+
+    def _infer_team_no(self, team_name: str, team_1: str = None, team_2: str = None) -> int | None:
+        if team_1 and self._team_name_matches(team_1, team_name):
+            return 1
+        if team_2 and self._team_name_matches(team_2, team_name):
+            return 2
+        return None
 
     def _ensure_bet_board_ready(self, game_id: str | None = None) -> bool:
         """Ensure lines are visible for clicking; reload when target rotations are missing."""
@@ -1339,13 +1452,37 @@ class BetWarController:
     def _betslip_shows_insufficient_available(self) -> bool:
         return "insufficient available" in self._betslip_text().lower()
 
-    def _submit_place_bets_with_retries(self, max_attempts: int = 10) -> bool:
+    def _prepare_betslip_for_submit(self, stake_plan: BaseAmountStake | None = None) -> None:
+        """Settle bet slip UI before Place Bets (reduces transient 'Insufficient available')."""
+        self._ensure_betslip_expanded()
+        self._accept_line_changes()
+        if stake_plan is not None:
+            fill_betslip_stake_input(
+                self.driver,
+                stake_plan,
+                self.logger,
+                scope_css="#divBetSlip, #pills-betslip",
+            )
+        self._fill_wager_password_if_required()
+        time.sleep(0.6)
+
+    def _submit_place_bets_with_retries(
+        self, max_attempts: int = 10, stake_plan: BaseAmountStake | None = None,
+    ) -> bool:
         """
-        BetWar sometimes shows transient 'Insufficient available' on first Place Bets click.
-        Retry processWagers until the slip shows Wager(s) Confirmed or a hard rejection.
+        BetWar often shows transient 'Insufficient available' on the first Place Bets click.
+        Re-settle the slip and retry until confirmed or a hard rejection.
         """
         last_slip = ""
         for attempt in range(1, max_attempts + 1):
+            self._prepare_betslip_for_submit(
+                stake_plan=stake_plan if attempt > 1 else None
+            )
+            if attempt == 1:
+                self.logger.info(
+                    "Submitting Place Bets (retry if 'Insufficient available' appears)"
+                )
+
             if not self._click_place_bets_button():
                 raise Exception("Place Bets button not found")
 
@@ -1359,7 +1496,7 @@ class BetWarController:
             if self._betslip_shows_insufficient_available():
                 self.logger.warning(
                     f"BetWar 'Insufficient available' on attempt {attempt}/{max_attempts}; "
-                    "retrying Place Bets"
+                    "re-settling slip and retrying Place Bets"
                 )
                 continue
 
@@ -1494,6 +1631,22 @@ class BetWarController:
         """Click DOM and/or Angular until the bet slip actually contains the team."""
         self._prepare_bet_slip_for_wager()
         game_num = game_line.get("GameNum")
+        if moneyline_elem and not self._element_is_full_game_moneyline(moneyline_elem):
+            lk = self._extract_data_linekey(moneyline_elem)
+            self.logger.warning(
+                f"Rejecting non-full-game moneyline element (linekey={lk}); "
+                f"using full-game linekey lookup for GameNum={game_num}"
+            )
+            moneyline_elem = None
+
+        if game_num and team_no in (1, 2) and not moneyline_elem:
+            moneyline_elem = self._find_ml_element_by_linekey(game_num, team_no)
+            if moneyline_elem:
+                self.logger.info(
+                    f"Using full-game linekey element "
+                    f"{self._extract_data_linekey(moneyline_elem)}"
+                )
+
         linekey = self._extract_data_linekey(moneyline_elem) if moneyline_elem else None
 
         if moneyline_elem:
@@ -1569,6 +1722,7 @@ class BetWarController:
                     for (var i = 0; i < lines.length; i++) {
                         var gl = lines[i];
                         if (!gl || gl.IsTitle) continue;
+                        if (gl.PeriodNumber !== 0 && gl.PeriodNumber !== '0') continue;
                         var match = String(gl.GameNum) === String(gameNum)
                             || (String(gl.Team1RotNum) === rot1 && String(gl.Team2RotNum) === rot2);
                         if (!match) continue;
@@ -3089,6 +3243,11 @@ class BetWarController:
                 By.CSS_SELECTOR,
                 "div.btnMLLine, div.gc-line.btnMLLine, div.divMLLine .gc-line",
             ):
+                linekey = (ml_card.get_attribute("data-linekey") or "").strip()
+                if linekey and not self._linekey_is_full_game_moneyline(linekey):
+                    continue
+                if not linekey and not self._element_is_full_game_moneyline(ml_card):
+                    continue
                 odds_elem = None
                 for cand in ml_card.find_elements(By.CSS_SELECTOR, "span.odds, .odds"):
                     txt = (cand.text or "").strip()
@@ -3097,13 +3256,11 @@ class BetWarController:
                         break
                 if not odds_elem:
                     txt = (ml_card.text or "").strip()
-                    if not self._odds_text_matches(txt, moneyline_odd):
-                        continue
-                click_target = ml_card
-                if ml_card.get_attribute("onclick"):
+                if not self._odds_text_matches(txt, moneyline_odd):
+                    continue
+                click_target = self._pick_moneyline_click_target(ml_card)
+                if click_target:
                     return click_target
-                parent = ml_card.find_element(By.XPATH, "./ancestor-or-self::*[@onclick][1]")
-                return parent or click_target
 
         for row in self.driver.find_elements(By.CSS_SELECTOR, "div.divGameTeam"):
             rot_spans = row.find_elements(By.CSS_SELECTOR, "span.lblRotation")
@@ -3119,8 +3276,19 @@ class BetWarController:
                 By.CSS_SELECTOR, "span.odds, .odds, [class*='odds']"
             ):
                 txt = (odds_elem.text or "").strip()
-                if self._odds_text_matches(txt, moneyline_odd):
-                    return odds_elem
+                if not self._odds_text_matches(txt, moneyline_odd):
+                    continue
+                try:
+                    ml_card = odds_elem.find_element(
+                        By.XPATH,
+                        "./ancestor::div[contains(@class,'btnMLLine') or contains(@class,'gc-line')][1]",
+                    )
+                    click_target = self._pick_moneyline_click_target(ml_card)
+                    if click_target:
+                        return click_target
+                except Exception:
+                    if self._element_is_full_game_moneyline(odds_elem):
+                        return odds_elem
 
         return None
 
@@ -3141,7 +3309,7 @@ class BetWarController:
         team_lower = team_name.lower()
         moneyline_elem = None
         game_num = (game_line or {}).get("GameNum")
-        period = (game_line or {}).get("PeriodNumber", 0)
+        period = 0  # Full-game ML only for arb placement.
 
         # Strategy 1: TicoSports id format is M{teamNo}_{GameNum}_{PeriodNumber} on <button>
         if game_num is not None and team_no in (1, 2):
@@ -3155,12 +3323,13 @@ class BetWarController:
                     moneyline_elem = candidates[0]
                     break
 
-        # Strategy 2: GameNum embedded in any M1_/M2_ button id + odds text match
+        # Strategy 2: GameNum embedded in full-game M1_/M2_ button id + odds text match
         if not moneyline_elem and game_num is not None:
             for prefix in ("M1_", "M2_"):
                 candidates = self.driver.find_elements(
                     By.CSS_SELECTOR,
-                    f"button[id^='{prefix}'][id*='_{game_num}_'], span[id^='{prefix}'][id*='_{game_num}_']",
+                    f"button[id^='{prefix}'][id*='_{game_num}_0'], "
+                    f"span[id^='{prefix}'][id*='_{game_num}_0']",
                 )
                 for cand in candidates:
                     txt = (cand.text or cand.get_attribute("innerText") or "").strip()
@@ -3175,6 +3344,10 @@ class BetWarController:
             for cand in self.driver.find_elements(
                 By.CSS_SELECTOR, "button[id^='M1_'], button[id^='M2_'], span[id^='M1_'], span[id^='M2_']"
             ):
+                elem_id = (cand.get_attribute("id") or "").strip()
+                match = re.match(r"M(\d)_(\d+)_(\d+)", elem_id, re.I)
+                if match and int(match.group(3)) != 0:
+                    continue
                 try:
                     row = cand.find_element(
                         By.XPATH,
@@ -3204,6 +3377,12 @@ class BetWarController:
                     By.CSS_SELECTOR,
                     "button[id^='M1_'], button[id^='M2_'], span[id^='M1_'], span[id^='M2_'], span.text-black",
                 ):
+                    elem_id = (cand.get_attribute("id") or "").strip()
+                    match = re.match(r"M(\d)_(\d+)_(\d+)", elem_id, re.I)
+                    if match and int(match.group(3)) != 0:
+                        continue
+                    if not self._element_is_full_game_moneyline(cand):
+                        continue
                     txt = (cand.text or "").strip()
                     if self._odds_text_matches(txt, moneyline_odd):
                         moneyline_elem = cand
@@ -3492,8 +3671,13 @@ class BetWarController:
 
             if stake is not None:
                 for row in self._parse_my_bets_rows(text):
-                    if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
+                    desc = row.get("description", "")
+                    if not self._my_bets_row_matches_team(desc, team_name):
                         continue
+                    if self._text_indicates_non_full_game_ml(desc):
+                        return False, (
+                            f"My Bets shows alternate-period market (not full-game ML): {desc}"
+                        )
                     try:
                         if stake_matches_verification_amount(stake, row["risk_raw"]):
                             return True, "Open bet confirmed on My Bets tab"
@@ -3776,6 +3960,7 @@ class BetWarController:
 
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
+            self._assert_betslip_is_full_game_moneyline(slip_team)
 
             self._ensure_betslip_expanded()
             if not fill_betslip_stake_input(
@@ -3793,7 +3978,7 @@ class BetWarController:
 
             self._install_wager_network_hook()
             self._accept_line_changes()
-            if not self._submit_place_bets_with_retries():
+            if not self._submit_place_bets_with_retries(stake_plan=stake_plan):
                 raise Exception("Place Bets did not confirm in bet slip")
 
             self.logger.info("Place Bets confirmed in bet slip; verifying on My Bets tab")

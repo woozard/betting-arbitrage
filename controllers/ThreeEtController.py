@@ -47,6 +47,21 @@ class ThreeEtController:
     ODDS_WATCH_POLL_SECONDS = float(os.getenv("THREEET_ODDS_POLL_SEC", "5"))
     ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("THREEET_ODDS_FORCE_SCAN_SEC", "30"))
     ODDS_IDLE_POLL_SECONDS = float(os.getenv("THREEET_ODDS_IDLE_POLL_SEC", "5"))
+    PLACE_BET_MAX_ATTEMPTS = int(os.getenv("THREEET_PLACE_BET_MAX_ATTEMPTS", "10"))
+    PLACE_BET_RETRY_SLEEP_SEC = float(os.getenv("THREEET_PLACE_BET_RETRY_SLEEP_SEC", "1.2"))
+    _PLACE_BET_ACCEPTED_STATUSES = frozenset(
+        {"ACCEPTED", "PENDING", "OPEN", "SUCCESS", "PLACED"}
+    )
+    _PLACE_BET_RETRYABLE_STATUSES = frozenset({"FAILED"})
+    _PLACE_BET_HARD_REJECT_MARKERS = (
+        "insufficient",
+        "suspended",
+        "not allowed",
+        "account",
+        "closed",
+        "limit exceeded",
+        "self-excl",
+    )
 
     def __init__(self, account, site, sport="baseball"):
         self.account_id = account.account
@@ -431,6 +446,34 @@ class ThreeEtController:
             return arb_live_odds_acceptable(expected_odds, live_odds, tol)
         return str(live_odds).strip() == str(expected_odds).strip()
 
+    def _parse_bet_api_response(self, result) -> tuple[bool, str, bool, dict]:
+        """Return (accepted, message, retryable, bet_dict)."""
+        bets = []
+        if isinstance(result, dict):
+            bets = result.get("bets") or []
+        elif isinstance(result, list):
+            bets = result
+
+        if not bets:
+            raise ThreeEtApiError(f"Unexpected bet response: {str(result)[:500]}")
+
+        bet = bets[0] if isinstance(bets[0], dict) else {}
+        status = (bet.get("status") or "").upper()
+        if status in self._PLACE_BET_ACCEPTED_STATUSES:
+            bet_id = bet.get("id") or bet.get("betId") or bet.get("requestId")
+            return True, f"status={status} id={bet_id}", False, bet
+
+        message = bet.get("message") or bet.get("rejectReason") or status or "rejected"
+        msg_l = str(message).lower()
+        retryable = status in self._PLACE_BET_RETRYABLE_STATUSES
+        if any(marker in msg_l for marker in self._PLACE_BET_HARD_REJECT_MARKERS):
+            retryable = False
+        self.logger.warning(
+            f"3et bet rejected: status={status} message={message!r} "
+            f"retryable={retryable} payload={str(bet)[:500]}"
+        )
+        return False, f"Bet rejected: {message}", retryable, bet
+
     def _place_bet_via_api(self, runner_id: int, stake: float, api_odds: float) -> tuple[bool, str]:
         body = {
             "bets": [{
@@ -446,23 +489,111 @@ class ThreeEtController:
             f"odds={api_odds} type={self._session_odds_type}"
         )
         result = self.api.post("/betting/v3/bets", json_body=body)
-        bets = []
-        if isinstance(result, dict):
-            bets = result.get("bets") or []
-        elif isinstance(result, list):
-            bets = result
+        accepted, message, retryable, _bet = self._parse_bet_api_response(result)
+        if accepted:
+            return True, message
+        raise ThreeEtApiError(message)
 
-        if not bets:
-            raise ThreeEtApiError(f"Unexpected bet response: {str(result)[:500]}")
+    def _place_bet_with_retries(
+        self,
+        runner_id: int,
+        stake_risk: float,
+        game_id: str,
+        team_name: str,
+        team_no: int,
+        team_1: str | None,
+        team_2: str | None,
+        moneyline_odd: str,
+    ) -> tuple[bool, str]:
+        """
+        Submit to 3et with retries on transient FAILED responses (stale quote / line move).
+        First attempt enforces arb odds; retries use the current live quote.
+        """
+        max_attempts = self.PLACE_BET_MAX_ATTEMPTS
+        last_message = ""
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self.logger.warning(
+                    f"3et bet FAILED on attempt {attempt - 1}/{max_attempts}; "
+                    "refreshing schedule quote and retrying"
+                )
+                time.sleep(self.PLACE_BET_RETRY_SLEEP_SEC)
+                self._refresh_schedule_cache()
 
-        bet = bets[0] if isinstance(bets[0], dict) else {}
-        status = (bet.get("status") or "").upper()
-        if status in ("ACCEPTED", "PENDING", "OPEN", "SUCCESS", "PLACED"):
-            bet_id = bet.get("id") or bet.get("betId") or bet.get("requestId")
-            return True, f"status={status} id={bet_id}"
+            game_row, resolved_team_no = self._find_game(
+                game_id, team_name, team_1=team_1, team_2=team_2,
+            )
+            if not game_row or not resolved_team_no:
+                raise ThreeEtApiError(
+                    f"Game {game_id} ({team_name}) not found in live {self.sport_name} schedule"
+                )
+            team_no = resolved_team_no
 
-        message = bet.get("message") or bet.get("rejectReason") or status or "rejected"
-        raise ThreeEtApiError(f"Bet rejected: {message}")
+            live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
+            if attempt == 1:
+                if live_odds is not None and not self._arb_odds_exact_match(
+                    str(live_odds), moneyline_odd
+                ):
+                    tol = getattr(self, "_odds_tolerance", 0) or 0
+                    raise ThreeEtApiError(
+                        f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
+                        + (f" (tolerance ±{tol})" if tol > 0 else "")
+                    )
+            elif live_odds is None:
+                raise ThreeEtApiError(
+                    f"No live moneyline odds for {team_name} on retry {attempt}/{max_attempts}"
+                )
+
+            quote = (game_row.get("runner_prices") or {}).get(f"team_{team_no}")
+            if not quote:
+                prices = self._fetch_runner_prices([int(runner_id)])
+                quote = prices.get(int(runner_id))
+            if not quote:
+                raise ThreeEtApiError(f"No price quote for runner {runner_id}")
+
+            api_odds = quote.get("api_odds")
+            if api_odds is None:
+                raise ThreeEtApiError(f"No API odds for runner {runner_id}")
+
+            if attempt == 1:
+                self.logger.info(
+                    "Submitting 3et bet (will retry on FAILED with fresh quote)"
+                )
+            else:
+                self.logger.info(
+                    f"3et retry {attempt}/{max_attempts} | live_odds={live_odds} "
+                    f"api_odds={api_odds}"
+                )
+
+            body = {
+                "bets": [{
+                    "odds": api_odds,
+                    "runnerId": int(runner_id),
+                    "stake": float(stake_risk),
+                }],
+                "platform": PLATFORM,
+                "isWebsocketPrice": False,
+            }
+            self.logger.info(
+                f"3et place bet | runner={runner_id} stake=${stake_risk:.2f} "
+                f"odds={api_odds} type={self._session_odds_type} attempt={attempt}/{max_attempts}"
+            )
+            result = self.api.post("/betting/v3/bets", json_body=body)
+            accepted, message, retryable, _bet = self._parse_bet_api_response(result)
+            if accepted:
+                if attempt > 1:
+                    self.logger.info(
+                        f"3et bet accepted on attempt {attempt}/{max_attempts}: {message}"
+                    )
+                return True, message
+
+            last_message = message
+            if not retryable:
+                raise ThreeEtApiError(message)
+
+        raise ThreeEtApiError(
+            last_message or f"Bet not accepted after {max_attempts} 3et attempts"
+        )
 
     def _poll_odds_watch_once(self, source: str = "watch", force_relogin: bool = False, **kwargs) -> int:
         if not hasattr(self, "_last_saved_ml"):
@@ -678,26 +809,16 @@ class ThreeEtController:
         if not runner_id:
             raise ThreeEtApiError(f"No moneyline runner for {team_name} on game {game_id}")
 
-        live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
-        if live_odds is not None and not self._arb_odds_exact_match(str(live_odds), moneyline_odd):
-            tol = getattr(self, "_odds_tolerance", 0) or 0
-            raise ThreeEtApiError(
-                f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
-                + (f" (tolerance ±{tol})" if tol > 0 else "")
-            )
-
-        quote = (game_row.get("runner_prices") or {}).get(f"team_{team_no}")
-        if not quote:
-            prices = self._fetch_runner_prices([int(runner_id)])
-            quote = prices.get(int(runner_id))
-        if not quote:
-            raise ThreeEtApiError(f"No price quote for runner {runner_id}")
-
-        api_odds = quote.get("api_odds")
-        if api_odds is None:
-            raise ThreeEtApiError(f"No API odds for runner {runner_id}")
-
-        confirmed, message = self._place_bet_via_api(runner_id, stake_plan.risk, api_odds)
+        confirmed, message = self._place_bet_with_retries(
+            runner_id,
+            stake_plan.risk,
+            game_id,
+            team_name,
+            team_no,
+            team_1,
+            team_2,
+            moneyline_odd,
+        )
         if not confirmed:
             raise ThreeEtApiError(message or "Bet not accepted by bookmaker")
         self.logger.info(f"Bet accepted by bookmaker: {message}")
