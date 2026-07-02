@@ -773,6 +773,8 @@ class BetWarController:
 
     def _invoke_add_line_to_bet_slip(self, elem) -> bool:
         """Modern BetWar portal adds picks via global addLineToBetSlip(el)."""
+        self._open_bet_slip_tab()
+        self._ensure_betslip_expanded()
         try:
             return bool(self.driver.execute_script("""
                 var el = arguments[0];
@@ -1119,8 +1121,50 @@ class BetWarController:
             time.sleep(0.5)
         return None
 
+    def _open_bet_slip_tab(self):
+        """Switch sidebar from My Bets back to Bet Slip (required before addLineToBetSlip)."""
+        try:
+            tab = self.driver.find_element(By.CSS_SELECTOR, "#pillBetslipTab")
+            selected = (tab.get_attribute("aria-selected") or "").lower() == "true"
+            if not selected:
+                self.driver.execute_script("arguments[0].click();", tab)
+                time.sleep(0.4)
+            pane = self.driver.find_element(By.CSS_SELECTOR, "#pills-betslip")
+            pane_class = pane.get_attribute("class") or ""
+            if "active" not in pane_class and "show" not in pane_class:
+                self.driver.execute_script(
+                    "arguments[0].classList.add('show', 'active');", pane
+                )
+        except Exception as e:
+            self.logger.warning(f"Could not open Bet Slip tab: {e}")
+
+    def _clear_bet_slip(self):
+        """Remove any stale picks so a new arb leg starts from an empty slip."""
+        try:
+            self._open_bet_slip_tab()
+            removed = self.driver.execute_script("""
+                var removed = 0;
+                var root = document.getElementById('pills-betslip') || document.getElementById('div-betSlip');
+                if (!root) return 0;
+                root.querySelectorAll('.btnBSRemove, [onclick*="removeWager"]').forEach(function(btn) {
+                    try { btn.click(); removed++; } catch (e) {}
+                });
+                return removed;
+            """)
+            if removed:
+                self.logger.info(f"Cleared {removed} existing pick(s) from bet slip")
+                time.sleep(0.5)
+        except Exception as e:
+            self.logger.warning(f"Could not clear bet slip: {e}")
+
+    def _prepare_bet_slip_for_wager(self):
+        """Bet slip must be expanded and on the Bet Slip tab (not My Bets) before adding a line."""
+        self._open_bet_slip_tab()
+        self._ensure_betslip_expanded()
+        self._clear_bet_slip()
+
     def _betslip_text(self) -> str:
-        for selector in ("#div-betSlip", "#betSlipDiv", "#div-betSlipCart"):
+        for selector in ("#pills-betslip", "#div-betSlip", "#betSlipDiv", "#div-betSlipCart"):
             try:
                 text = (self.driver.find_element(By.CSS_SELECTOR, selector).text or "").strip()
                 if text:
@@ -1151,6 +1195,7 @@ class BetWarController:
 
     def _ensure_betslip_expanded(self):
         """BetWar hides the slip in a Bootstrap collapse panel on smaller viewports."""
+        self._open_bet_slip_tab()
         try:
             slip = self.driver.find_element(By.CSS_SELECTOR, "#div-betSlip")
             slip_class = slip.get_attribute("class") or ""
@@ -1447,6 +1492,7 @@ class BetWarController:
         moneyline_elem=None,
     ) -> bool:
         """Click DOM and/or Angular until the bet slip actually contains the team."""
+        self._prepare_bet_slip_for_wager()
         game_num = game_line.get("GameNum")
         linekey = self._extract_data_linekey(moneyline_elem) if moneyline_elem else None
 
@@ -3637,6 +3683,7 @@ class BetWarController:
             )
 
             self._refresh_session_before_wager()
+            self._prepare_bet_slip_for_wager()
 
             team_no, display_name, live_odds = self._lookup_side_from_getlines(
                 game_id, team_name
@@ -3706,17 +3753,25 @@ class BetWarController:
                     f"(linekey={game_line.get('LineKey')}) for {game_id}"
                 )
 
+            slip_team = lookup_name or team_name
             slip_populated = False
             if game_line and team_no in (1, 2):
                 slip_populated = self._add_moneyline_to_slip(
-                    game_line, team_no, lookup_name or team_name,
+                    game_line, team_no, slip_team,
                     moneyline_elem=moneyline_elem,
                 )
 
-            if not self._wait_for_betslip_team(team_name, timeout=8):
+            if not slip_populated and not self._wait_for_betslip_team(slip_team, timeout=3):
+                # Angular/API path when DOM clicks fail (common after My Bets tab was open).
+                if game_line and team_no in (1, 2):
+                    self.logger.info("Retrying bet slip via Angular GameLineAction")
+                    if self._click_moneyline_via_angular(game_line, team_no):
+                        slip_populated = self._wait_for_betslip_team(slip_team, timeout=6)
+
+            if not self._wait_for_betslip_team(slip_team, timeout=8):
                 slip_preview = self._betslip_text()[:200]
                 raise Exception(
-                    f"Bet slip still empty after click for {team_name} (game_id={game_id}): {slip_preview}"
+                    f"Bet slip still empty after click for {slip_team} (game_id={game_id}): {slip_preview}"
                 )
 
             limits_text = self._betslip_text()

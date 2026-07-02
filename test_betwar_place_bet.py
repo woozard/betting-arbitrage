@@ -85,7 +85,7 @@ def main():
             pass
         sys.exit(0 if confirmed else 1)
 
-    bet_placed, stake = controller._BetWarController__execute_bet(
+    bet_placed, stake = controller._execute_bet_attempt(
         game["game_id"],
         team_name,
         str(live_odd),
