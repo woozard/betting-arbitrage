@@ -1026,17 +1026,20 @@ class BetWarController:
         return game_line
 
     def _resolve_game_num_from_dom_rotations(self, rot1: str, rot2: str) -> int | None:
-        """Parse GameNum from a full-game linekey already rendered for this rotation pair."""
+        """Parse GameNum from a full-game linekey on the rotation row in the DOM."""
+        target_rots = {str(rot1), str(rot2)}
         try:
-            for elem in self.driver.find_elements(By.CSS_SELECTOR, "[data-linekey]"):
-                lk = self._extract_data_linekey(elem)
-                if not lk or not self._linekey_is_full_game_moneyline(lk):
+            for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
+                rot_text = (rot_span.text or "").strip()
+                if rot_text not in target_rots:
                     continue
-                gl, _ = self._parse_game_line_from_linekey(lk, [rot1, rot2])
-                if not gl:
-                    continue
-                if str(gl.get("Team1RotNum")) == str(rot1) and str(gl.get("Team2RotNum")) == str(rot2):
-                    return gl.get("GameNum")
+                for ml_card in self._moneyline_cards_for_rotation_row(rot_span):
+                    linekey = self._extract_data_linekey(ml_card)
+                    if not linekey or not self._linekey_is_full_game_moneyline(linekey):
+                        continue
+                    parts = linekey.split("-")
+                    if parts and str(parts[0]).isdigit():
+                        return int(parts[0])
         except Exception:
             pass
         return None
@@ -4149,13 +4152,20 @@ class BetWarController:
                     )
                 if not spread_elem:
                     self._save_bet_board_debug(game_id, "missing_spread")
-                    visible = self._board_rotation_numbers()
-                    raise Exception(
-                        f"Spread not found for {lookup_name} @ {moneyline_odd} "
-                        f"(game_id={game_id}; board rotations={visible[:12]})"
-                    )
-
-                if not game_line or game_line.get("GameNum") is None:
+                    if game_line and team_no in (1, 2):
+                        self.logger.info(
+                            f"Spread DOM click failed for {lookup_name}; trying Angular GameLineAction"
+                        )
+                        slip_populated = self._add_spread_to_slip(
+                            game_line, team_no, slip_team, spread_elem=None
+                        )
+                    if not slip_populated:
+                        visible = self._board_rotation_numbers()
+                        raise Exception(
+                            f"Spread not found for {lookup_name} @ {moneyline_odd} "
+                            f"(game_id={game_id}; board rotations={visible[:12]})"
+                        )
+                elif not game_line or game_line.get("GameNum") is None:
                     if not game_line:
                         game_line = self._fallback_game_line_from_rotations(game_id)
                     game_line, parsed_team_no = self._resolve_game_line_for_bet(
