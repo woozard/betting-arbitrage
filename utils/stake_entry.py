@@ -27,6 +27,9 @@ DEFAULT_RISK_SELECTORS: tuple[str, ...] = (
 )
 
 DEFAULT_WIN_SELECTORS: tuple[str, ...] = (
+    "#betSlipDiv input[id^='W_']",
+    "#betSlipBody input[id^='W_']",
+    "input.js-kioskboard-input[id^='W_']",
     "input[id^='win_']",
     "input[name*='win']",
     "input[ng-model*='win']",
