@@ -1692,7 +1692,7 @@ class ParadiseWagerController:
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
                 bet_type = arb.get("bet_type", "moneyline")
-                if should_skip_spread_arb_for_placement(arb, self.logger):
+                if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
                     continue
 
                 if not is_active_arb_pair(book_1, book_2):

@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 from cache.arbitrage_cache import ArbitrageCache
+from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -482,10 +483,12 @@ class FourCastersController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
-        blocked = block_real_money_bet(self.logger, stake)
+        blocked = block_real_money_bet(self.logger, stake, bet_type=bet_type)
         if blocked is not None:
             self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
             return blocked
@@ -498,6 +501,8 @@ class FourCastersController:
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
                     )
                 except FourCastersApiError as e:
                     if attempt == 1 and ("401" in str(e).lower() or "unauthorized" in str(e).lower()):
@@ -526,11 +531,16 @@ class FourCastersController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+        market_label = (
+            f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+        )
         self.logger.info(
             f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-            f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+            f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
         self._ensure_session()
 
@@ -545,7 +555,16 @@ class FourCastersController:
         if not participant_id:
             raise FourCastersApiError(f"No participant id for {team_name} on game {game_id}")
 
-        live_odds = self._live_moneyline_for_team(game_id, team_no)
+        spread_market = game_row.get("spread") or {}
+        if bet_type == "spread":
+            live_odds = spread_market.get(f"team_{team_no}_odds")
+            spread_number = spread_line
+            if spread_number is None:
+                spread_number = spread_market.get(f"team_{team_no}_spread")
+        else:
+            live_odds = self._live_moneyline_for_team(game_id, team_no)
+            spread_number = None
+
         if live_odds is not None and not self._arb_odds_exact_match(live_odds, moneyline_odd):
             tol = getattr(self, "_odds_tolerance", 0) or 0
             raise FourCastersApiError(
@@ -565,12 +584,14 @@ class FourCastersController:
             except (TypeError, ValueError):
                 use_odds = american_odds
 
+        api_bet_type = "spread" if bet_type == "spread" else "moneyline"
         confirmed, message = self._place_bet_via_api(
             game_id,
             participant_id,
             use_odds,
             stake_plan.risk,
-            bet_type="moneyline",
+            bet_type=api_bet_type,
+            spread_number=spread_number,
         )
         if not confirmed:
             raise FourCastersApiError(message or "Bet not accepted by bookmaker")
@@ -614,10 +635,7 @@ class FourCastersController:
                 )
                 self._maybe_poll_odds_while_idle()
 
-                arbs = self.cache.get_arbitrage(
-                    bookmaker=self.bookmaker,
-                    bet_type="moneyline",
-                )
+                arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
                 if not arbs:
                     time.sleep(1)
                     continue
@@ -627,8 +645,18 @@ class FourCastersController:
                     league = arb.get("league")
                     game_datetime = arb.get("game_datetime")
                     bet_type = arb.get("bet_type", "moneyline")
-                    if should_skip_spread_arb_for_placement(arb, self.logger):
+
+                    if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
                         continue
+
+                    leg = arb_leg_for_book(arb, self.bookmaker)
+                    if not leg:
+                        continue
+                    team_no = leg["team_no"]
+                    game_id = leg["game_id"]
+                    team_name = leg["team_name"]
+                    wager_odds = leg["odds"]
+                    spread_line = leg.get("spread_line")
                     team_1 = arb.get("team_1")
                     team_2 = arb.get("team_2")
 
@@ -638,19 +666,6 @@ class FourCastersController:
                         self.logger.info(
                             f"Skipping arb (game started) | Match: {team_1} vs {team_2}"
                         )
-                        continue
-
-                    if arb.get("team_1_bookmaker") == self.bookmaker:
-                        team_no = 1
-                        game_id = arb.get("team_1_game_id")
-                        team_name = team_1
-                        moneyline_odd = arb.get("team_1_odds")
-                    elif arb.get("team_2_bookmaker") == self.bookmaker:
-                        team_no = 2
-                        game_id = arb.get("team_2_game_id")
-                        team_name = team_2
-                        moneyline_odd = arb.get("team_2_odds")
-                    else:
                         continue
 
                     book_1 = arb.get("team_1_bookmaker")
@@ -664,7 +679,7 @@ class FourCastersController:
                         self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                         continue
 
-                    if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                    if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
                         self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                         continue
 
@@ -683,8 +698,14 @@ class FourCastersController:
                     )
 
                     bet_placed, stake_used = self.__execute_bet(
-                        game_id, team_name, moneyline_odd, stake,
-                        team_1=team_1, team_2=team_2,
+                        game_id,
+                        team_name,
+                        wager_odds,
+                        stake,
+                        team_1=team_1,
+                        team_2=team_2,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
                     )
                     if bet_placed:
                         finalize_confirmed_bet(
@@ -697,7 +718,7 @@ class FourCastersController:
                             team_name,
                             game_id,
                             stake_used,
-                            moneyline_odd,
+                            wager_odds,
                             TELEGRAM,
                         )
                     else:

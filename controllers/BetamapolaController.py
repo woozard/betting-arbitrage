@@ -17,7 +17,9 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines, spread_values_match
+from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
+from utils.ticosports_wager import click_line_via_angular
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -594,6 +596,110 @@ class BetamapolaController:
         except Exception as e:
             self.logger.warning(f"Angular GameLineAction failed: {e}")
             return False
+
+    def _wait_for_spread_button(self, game_num, team_no: int, timeout: int = 25):
+        """Wait for S{team}_{GameNum}_0 button (TicoSports DOM id format)."""
+        selector = f"button#S{team_no}_{game_num}_0, #S{team_no}_{game_num}_0"
+        end = time.time() + timeout
+        while time.time() < end:
+            elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            if elems:
+                return elems[0]
+            time.sleep(0.5)
+        return None
+
+    def _find_spread_element(
+        self,
+        game_id: str,
+        team_name: str,
+        wager_odds,
+        game_line: dict = None,
+        team_no: int = None,
+        spread_line: float | None = None,
+    ):
+        game_num = (game_line or {}).get("GameNum")
+        period = (game_line or {}).get("PeriodNumber", 0)
+        team_lower = team_name.lower()
+
+        if game_num is not None and team_no in (1, 2):
+            for selector in (
+                f"button#S{team_no}_{game_num}_{period}",
+                f"#S{team_no}_{game_num}_{period}",
+            ):
+                candidates = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if candidates:
+                    txt = (candidates[0].text or candidates[0].get_attribute("innerText") or "").strip()
+                    if self._odds_text_matches(txt, wager_odds):
+                        return candidates[0]
+
+        if game_num is not None:
+            for prefix in ("S1_", "S2_"):
+                candidates = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    f"button[id^='{prefix}'][id*='_{game_num}_'], span[id^='{prefix}'][id*='_{game_num}_']",
+                )
+                for cand in candidates:
+                    txt = (cand.text or cand.get_attribute("innerText") or "").strip()
+                    if not self._odds_text_matches(txt, wager_odds):
+                        continue
+                    if spread_line is not None:
+                        spread_txt = re.search(r"([+-]?\d+(?:\.\d+)?)", txt)
+                        if spread_txt and not spread_values_match(spread_txt.group(1), spread_line):
+                            continue
+                    return cand
+
+        for cand in self.driver.find_elements(
+            By.CSS_SELECTOR, "button[id^='S1_'], button[id^='S2_'], span[id^='S1_'], span[id^='S2_']"
+        ):
+            try:
+                row = cand.find_element(
+                    By.XPATH,
+                    "./ancestor::*[contains(@class,'game') or contains(@class,'line') or contains(@class,'betting')][1]",
+                )
+                row_text = (row.text or "").lower()
+            except Exception:
+                row_text = (cand.text or "").lower()
+
+            txt = (cand.text or cand.get_attribute("innerText") or "").strip()
+            if team_lower in row_text and self._odds_text_matches(txt, wager_odds):
+                return cand
+
+        return None
+
+    def _add_spread_to_slip(
+        self,
+        game_line: dict,
+        team_no: int,
+        team_name: str,
+        spread_elem=None,
+    ) -> bool:
+        """Click DOM and/or Angular until the bet slip contains the spread pick."""
+        game_num = game_line.get("GameNum")
+
+        if spread_elem:
+            self.logger.info(f"Spread element located: {spread_elem.get_attribute('id')}")
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", spread_elem)
+            time.sleep(0.4)
+            self.driver.execute_script("arguments[0].click();", spread_elem)
+            self.logger.info("Spread element clicked")
+            if self._wait_for_betslip_team(team_name, timeout=4):
+                return True
+            self.logger.warning(
+                f"DOM click on S{team_no}_{game_num}_0 did not populate bet slip; trying Angular"
+            )
+
+        if click_line_via_angular(self.driver, game_line, team_no, "S"):
+            if self._wait_for_betslip_team(team_name, timeout=6):
+                return True
+            self.logger.warning("Angular GameLineAction (spread) did not populate bet slip")
+
+        btn = self._wait_for_spread_button(game_num, team_no, timeout=3)
+        if btn:
+            self.driver.execute_script("arguments[0].click();", btn)
+            if self._wait_for_betslip_team(team_name, timeout=4):
+                return True
+
+        return False
 
     def _get_api_payload(self):
         if self.sport_name == "NBA":
@@ -1663,10 +1769,12 @@ class BetamapolaController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
-        blocked = block_real_money_bet(self.logger, stake)
+        blocked = block_real_money_bet(self.logger, stake, bet_type=bet_type)
         if blocked is not None:
             self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
             return blocked
@@ -1680,6 +1788,8 @@ class BetamapolaController:
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
                     )
                 except Exception as e:
                     if attempt == 1 and self._message_requires_relogin(str(e)):
@@ -1709,12 +1819,17 @@ class BetamapolaController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         try:
             stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+            market_label = (
+                f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+            )
             self.logger.info(
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-                f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+                f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
             )
 
             self._refresh_session_before_wager()
@@ -1741,34 +1856,79 @@ class BetamapolaController:
                 f"rot={game_line.get('Team1RotNum')}-{game_line.get('Team2RotNum')}"
             )
 
+            if bet_type == "spread":
+                live_odds = game_line.get(f"SpreadAdj{team_no}")
+                if live_odds is not None and not self._odds_text_matches(str(live_odds), moneyline_odd):
+                    raise Exception(
+                        f"Line moved: live spread odds {live_odds} differ from arb odds {moneyline_odd}"
+                    )
+                if spread_line is not None:
+                    spread_val = game_line.get("Spread")
+                    team_1_spread, team_2_spread = resolve_ticosports_spread_lines(
+                        spread_val, game_line.get("MoneyLine1"), game_line.get("MoneyLine2")
+                    )
+                    live_spread = team_1_spread if team_no == 1 else team_2_spread
+                    if live_spread is not None and not spread_values_match(live_spread, spread_line):
+                        raise Exception(
+                            f"Spread line moved: live {live_spread} differs from arb {spread_line}"
+                        )
+
             if not self.__ensure_sport_offering_loaded(
                 game_num=game_num, team_no=team_no, fast=True
             ):
                 self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
 
-            moneyline_elem = self._find_moneyline_element(
-                game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
-            )
-
-            if not moneyline_elem:
-                self.logger.warning(
-                    f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, re-navigating"
+            if bet_type == "spread":
+                spread_elem = self._find_spread_element(
+                    game_id,
+                    team_name,
+                    moneyline_odd,
+                    game_line=game_line,
+                    team_no=team_no,
+                    spread_line=spread_line,
                 )
-                self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
+                if not spread_elem:
+                    self.logger.warning(
+                        f"Spread element not found on first pass for {team_name} @ {moneyline_odd}, re-navigating"
+                    )
+                    self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
+                    spread_elem = self._find_spread_element(
+                        game_id,
+                        team_name,
+                        moneyline_odd,
+                        game_line=game_line,
+                        team_no=team_no,
+                        spread_line=spread_line,
+                    )
+                add_to_slip = lambda: self._add_spread_to_slip(
+                    game_line, team_no, team_name, spread_elem=spread_elem
+                )
+                missing_line_msg = f"Spread not found for {team_name} @ {moneyline_odd}"
+            else:
                 moneyline_elem = self._find_moneyline_element(
                     game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
                 )
+                if not moneyline_elem:
+                    self.logger.warning(
+                        f"Moneyline element not found on first pass for {team_name} @ {moneyline_odd}, re-navigating"
+                    )
+                    self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
+                    moneyline_elem = self._find_moneyline_element(
+                        game_id, team_name, moneyline_odd, game_line=game_line, team_no=team_no
+                    )
+                add_to_slip = lambda: self._add_moneyline_to_slip(
+                    game_line, team_no, team_name, moneyline_elem=moneyline_elem
+                )
+                missing_line_msg = f"Moneyline not found for {team_name} @ {moneyline_odd}"
 
             self.wait.until(EC.presence_of_element_located((By.ID, "betSlipDiv")))
             self.logger.info("Bet slip appeared")
 
-            if not self._add_moneyline_to_slip(
-                game_line, team_no, team_name, moneyline_elem=moneyline_elem
-            ):
+            if not add_to_slip():
                 slip_preview = self._betslip_text()[:200]
                 raise Exception(
                     f"Bet slip still empty after click attempts for {team_name} "
-                    f"(GameNum={game_num}): {slip_preview}"
+                    f"(GameNum={game_num}): {slip_preview or missing_line_msg}"
                 )
 
             limits_text = self._betslip_text()
@@ -1996,7 +2156,7 @@ class BetamapolaController:
                 continue
 
             consecutive_recoveries = 0
-            arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
+            arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
             if not arbs:
                 self._maybe_poll_odds_while_idle()
                 self.logger.info("Waiting for Arbitrage")
@@ -2007,11 +2167,20 @@ class BetamapolaController:
             for arb in arbs:
                 sport = arb.get('sport')
                 league = arb.get('league')
-                game_date = arb.get('game_date')
                 game_datetime = arb.get('game_datetime')
-                bet_type = arb.get('bet_type')
-                if should_skip_spread_arb_for_placement(arb, self.logger):
+                bet_type = arb.get('bet_type', 'moneyline')
+
+                if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
                     continue
+
+                leg = arb_leg_for_book(arb, self.bookmaker)
+                if not leg:
+                    continue
+                team_no = leg["team_no"]
+                game_id = leg["game_id"]
+                team_name = leg["team_name"]
+                wager_odds = leg["odds"]
+                spread_line = leg.get("spread_line")
                 team_1 = arb.get("team_1")
                 team_2 = arb.get("team_2")
 
@@ -2025,20 +2194,6 @@ class BetamapolaController:
                     continue
 
                 self.logger.info(f"Arbitrage | Match: {team_1} vs {team_2}")
-
-                if arb.get("team_1_bookmaker") == self.bookmaker:
-                    team_no = 1
-                    game_id = arb.get("team_1_game_id")
-                    team_name = team_1
-                    moneyline_odd = arb.get("team_1_odds")
-                elif arb.get("team_2_bookmaker") == self.bookmaker:
-                    team_no = 2
-                    game_id = arb.get("team_2_game_id")
-                    team_name = team_2
-                    moneyline_odd = arb.get("team_2_odds")
-                else:
-                    self.logger.warning("Bookmaker mismatch, skipping arb")
-                    continue
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
@@ -2069,7 +2224,7 @@ class BetamapolaController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
                     self.logger.info(
                         f"Skipping — leg already confirmed on {self.bookmaker} | "
                         f"{team_name} | {team_1} vs {team_2}"
@@ -2111,7 +2266,14 @@ class BetamapolaController:
                     continue
 
                 bet_placed, stake_used = self.__execute_bet(
-                    game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
+                    game_id,
+                    team_name,
+                    wager_odds,
+                    stake,
+                    team_1=team_1,
+                    team_2=team_2,
+                    bet_type=bet_type,
+                    spread_line=spread_line,
                 )
                 if not bet_placed and should_notify_failed_bet(self._last_bet_error):
                     maybe_notify_partial_arb_exposure(
@@ -2143,7 +2305,7 @@ class BetamapolaController:
                         team_name,
                         game_id,
                         stake_used,
-                        moneyline_odd,
+                        wager_odds,
                         TELEGRAM,
                     )
                     self.logger.info("Re-establishing sport offering before next arbitrage")

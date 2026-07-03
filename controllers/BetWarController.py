@@ -21,7 +21,9 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, teams_same, resolve_ticosports_spread_lines
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, teams_same, resolve_ticosports_spread_lines, spread_values_match
+from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
+from utils.ticosports_wager import click_line_via_angular
 from utils.team_registry import standard_team_name
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
@@ -1759,6 +1761,110 @@ class BetWarController:
         except Exception as e:
             self.logger.warning(f"Angular GameLineAction failed: {e}")
             return False
+
+    def _wait_for_spread_button(self, game_num, team_no: int, timeout: int = 25):
+        """Wait for S{team}_{GameNum}_0 button (TicoSports DOM id format)."""
+        selector = f"button#S{team_no}_{game_num}_0, #S{team_no}_{game_num}_0"
+        end = time.time() + timeout
+        while time.time() < end:
+            elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            if elems:
+                return elems[0]
+            time.sleep(0.5)
+        return None
+
+    def _find_spread_on_board(
+        self,
+        game_id: str,
+        team_name: str,
+        wager_odds,
+        team_no: int | None = None,
+        spread_line: float | None = None,
+        game_line: dict | None = None,
+    ):
+        """Locate a clickable spread/run-line on the BetWar board."""
+        rotations = set(self._game_rotations(game_id))
+        if rotations:
+            target_rot = self._target_rotation(game_id, team_name, team_no)
+            for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
+                rot_text = (rot_span.text or "").strip()
+                if rot_text not in rotations:
+                    continue
+                if target_rot and rot_text != target_rot:
+                    continue
+                try:
+                    team_block = rot_span.find_element(
+                        By.XPATH,
+                        "./ancestor::div[contains(@class,'divGameTeam')][1]",
+                    )
+                except Exception:
+                    continue
+                for ps_elem in team_block.find_elements(
+                    By.CSS_SELECTOR, ".btnPSLine, .divPSLine .gc-line, div.btnPSLine"
+                ):
+                    txt = (ps_elem.text or ps_elem.get_attribute("innerText") or "").strip()
+                    spread, odds = self._parse_betwar_ps_line_text(txt)
+                    if spread_line is not None and spread is not None:
+                        if not spread_values_match(spread, spread_line):
+                            continue
+                    if odds and self._odds_text_matches(odds, wager_odds):
+                        return ps_elem
+
+        game_num = (game_line or {}).get("GameNum")
+        if game_num is not None and team_no in (1, 2):
+            for selector in (
+                f"button#S{team_no}_{game_num}_0",
+                f"#S{team_no}_{game_num}_0",
+            ):
+                candidates = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if candidates:
+                    txt = (candidates[0].text or candidates[0].get_attribute("innerText") or "").strip()
+                    if self._odds_text_matches(txt, wager_odds):
+                        return candidates[0]
+        return None
+
+    def _add_spread_to_slip(
+        self,
+        game_line: dict,
+        team_no: int,
+        team_name: str,
+        spread_elem=None,
+    ) -> bool:
+        """Click DOM and/or Angular until the bet slip contains the spread pick."""
+        self._prepare_bet_slip_for_wager()
+        game_num = game_line.get("GameNum")
+        linekey = self._extract_data_linekey(spread_elem) if spread_elem else None
+
+        if spread_elem:
+            elem_label = (
+                spread_elem.get_attribute("id")
+                or linekey
+                or spread_elem.get_attribute("class")
+            )
+            self.logger.info(f"Spread element located: {elem_label}")
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", spread_elem
+            )
+            time.sleep(0.4)
+            if linekey or spread_elem.get_attribute("onclick"):
+                if self._invoke_add_line_to_bet_slip(spread_elem):
+                    if self._wait_for_betslip_team(team_name, timeout=5):
+                        return True
+            self.driver.execute_script("arguments[0].click();", spread_elem)
+            if self._wait_for_betslip_team(team_name, timeout=4):
+                return True
+
+        if click_line_via_angular(self.driver, game_line, team_no, "S"):
+            if self._wait_for_betslip_team(team_name, timeout=6):
+                return True
+
+        btn = self._wait_for_spread_button(game_num, team_no, timeout=3)
+        if btn:
+            self.driver.execute_script("arguments[0].click();", btn)
+            if self._wait_for_betslip_team(team_name, timeout=4):
+                return True
+
+        return False
 
     def _get_api_payload(self):
         if self.sport_name == "NBA":
@@ -3802,10 +3908,12 @@ class BetWarController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
-        blocked = block_real_money_bet(self.logger, stake)
+        blocked = block_real_money_bet(self.logger, stake, bet_type=bet_type)
         if blocked is not None:
             self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
             return blocked
@@ -3819,6 +3927,8 @@ class BetWarController:
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
                     )
                 except SessionUnauthorizedError as e:
                     if attempt >= 3:
@@ -3860,12 +3970,17 @@ class BetWarController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         try:
             stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+            market_label = (
+                f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+            )
             self.logger.info(
                 f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-                f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+                f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
             )
 
             self._refresh_session_before_wager()
@@ -3893,66 +4008,152 @@ class BetWarController:
                         f"(GetLines has it; DOM does not)"
                     )
 
-            moneyline_elem = self._find_moneyline_on_board(
-                game_id, lookup_name, moneyline_odd, team_no=team_no
-            )
+            try:
+                game_line, api_team_no = self._lookup_game_line_from_api(game_id, team_name)
+            except SessionUnauthorizedError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"GetSportOffering game-line lookup failed: {e}")
+                game_line, api_team_no = None, None
 
-            if not moneyline_elem and lookup_name != team_name:
-                moneyline_elem = self._find_moneyline_on_board(
-                    game_id, team_name, moneyline_odd, team_no=team_no
-                )
+            if team_no is None:
+                team_no = api_team_no
+            if team_no is None:
+                team_no = self._infer_team_no(team_name, team_1, team_2)
 
-            if not moneyline_elem:
-                self.logger.warning(
-                    f"Moneyline element not found on first pass for {lookup_name} @ "
-                    f"{moneyline_odd}, refreshing board"
+            if bet_type == "spread" and game_line:
+                live_spread_odds = game_line.get(f"SpreadAdj{team_no}")
+                if live_spread_odds is not None and not self._odds_text_matches(
+                    str(live_spread_odds), moneyline_odd
+                ):
+                    raise Exception(
+                        f"Line moved: live spread odds {live_spread_odds} differ from arb odds {moneyline_odd}"
+                    )
+                if spread_line is not None:
+                    team_1_spread, team_2_spread = resolve_ticosports_spread_lines(
+                        game_line.get("Spread"),
+                        game_line.get("MoneyLine1"),
+                        game_line.get("MoneyLine2"),
+                    )
+                    live_spread = team_1_spread if team_no == 1 else team_2_spread
+                    if live_spread is not None and not spread_values_match(live_spread, spread_line):
+                        raise Exception(
+                            f"Spread line moved: live {live_spread} differs from arb {spread_line}"
+                        )
+
+            slip_team = lookup_name or team_name
+            slip_populated = False
+
+            if bet_type == "spread":
+                spread_elem = self._find_spread_on_board(
+                    game_id,
+                    lookup_name,
+                    moneyline_odd,
+                    team_no=team_no,
+                    spread_line=spread_line,
+                    game_line=game_line,
                 )
-                self._refresh_bet_board_for_game(game_id)
-                time.sleep(1.0)
+                if not spread_elem and lookup_name != team_name:
+                    spread_elem = self._find_spread_on_board(
+                        game_id,
+                        team_name,
+                        moneyline_odd,
+                        team_no=team_no,
+                        spread_line=spread_line,
+                        game_line=game_line,
+                    )
+                if not spread_elem:
+                    self.logger.warning(
+                        f"Spread element not found on first pass for {lookup_name} @ "
+                        f"{moneyline_odd}, refreshing board"
+                    )
+                    self._refresh_bet_board_for_game(game_id)
+                    time.sleep(1.0)
+                    spread_elem = self._find_spread_on_board(
+                        game_id,
+                        lookup_name,
+                        moneyline_odd,
+                        team_no=team_no,
+                        spread_line=spread_line,
+                        game_line=game_line,
+                    )
+                if not spread_elem:
+                    self._save_bet_board_debug(game_id, "missing_spread")
+                    visible = self._board_rotation_numbers()
+                    raise Exception(
+                        f"Spread not found for {lookup_name} @ {moneyline_odd} "
+                        f"(game_id={game_id}; board rotations={visible[:12]})"
+                    )
+
+                if not game_line or game_line.get("GameNum") is None:
+                    game_line, parsed_team_no = self._resolve_game_line_for_bet(
+                        game_id, team_name, None, team_no=team_no
+                    )
+                    if team_no is None:
+                        team_no = parsed_team_no
+
+                if game_line and team_no in (1, 2):
+                    slip_populated = self._add_spread_to_slip(
+                        game_line, team_no, slip_team, spread_elem=spread_elem
+                    )
+            else:
                 moneyline_elem = self._find_moneyline_on_board(
                     game_id, lookup_name, moneyline_odd, team_no=team_no
                 )
+
                 if not moneyline_elem and lookup_name != team_name:
                     moneyline_elem = self._find_moneyline_on_board(
                         game_id, team_name, moneyline_odd, team_no=team_no
                     )
 
-            if not moneyline_elem:
-                self._save_bet_board_debug(game_id, "missing_moneyline")
-                visible = self._board_rotation_numbers()
-                raise Exception(
-                    f"Moneyline not found for {lookup_name} @ {moneyline_odd} "
-                    f"(game_id={game_id}; board rotations={visible[:12]})"
+                if not moneyline_elem:
+                    self.logger.warning(
+                        f"Moneyline element not found on first pass for {lookup_name} @ "
+                        f"{moneyline_odd}, refreshing board"
+                    )
+                    self._refresh_bet_board_for_game(game_id)
+                    time.sleep(1.0)
+                    moneyline_elem = self._find_moneyline_on_board(
+                        game_id, lookup_name, moneyline_odd, team_no=team_no
+                    )
+                    if not moneyline_elem and lookup_name != team_name:
+                        moneyline_elem = self._find_moneyline_on_board(
+                            game_id, team_name, moneyline_odd, team_no=team_no
+                        )
+
+                if not moneyline_elem:
+                    self._save_bet_board_debug(game_id, "missing_moneyline")
+                    visible = self._board_rotation_numbers()
+                    raise Exception(
+                        f"Moneyline not found for {lookup_name} @ {moneyline_odd} "
+                        f"(game_id={game_id}; board rotations={visible[:12]})"
+                    )
+
+                game_line, parsed_team_no = self._resolve_game_line_for_bet(
+                    game_id, team_name, moneyline_elem, team_no=team_no
                 )
+                if team_no is None:
+                    team_no = parsed_team_no
+                if team_no is None:
+                    team_no = self._infer_team_no(team_name, team_1, team_2)
 
-            game_line, parsed_team_no = self._resolve_game_line_for_bet(
-                game_id, team_name, moneyline_elem, team_no=team_no
-            )
-            if team_no is None:
-                team_no = parsed_team_no
-            if team_no is None:
-                team_no = self._infer_team_no(team_name, team_1, team_2)
+                if game_line.get("GameNum") is not None:
+                    self.logger.info(
+                        f"Resolved GameNum={game_line.get('GameNum')} "
+                        f"(linekey={game_line.get('LineKey')}) for {game_id}"
+                    )
 
-            if game_line.get("GameNum") is not None:
-                self.logger.info(
-                    f"Resolved GameNum={game_line.get('GameNum')} "
-                    f"(linekey={game_line.get('LineKey')}) for {game_id}"
-                )
-
-            slip_team = lookup_name or team_name
-            slip_populated = False
-            if game_line and team_no in (1, 2):
-                slip_populated = self._add_moneyline_to_slip(
-                    game_line, team_no, slip_team,
-                    moneyline_elem=moneyline_elem,
-                )
-
-            if not slip_populated and not self._wait_for_betslip_team(slip_team, timeout=3):
-                # Angular/API path when DOM clicks fail (common after My Bets tab was open).
                 if game_line and team_no in (1, 2):
-                    self.logger.info("Retrying bet slip via Angular GameLineAction")
-                    if self._click_moneyline_via_angular(game_line, team_no):
-                        slip_populated = self._wait_for_betslip_team(slip_team, timeout=6)
+                    slip_populated = self._add_moneyline_to_slip(
+                        game_line, team_no, slip_team,
+                        moneyline_elem=moneyline_elem,
+                    )
+
+                if not slip_populated and not self._wait_for_betslip_team(slip_team, timeout=3):
+                    if game_line and team_no in (1, 2):
+                        self.logger.info("Retrying bet slip via Angular GameLineAction")
+                        if self._click_moneyline_via_angular(game_line, team_no):
+                            slip_populated = self._wait_for_betslip_team(slip_team, timeout=6)
 
             if not self._wait_for_betslip_team(slip_team, timeout=8):
                 slip_preview = self._betslip_text()[:200]
@@ -3962,7 +4163,8 @@ class BetWarController:
 
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
-            self._assert_betslip_is_full_game_moneyline(slip_team)
+            if bet_type != "spread":
+                self._assert_betslip_is_full_game_moneyline(slip_team)
 
             self._ensure_betslip_expanded()
             if not fill_betslip_stake_input(
@@ -4195,7 +4397,7 @@ class BetWarController:
                 continue
 
             consecutive_recoveries = 0
-            arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
+            arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
             if not arbs:
                 self._maybe_poll_odds_while_idle()
                 self.logger.info("Waiting for Arbitrage")
@@ -4206,11 +4408,20 @@ class BetWarController:
             for arb in arbs:
                 sport = arb.get('sport')
                 league = arb.get('league')
-                game_date = arb.get('game_date')
                 game_datetime = arb.get('game_datetime')
-                bet_type = arb.get('bet_type')
-                if should_skip_spread_arb_for_placement(arb, self.logger):
+                bet_type = arb.get('bet_type', 'moneyline')
+
+                if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
                     continue
+
+                leg = arb_leg_for_book(arb, self.bookmaker)
+                if not leg:
+                    continue
+                team_no = leg["team_no"]
+                game_id = leg["game_id"]
+                team_name = leg["team_name"]
+                wager_odds = leg["odds"]
+                spread_line = leg.get("spread_line")
                 team_1 = arb.get("team_1")
                 team_2 = arb.get("team_2")
 
@@ -4224,20 +4435,6 @@ class BetWarController:
                     continue
 
                 self.logger.info(f"Arbitrage | Match: {team_1} vs {team_2}")
-
-                if arb.get("team_1_bookmaker") == self.bookmaker:
-                    team_no = 1
-                    game_id = arb.get("team_1_game_id")
-                    team_name = team_1
-                    moneyline_odd = arb.get("team_1_odds")
-                elif arb.get("team_2_bookmaker") == self.bookmaker:
-                    team_no = 2
-                    game_id = arb.get("team_2_game_id")
-                    team_name = team_2
-                    moneyline_odd = arb.get("team_2_odds")
-                else:
-                    self.logger.warning("Bookmaker mismatch, skipping arb")
-                    continue
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
@@ -4267,7 +4464,7 @@ class BetWarController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
                     self.logger.info(
                         f"Skipping — leg already confirmed on {self.bookmaker} | "
                         f"{team_name} | {team_1} vs {team_2}"
@@ -4309,7 +4506,14 @@ class BetWarController:
                     continue
 
                 bet_placed, stake_used = self.__execute_bet(
-                    game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
+                    game_id,
+                    team_name,
+                    wager_odds,
+                    stake,
+                    team_1=team_1,
+                    team_2=team_2,
+                    bet_type=bet_type,
+                    spread_line=spread_line,
                 )
                 if not bet_placed and should_notify_failed_bet(self._last_bet_error):
                     maybe_notify_partial_arb_exposure(
@@ -4333,7 +4537,7 @@ class BetWarController:
                         team_name,
                         game_id,
                         stake_used,
-                        moneyline_odd,
+                        wager_odds,
                         TELEGRAM,
                     )
                     self.logger.info("Re-establishing sport offering before next arbitrage")

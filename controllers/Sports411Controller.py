@@ -22,7 +22,8 @@ import undetected_chromedriver as uc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, extract_spread_line_odds_from_label
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, extract_spread_line_odds_from_label, spread_values_match
+from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.odds_watch import persist_moneyline_games
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
@@ -1835,6 +1836,58 @@ class Sports411Controller:
 
         return None, None
 
+    def _find_spread_label(
+        self,
+        game_container,
+        team_name: str,
+        spread_line: float | None,
+        odds: str,
+    ):
+        labels = game_container.find_elements(
+            By.CSS_SELECTOR,
+            ".hdp label.bet-indicator",
+        )
+        team_match = None
+        team_match_odds = None
+
+        for idx, label in enumerate(labels):
+            spread_val, odds_text = extract_spread_line_odds_from_label(label)
+            if spread_val is None or not odds_text:
+                continue
+
+            title = (label.get_attribute("title") or "").strip()
+            team = ""
+            if title:
+                match = re.match(r"(.+?)\s([+-]?\d+(?:\.\d+)?)", title)
+                if match:
+                    team = match.group(1).strip()
+
+            self.logger.info(
+                f"Spread [{idx}] | Team: '{team}' | Line: {spread_val} | Odds: '{odds_text}' | Title: '{title}'"
+            )
+
+            if team.lower() != team_name.lower():
+                continue
+
+            if spread_line is not None and not spread_values_match(spread_val, spread_line):
+                continue
+
+            if self._arb_odds_match(odds, odds_text):
+                self.logger.info(
+                    f"Matched Spread | Index: {idx} | Team: {team} | "
+                    f"Line: {spread_val} | Odds: {odds_text}"
+                )
+                return label, odds_text
+
+            if team_match is None:
+                team_match = label
+                team_match_odds = odds_text
+
+        if team_match is not None:
+            self._reject_if_line_moved(odds, team_match_odds, f"spread board for {team_name}")
+
+        return None, None
+
     def _get_betslip_team_name(self) -> str:
         try:
             return (
@@ -2285,11 +2338,13 @@ class Sports411Controller:
         game_id: str,
         team_name: str,
         moneyline_odd: str,
-        stake: float = 1.0
+        stake: float = 1.0,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
-        blocked = block_real_money_bet(self.logger, stake)
+        blocked = block_real_money_bet(self.logger, stake, bet_type=bet_type)
         if blocked is not None:
             self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
             return blocked
@@ -2301,7 +2356,12 @@ class Sports411Controller:
                     if attempt > 1:
                         self.logger.info(f"Retrying wager after re-login (attempt {attempt}/2)")
                     return self._execute_bet_attempt(
-                        game_id, team_name, moneyline_odd, stake
+                        game_id,
+                        team_name,
+                        moneyline_odd,
+                        stake,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
                     )
                 except Exception as e:
                     confirmed, open_msg = self._verify_open_bet_on_pending(
@@ -2343,11 +2403,16 @@ class Sports411Controller:
         team_name: str,
         moneyline_odd: str,
         stake: float = 1.0,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+        market_label = (
+            f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+        )
         self.logger.info(
             f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-            f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+            f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
 
         already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
@@ -2386,28 +2451,37 @@ class Sports411Controller:
                 By.CSS_SELECTOR, f"div.sports-league-game[idgame='{game_id}']"
             )
 
-        moneyline_label, live_odds = self._find_moneyline_label(
-            game_container, team_name, moneyline_odd
-        )
-        if not moneyline_label:
-            raise Exception("Moneyline label not found for given team & odds")
+        if bet_type == "spread":
+            line_label, live_odds = self._find_spread_label(
+                game_container, team_name, spread_line, moneyline_odd
+            )
+            if not line_label:
+                raise Exception("Spread label not found for given team, line & odds")
+            line_kind = "Spread"
+        else:
+            line_label, live_odds = self._find_moneyline_label(
+                game_container, team_name, moneyline_odd
+            )
+            if not line_label:
+                raise Exception("Moneyline label not found for given team & odds")
+            line_kind = "Moneyline"
 
         self._reject_if_line_moved(moneyline_odd, live_odds, f"board click for {team_name}")
 
-        self.logger.info(f"Moneyline Label: {moneyline_label}")
+        self.logger.info(f"{line_kind} Label: {line_label}")
 
         self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
         self._clear_betslip()
 
-        self._human_click(moneyline_label, force_xdotool=self.use_xdotool and not self.xdotool_bet_only)
-        self.logger.info("Moneyline label clicked")
+        self._human_click(line_label, force_xdotool=self.use_xdotool and not self.xdotool_bet_only)
+        self.logger.info(f"{line_kind} label clicked")
 
         betslip_team = self._wait_for_betslip_team(team_name, timeout=8)
         if betslip_team.lower() != team_name.lower():
             self.logger.warning(
-                f"Betslip still shows '{betslip_team}' after first click; retrying moneyline click"
+                f"Betslip still shows '{betslip_team}' after first click; retrying {line_kind.lower()} click"
             )
-            self._human_click(moneyline_label, force_xdotool=self.use_xdotool and not self.xdotool_bet_only)
+            self._human_click(line_label, force_xdotool=self.use_xdotool and not self.xdotool_bet_only)
             betslip_team = self._wait_for_betslip_team(team_name, timeout=6)
 
         if betslip_team.lower() != team_name.lower():
@@ -2729,7 +2803,7 @@ class Sports411Controller:
 
             consecutive_recoveries = 0
             consecutive_soft_nav_failures = 0
-            arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
+            arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
             matching_arbs = [
                 arb for arb in arbs
                 if arb.get("sport") == self.sport_name and arb.get("league") == self.league
@@ -2750,11 +2824,20 @@ class Sports411Controller:
 
                 sport = arb.get('sport')
                 league = arb.get('league')
-                game_date = arb.get('game_date')
                 game_datetime = arb.get('game_datetime')
-                bet_type = arb.get('bet_type')
-                if should_skip_spread_arb_for_placement(arb, self.logger):
+                bet_type = arb.get('bet_type', 'moneyline')
+
+                if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
                     continue
+
+                leg = arb_leg_for_book(arb, self.bookmaker)
+                if not leg:
+                    continue
+                team_no = leg["team_no"]
+                game_id = leg["game_id"]
+                team_name = leg["team_name"]
+                wager_odds = leg["odds"]
+                spread_line = leg.get("spread_line")
                 team_1 = arb.get("team_1")
                 team_2 = arb.get("team_2")
 
@@ -2767,28 +2850,9 @@ class Sports411Controller:
                 self.logger.info(
                     f"Arbitrage | Match: {team_1} vs {team_2}"
                 )
-                
-                if arb.get("team_1_bookmaker") == self.bookmaker:
-                    team_no = 1
-                    game_id = arb.get("team_1_game_id")
-                    team_name = team_1
-                    moneyline_odd = arb.get("team_1_odds")
-                    attempts = arb.get("team_1_bet_placed_attempts", 0) + 1
-                elif arb.get("team_2_bookmaker") == self.bookmaker:
-                    team_no = 2
-                    game_id = arb.get("team_2_game_id")
-                    team_name = team_2
-                    moneyline_odd = arb.get("team_2_odds")
-                    attempts = arb.get("team_2_bet_placed_attempts", 0) + 1
-                else:
-                    self.logger.warning("Bookmaker mismatch, skipping arb")
-                    continue
 
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
-                bet_type = arb.get("bet_type", "moneyline")
-                if should_skip_spread_arb_for_placement(arb, self.logger):
-                    continue
 
                 if not is_active_arb_pair(book_1, book_2):
                     self.logger.info(
@@ -2816,7 +2880,7 @@ class Sports411Controller:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
                     self.logger.info(
                         f"Skipping — leg already confirmed on {self.bookmaker} | "
                         f"{team_name} | {team_1} vs {team_2}"
@@ -2858,7 +2922,14 @@ class Sports411Controller:
                         f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
                     )
 
-                bet_placed, stake_used = self.__execute_bet(game_id, team_name, moneyline_odd, stake)
+                bet_placed, stake_used = self.__execute_bet(
+                    game_id,
+                    team_name,
+                    wager_odds,
+                    stake,
+                    bet_type=bet_type,
+                    spread_line=spread_line,
+                )
 
                 if not bet_placed:
                     recovered, open_msg = self._recover_bet_from_open_bets(
@@ -2921,7 +2992,7 @@ class Sports411Controller:
                         team_name,
                         game_id,
                         stake_used,
-                        moneyline_odd,
+                        wager_odds,
                         TELEGRAM,
                     )
                     self.logger.info("Returning to sport page and resuming odds watch")

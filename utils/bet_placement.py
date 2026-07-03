@@ -11,6 +11,7 @@ from utils.config import (
     arb_pair_legs,
     required_first_leg_book,
 )
+from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS
 from utils.helpers import send_telegram_alert, format_utc_timestamp
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
 
@@ -28,11 +29,17 @@ def spread_real_money_betting_enabled() -> bool:
     return SPREAD_REAL_MONEY_BETTING_ENABLED
 
 
-def should_skip_spread_arb_for_placement(arb: dict, logger) -> bool:
-    """Alerts-only for spread arbs until explicitly enabled."""
+def should_skip_spread_arb_for_placement(
+    arb: dict, logger, bookmaker: str | None = None
+) -> bool:
+    """Alerts-only for spread arbs until explicitly enabled / supported on this book."""
     bet_type = (arb.get("bet_type") or "moneyline").lower()
     if bet_type != "spread":
         return False
+    bm = (bookmaker or "").strip().lower()
+    if bm in SPREAD_BETTING_UNSUPPORTED_BOOKS:
+        logger.info(f"Spread real-money betting not implemented for {bm}")
+        return True
     if spread_real_money_betting_enabled():
         return False
     logger.info(SPREAD_BETTING_PAUSED_MSG)
