@@ -1014,6 +1014,33 @@ class BetWarController:
             "Team2RotNum": rot2,
         }
 
+    def _fallback_game_line_from_rotations(self, game_id: str) -> dict | None:
+        """Build a minimal GameLine when GetSportOffering is unavailable."""
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        if len(rotations) < 2:
+            return None
+        game_line = self._minimal_game_line_from_rotations(rotations)
+        game_num = self._resolve_game_num_from_dom_rotations(rotations[0], rotations[1])
+        if game_num is not None:
+            game_line["GameNum"] = game_num
+        return game_line
+
+    def _resolve_game_num_from_dom_rotations(self, rot1: str, rot2: str) -> int | None:
+        """Parse GameNum from a full-game linekey already rendered for this rotation pair."""
+        try:
+            for elem in self.driver.find_elements(By.CSS_SELECTOR, "[data-linekey]"):
+                lk = self._extract_data_linekey(elem)
+                if not lk or not self._linekey_is_full_game_moneyline(lk):
+                    continue
+                gl, _ = self._parse_game_line_from_linekey(lk, [rot1, rot2])
+                if not gl:
+                    continue
+                if str(gl.get("Team1RotNum")) == str(rot1) and str(gl.get("Team2RotNum")) == str(rot2):
+                    return gl.get("GameNum")
+        except Exception:
+            pass
+        return None
+
     def _parse_game_line_from_button(self, elem, game_id: str):
         """Extract GameNum/team_no from portal moneyline element (linekey or legacy id)."""
         rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
@@ -4028,6 +4055,14 @@ class BetWarController:
                 self.logger.warning(f"GetSportOffering game-line lookup failed: {e}")
                 game_line, api_team_no = None, None
 
+            if not game_line:
+                game_line = self._fallback_game_line_from_rotations(game_id)
+                if game_line:
+                    self.logger.warning(
+                        f"Using GetLines rotation fallback for {game_id} "
+                        f"(GameNum={game_line.get('GameNum')})"
+                    )
+
             if team_no is None:
                 team_no = api_team_no
             if team_no is None:
@@ -4039,7 +4074,10 @@ class BetWarController:
             angular_only = (
                 not board_visible
                 and game_line
-                and game_line.get("GameNum") is not None
+                and (
+                    game_line.get("GameNum") is not None
+                    or game_line.get("Team1RotNum")
+                )
             )
             if not board_visible and not angular_only:
                 self._save_bet_board_debug(game_id, "missing_rotations")
@@ -4118,9 +4156,13 @@ class BetWarController:
                     )
 
                 if not game_line or game_line.get("GameNum") is None:
+                    if not game_line:
+                        game_line = self._fallback_game_line_from_rotations(game_id)
                     game_line, parsed_team_no = self._resolve_game_line_for_bet(
                         game_id, team_name, None, team_no=team_no
                     )
+                    if not game_line:
+                        game_line = self._fallback_game_line_from_rotations(game_id)
                     if team_no is None:
                         team_no = parsed_team_no
 
