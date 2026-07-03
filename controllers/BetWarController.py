@@ -1174,6 +1174,20 @@ class BetWarController:
             )
         return self.__ensure_sport_offering_loaded()
 
+    def _scroll_board_until_rotation(self, game_id: str, max_scrolls: int = 10) -> bool:
+        """Scroll the lines panel until target rotations render (late games are off-screen)."""
+        if self._rotation_on_board(game_id):
+            return True
+        for _ in range(max_scrolls):
+            try:
+                self.driver.execute_script("window.scrollBy(0, 900);")
+            except Exception:
+                pass
+            time.sleep(0.4)
+            if self._rotation_on_board(game_id):
+                return True
+        return self._rotation_on_board(game_id)
+
     def _refresh_bet_board_for_game(self, game_id: str) -> bool:
         """Try progressively stronger board refreshes until target rotations appear."""
         if self._rotation_on_board(game_id):
@@ -1185,11 +1199,17 @@ class BetWarController:
         if self._rotation_on_board(game_id):
             return True
 
+        self.logger.info(f"Scrolling bet board for missing game {game_id}")
+        if self._scroll_board_until_rotation(game_id):
+            return True
+
         self.logger.info(f"Full sport navigation for missing game {game_id}")
         if not self.__ensure_sport_offering_loaded():
             return False
         time.sleep(0.5)
-        return self._rotation_on_board(game_id)
+        if self._rotation_on_board(game_id):
+            return True
+        return self._scroll_board_until_rotation(game_id)
 
     def _trigger_angular_offering_select(self) -> bool:
         """Select the active sport/league in the Angular SPA (same UI path users take)."""
@@ -4000,14 +4020,6 @@ class BetWarController:
             if not self._ensure_bet_board_ready(game_id):
                 raise Exception(f"{self.sport_name} lines not loaded before bet placement")
 
-            if not self._rotation_on_board(game_id):
-                if not self._refresh_bet_board_for_game(game_id):
-                    self._save_bet_board_debug(game_id, "missing_rotations")
-                    raise Exception(
-                        f"Game {game_id} not visible on BetWar bet board "
-                        f"(GetLines has it; DOM does not)"
-                    )
-
             try:
                 game_line, api_team_no = self._lookup_game_line_from_api(game_id, team_name)
             except SessionUnauthorizedError:
@@ -4020,6 +4032,26 @@ class BetWarController:
                 team_no = api_team_no
             if team_no is None:
                 team_no = self._infer_team_no(team_name, team_1, team_2)
+
+            board_visible = self._rotation_on_board(game_id)
+            if not board_visible:
+                board_visible = self._refresh_bet_board_for_game(game_id)
+            angular_only = (
+                not board_visible
+                and game_line
+                and game_line.get("GameNum") is not None
+            )
+            if not board_visible and not angular_only:
+                self._save_bet_board_debug(game_id, "missing_rotations")
+                raise Exception(
+                    f"Game {game_id} not visible on BetWar bet board "
+                    f"(GetLines has it; DOM does not)"
+                )
+            if angular_only:
+                self.logger.warning(
+                    f"Game {game_id} not on DOM board; using Angular GameLineAction "
+                    f"(GameNum={game_line.get('GameNum')})"
+                )
 
             if bet_type == "spread" and game_line:
                 live_spread_odds = game_line.get(f"SpreadAdj{team_no}")
@@ -4097,31 +4129,47 @@ class BetWarController:
                         game_line, team_no, slip_team, spread_elem=spread_elem
                     )
             else:
-                moneyline_elem = self._find_moneyline_on_board(
-                    game_id, lookup_name, moneyline_odd, team_no=team_no
-                )
-
-                if not moneyline_elem and lookup_name != team_name:
-                    moneyline_elem = self._find_moneyline_on_board(
-                        game_id, team_name, moneyline_odd, team_no=team_no
-                    )
-
-                if not moneyline_elem:
-                    self.logger.warning(
-                        f"Moneyline element not found on first pass for {lookup_name} @ "
-                        f"{moneyline_odd}, refreshing board"
-                    )
-                    self._refresh_bet_board_for_game(game_id)
-                    time.sleep(1.0)
+                moneyline_elem = None
+                if not angular_only:
                     moneyline_elem = self._find_moneyline_on_board(
                         game_id, lookup_name, moneyline_odd, team_no=team_no
                     )
+
                     if not moneyline_elem and lookup_name != team_name:
                         moneyline_elem = self._find_moneyline_on_board(
                             game_id, team_name, moneyline_odd, team_no=team_no
                         )
 
-                if not moneyline_elem:
+                    if not moneyline_elem:
+                        self.logger.warning(
+                            f"Moneyline element not found on first pass for {lookup_name} @ "
+                            f"{moneyline_odd}, refreshing board"
+                        )
+                        self._refresh_bet_board_for_game(game_id)
+                        time.sleep(1.0)
+                        moneyline_elem = self._find_moneyline_on_board(
+                            game_id, lookup_name, moneyline_odd, team_no=team_no
+                        )
+                        if not moneyline_elem and lookup_name != team_name:
+                            moneyline_elem = self._find_moneyline_on_board(
+                                game_id, team_name, moneyline_odd, team_no=team_no
+                            )
+
+                if moneyline_elem:
+                    game_line, parsed_team_no = self._resolve_game_line_for_bet(
+                        game_id, team_name, moneyline_elem, team_no=team_no
+                    )
+                elif game_line:
+                    parsed_team_no = team_no
+                else:
+                    parsed_team_no = None
+
+                if team_no is None:
+                    team_no = parsed_team_no
+                if team_no is None:
+                    team_no = self._infer_team_no(team_name, team_1, team_2)
+
+                if not moneyline_elem and not (game_line and team_no in (1, 2)):
                     self._save_bet_board_debug(game_id, "missing_moneyline")
                     visible = self._board_rotation_numbers()
                     raise Exception(
@@ -4129,25 +4177,20 @@ class BetWarController:
                         f"(game_id={game_id}; board rotations={visible[:12]})"
                     )
 
-                game_line, parsed_team_no = self._resolve_game_line_for_bet(
-                    game_id, team_name, moneyline_elem, team_no=team_no
-                )
-                if team_no is None:
-                    team_no = parsed_team_no
-                if team_no is None:
-                    team_no = self._infer_team_no(team_name, team_1, team_2)
-
-                if game_line.get("GameNum") is not None:
+                if game_line and game_line.get("GameNum") is not None:
                     self.logger.info(
                         f"Resolved GameNum={game_line.get('GameNum')} "
                         f"(linekey={game_line.get('LineKey')}) for {game_id}"
                     )
 
                 if game_line and team_no in (1, 2):
-                    slip_populated = self._add_moneyline_to_slip(
-                        game_line, team_no, slip_team,
-                        moneyline_elem=moneyline_elem,
-                    )
+                    if moneyline_elem:
+                        slip_populated = self._add_moneyline_to_slip(
+                            game_line, team_no, slip_team,
+                            moneyline_elem=moneyline_elem,
+                        )
+                    elif self._click_moneyline_via_angular(game_line, team_no):
+                        slip_populated = self._wait_for_betslip_team(slip_team, timeout=6)
 
                 if not slip_populated and not self._wait_for_betslip_team(slip_team, timeout=3):
                     if game_line and team_no in (1, 2):
