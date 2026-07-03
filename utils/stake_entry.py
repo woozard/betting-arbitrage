@@ -9,6 +9,9 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from utils.stake_sizing import BaseAmountStake
 
 DEFAULT_RISK_SELECTORS: tuple[str, ...] = (
+    "#betSlipDiv input[id^='R_']",
+    "#betSlipBody input[id^='R_']",
+    "input.js-kioskboard-input[id^='R_']",
     "#betSlipDiv input.txtRiskAmount",
     "#betSlipDiv input.txtWinAmount",
     "#betSlipDiv input[id^='risk_']",
