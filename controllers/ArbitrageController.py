@@ -12,7 +12,6 @@ from database.models.Arbitrage import Arbitrage
 from database.models.ArbitrageOdds import ArbitrageOdds
 from utils.config import (
     TELEGRAM,
-    SEQUENTIAL_ARB_BETTING,
     is_active_arb_pair,
     arb_max_total_prob_for_bet_type,
     min_arb_profit_pct_for_bet_type,
@@ -20,6 +19,7 @@ from utils.config import (
     SPREAD_ARB_MAX_PROFIT_PCT,
     SPREAD_ODDS_MAX_AGE_SECONDS,
     SPREAD_ODDS_MAX_GAP_SECONDS,
+    arb_opportunity_alert_chat_ids,
 )
 from utils.logger import Logger
 from utils.helpers import (
@@ -665,37 +665,18 @@ class ArbitrageController:
             )
 
             self.__store_arbitrage_cache(arb_data)
-            game_date_str = str(arb.game_date)
-            if self.cache.arb_opportunity_alert_already_sent(
+            self.__maybe_send_arb_opportunity_alert(
                 arb.team_1,
                 arb.team_2,
                 arb.team_1_bookmaker,
                 arb.team_2_bookmaker,
-                game_date_str,
-                bet_type=bet_type,
-                spread_value=spread_value,
-            ):
-                self.logger.info(
-                    f"Skipping duplicate arb opportunity Telegram alert - "
-                    f"{market_label} {arb.team_1} vs {arb.team_2} | "
-                    f"{arb.team_1_bookmaker} vs {arb.team_2_bookmaker}"
-                )
-            else:
-                self.__send_alert(
-                    arb,
-                    arb_data.get("identified_at"),
-                    spread_value=spread_value,
-                    arb_data=arb_data,
-                )
-                self.cache.mark_arb_opportunity_alert_sent(
-                    arb.team_1,
-                    arb.team_2,
-                    arb.team_1_bookmaker,
-                    arb.team_2_bookmaker,
-                    game_date_str,
-                    bet_type=bet_type,
-                    spread_value=spread_value,
-                )
+                str(arb.game_date),
+                bet_type,
+                spread_value,
+                o1.get("sport"),
+                arb=arb,
+                arb_data=arb_data,
+            )
 
             return arb
 
@@ -707,6 +688,17 @@ class ArbitrageController:
             )
             self.db.rollback()
             self.__store_arbitrage_cache(arb_data)
+            self.__maybe_send_arb_opportunity_alert(
+                arb_data["team_1"],
+                arb_data["team_2"],
+                arb_data["team_1_bookmaker"],
+                arb_data["team_2_bookmaker"],
+                arb_data.get("game_date") or str(game_date),
+                bet_type,
+                spread_value,
+                o1.get("sport"),
+                arb_data=arb_data,
+            )
             return None
 
     # --------------------------------------------------------
@@ -738,6 +730,55 @@ class ArbitrageController:
 
         self.__store_arbitrage_cache(arb_data)
 
+    def __maybe_send_arb_opportunity_alert(
+        self,
+        team_1,
+        team_2,
+        book_1,
+        book_2,
+        game_date_str,
+        bet_type,
+        spread_value,
+        sport,
+        arb=None,
+        arb_data=None,
+    ):
+        market_label = (
+            spread_market_label(spread_value, sport)
+            if bet_type == "spread"
+            else bet_type
+        )
+        if self.cache.arb_opportunity_alert_already_sent(
+            team_1,
+            team_2,
+            book_1,
+            book_2,
+            game_date_str,
+            bet_type=bet_type,
+            spread_value=spread_value,
+        ):
+            self.logger.info(
+                f"Skipping duplicate arb opportunity Telegram alert - "
+                f"{market_label} {team_1} vs {team_2} | {book_1} vs {book_2}"
+            )
+            return
+
+        self.__send_alert(
+            arb,
+            (arb_data or {}).get("identified_at"),
+            spread_value=spread_value,
+            arb_data=arb_data,
+        )
+        self.cache.mark_arb_opportunity_alert_sent(
+            team_1,
+            team_2,
+            book_1,
+            book_2,
+            game_date_str,
+            bet_type=bet_type,
+            spread_value=spread_value,
+        )
+
     # --------------------------------------------------------
     # Send Alert
     # --------------------------------------------------------
@@ -754,14 +795,23 @@ class ArbitrageController:
             self.logger.info(alert)
             self.logger.info(f"========== Alert ==========")
 
-            alert_chat = TELEGRAM.get("arbitrage")
-            if TELEGRAM_ALERTS_ASYNC:
-                threading.Thread(
-                    target=lambda: asyncio.run(send_telegram_alert(alert, alert_chat)),
-                    daemon=True,
-                ).start()
-            else:
-                asyncio.run(send_telegram_alert(alert, alert_chat))
+            chat_ids = arb_opportunity_alert_chat_ids()
+            if not chat_ids:
+                self.logger.warning(
+                    "No Telegram chat configured for arb opportunity alerts — skipping"
+                )
+                return
+
+            for chat_id in chat_ids:
+                if TELEGRAM_ALERTS_ASYNC:
+                    threading.Thread(
+                        target=lambda cid=chat_id: asyncio.run(
+                            send_telegram_alert(alert, cid)
+                        ),
+                        daemon=True,
+                    ).start()
+                else:
+                    asyncio.run(send_telegram_alert(alert, chat_id))
             
 
         except Exception as e:

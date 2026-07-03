@@ -65,6 +65,19 @@ def telegram_health_chat_id():
         or TELEGRAM.get('arbitrage_monitoring')
     )
 
+
+def arb_opportunity_alert_chat_ids():
+    """Telegram chats for scanner / arb-opportunity alerts (both legs, pre-bet).
+
+    Uses TELEGRAM_CHAT_ARBITRAGE only — not TELEGRAM_CHAT_OPS / REAL_BETS, which are
+    reserved for isolated per-book bet confirmations and arb-complete summaries.
+    """
+    cid = TELEGRAM.get("arbitrage")
+    if cid:
+        return [cid]
+    fallback = TELEGRAM.get("chat_id")
+    return [fallback] if fallback else []
+
 # Betting — base amount per arb leg ($20 default).
 # Minus odds → fill to-win box; plus odds → fill risk box (see utils/stake_sizing.py).
 BET_STAKE = float(os.getenv('BET_STAKE', '20'))

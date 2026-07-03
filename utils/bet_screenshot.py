@@ -146,6 +146,89 @@ def _bet_type_label(bet_type: str, spread_line) -> str:
     return "Moneyline"
 
 
+def render_open_bets_receipt(
+    path: str,
+    bookmaker: str,
+    bets: list[dict],
+    *,
+    title: str = "OPEN BETS",
+    logger=None,
+) -> str | None:
+    """Render a list of open wagers for API books (3et, 4casters, Paradise)."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        if logger:
+            logger.warning("Pillow not installed — skipping open bets receipt")
+        return None
+
+    if not bets:
+        return None
+
+    width = 760
+    row_height = 88
+    height = max(260, 130 + len(bets) * row_height)
+    img = Image.new("RGB", (width, height), color=(18, 24, 38))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        body_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 17)
+    except OSError:
+        title_font = ImageFont.load_default()
+        body_font = title_font
+        small_font = title_font
+
+    y = 24
+    draw.text(
+        (24, y),
+        f"{(bookmaker or 'book').upper()} — {title}",
+        fill=(76, 175, 80),
+        font=title_font,
+    )
+    y += 40
+    draw.line([(24, y), (width - 24, y)], fill=(60, 70, 90), width=1)
+    y += 18
+
+    for bet in bets:
+        desc = bet.get("description") or bet.get("team_name") or "Wager"
+        match = bet.get("match") or ""
+        odds = bet.get("odds", "")
+        stake = bet.get("stake_display") or _stake_display(bet.get("stake", ""))
+        status = bet.get("status", "")
+        extra = bet.get("extra", "")
+
+        draw.text((24, y), desc, fill=(230, 235, 245), font=body_font)
+        y += 26
+        detail_parts = [p for p in (match, f"Odds: {odds}" if odds else "", f"Stake: {stake}") if p]
+        if detail_parts:
+            draw.text((24, y), " · ".join(detail_parts), fill=(170, 180, 200), font=small_font)
+            y += 22
+        tail = " · ".join(p for p in (f"Status: {status}" if status else "", extra) if p)
+        if tail:
+            draw.text((24, y), tail, fill=(130, 140, 160), font=small_font)
+            y += 22
+        y += 12
+
+    draw.text(
+        (24, height - 32),
+        time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        fill=(130, 140, 160),
+        font=small_font,
+    )
+
+    try:
+        img.save(path, format="PNG")
+        if logger:
+            logger.info(f"Open bets receipt saved: {path}")
+        return path
+    except OSError as exc:
+        if logger:
+            logger.warning(f"Could not save open bets receipt {path}: {exc}")
+        return None
+
+
 def render_bet_receipt(
     path: str,
     bookmaker: str,

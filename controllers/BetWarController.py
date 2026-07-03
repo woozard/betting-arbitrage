@@ -1682,14 +1682,41 @@ class BetWarController:
                 i += 1
                 continue
             if re.match(r"^\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?$", ln.replace(",", "")):
-                risk_raw = ln.split("/")[0].strip()
+                parts = [p.strip() for p in ln.replace(",", "").split("/")]
+                risk_raw = parts[0]
+                win_raw = parts[1] if len(parts) > 1 else ""
                 desc = lines[i + 1] if i + 1 < len(lines) else ""
                 if desc.lower() not in skip:
-                    rows.append({"risk_raw": risk_raw, "description": desc, "risk_win": ln})
+                    rows.append({
+                        "risk_raw": risk_raw,
+                        "win_raw": win_raw,
+                        "description": desc,
+                        "risk_win": ln,
+                    })
                     i += 2
                     continue
             i += 1
         return rows
+
+    def _my_bets_tab_has_payload(self, text: str) -> bool:
+        """True when My Bets finished loading (wager rows or explicit empty state)."""
+        text_l = (text or "").lower().strip()
+        if not text_l or text_l in ("my bets", "loading", "loading..."):
+            return False
+        if any(m in text_l for m in ("no pending", "no open", "no wagers", "you have no")):
+            return True
+        return bool(self._parse_my_bets_rows(text))
+
+    def _my_bets_row_matches_stake(self, row: dict, stake) -> bool:
+        try:
+            if stake_matches_verification_amount(stake, row["risk_raw"]):
+                return True
+            win_raw = row.get("win_raw")
+            if win_raw and stake_matches_verification_amount(stake, win_raw):
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
 
     @staticmethod
     def _my_bets_row_matches_team(description: str, team_name: str) -> bool:
@@ -1708,11 +1735,15 @@ class BetWarController:
         for row in self._parse_my_bets_rows(text):
             if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
                 continue
-            try:
-                if stake_matches_verification_amount(stake, row["risk_raw"]):
-                    return True
-            except (TypeError, ValueError):
-                continue
+            if self._my_bets_row_matches_stake(row, stake):
+                return True
+        return False
+
+    def _my_bets_has_team_wager(self, team_name: str) -> bool:
+        text = self._my_bets_tab_text(timeout=12)
+        for row in self._parse_my_bets_rows(text):
+            if self._my_bets_row_matches_team(row.get("description", ""), team_name):
+                return True
         return False
 
     def _betslip_shows_insufficient_available(self) -> bool:
@@ -3873,11 +3904,10 @@ class BetWarController:
             and team_2.lower() in text
         )
 
-    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
-        confirmed, _ = self._verify_open_bet_on_my_bets(
-            team_name, stake=None, team_1=team_1, team_2=team_2
-        )
-        return confirmed
+    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str, stake=None) -> bool:
+        if stake is None:
+            return False
+        return self._my_bets_has_wager(team_name, stake)
 
     def _message_requires_relogin(self, message: str) -> bool:
         msg_l = (message or "").lower()
@@ -4048,6 +4078,27 @@ class BetWarController:
         if not selected:
             self.driver.execute_script("arguments[0].click();", tab)
 
+    def _refresh_my_bets_tab(self):
+        """Toggle away from My Bets and back so pending wagers reload after Place Bets."""
+        try:
+            for selector in ("#pillsBetSlipTab", "#pills-betslip-tab", "#pills-betslip"):
+                tabs = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if tabs:
+                    self.driver.execute_script("arguments[0].click();", tabs[0])
+                    time.sleep(0.4)
+                    break
+        except Exception:
+            pass
+        try:
+            pending_tab = self.driver.find_element(By.CSS_SELECTOR, "#pillsPendingTab")
+            self.driver.execute_script(
+                "arguments[0].setAttribute('data-loaded', 'false');", pending_tab
+            )
+            self.driver.execute_script("arguments[0].click();", pending_tab)
+            time.sleep(0.6)
+        except Exception:
+            self._open_my_bets_tab()
+
     def _my_bets_tab_text(self, timeout: int = 10) -> str:
         """Load and return visible text from the Player portal My Bets tab."""
         self._open_my_bets_tab()
@@ -4061,14 +4112,12 @@ class BetWarController:
                     last_text = text
                 text_l = text.lower()
                 loading = not text or text_l in ("my bets", "loading", "loading...")
-                has_wagers = any(
-                    marker in text_l
-                    for marker in ("risk", "to win", "pending", "wager", "no pending", "no open")
-                )
+                if not loading and self._my_bets_tab_has_payload(text):
+                    return text
                 tab_loaded = (self.driver.find_element(
                     By.CSS_SELECTOR, "#pillsPendingTab"
                 ).get_attribute("data-loaded") or "").lower() == "true"
-                if not loading and (has_wagers or tab_loaded):
+                if tab_loaded and self._my_bets_tab_has_payload(text):
                     return text
             except Exception:
                 pass
@@ -4090,6 +4139,8 @@ class BetWarController:
             text = self._my_bets_tab_text(timeout=12)
             if not text:
                 return False, "My Bets tab did not load"
+            if not self._my_bets_tab_has_payload(text):
+                return False, "My Bets tab did not load wager rows"
             text_l = text.lower()
             self.logger.info(f"My Bets tab preview: {text[:250]}")
 
@@ -4111,11 +4162,8 @@ class BetWarController:
                         return False, (
                             f"My Bets shows alternate-period market (not full-game ML): {desc}"
                         )
-                    try:
-                        if stake_matches_verification_amount(stake, row["risk_raw"]):
-                            return True, "Open bet confirmed on My Bets tab"
-                    except (TypeError, ValueError):
-                        continue
+                    if self._my_bets_row_matches_stake(row, stake):
+                        return True, "Open bet confirmed on My Bets tab"
                 stake_label = (
                     format_base_amount_stake(stake)
                     if isinstance(stake, BaseAmountStake)
@@ -4561,6 +4609,7 @@ class BetWarController:
                 raise Exception("Place Bets did not confirm in bet slip")
 
             self.logger.info("Place Bets confirmed in bet slip; verifying on My Bets tab")
+            self._refresh_my_bets_tab()
             time.sleep(1.5)
 
             matchup_1 = team_1 or ""
@@ -4873,9 +4922,42 @@ class BetWarController:
                         f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
                     )
 
-                if self._has_existing_open_bet(team_name, team_1, team_2):
+                stake_plan = base_amount_stake_from_odds(wager_odds, stake)
+                if self._my_bets_has_wager(team_name, stake_plan):
+                    self.logger.info(
+                        f"Recovering existing My Bets wager for {team_name} on {self.bookmaker} "
+                        f"(matches intended base stake)"
+                    )
+                    screenshot_path = capture_bet_screenshot_for_alert(
+                        self.logger,
+                        self.bookmaker,
+                        arb,
+                        team_name,
+                        game_id,
+                        stake_plan,
+                        wager_odds,
+                        driver=self.driver,
+                    )
+                    finalize_confirmed_bet(
+                        self.cache,
+                        self.storage,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        team_name,
+                        game_id,
+                        stake_plan,
+                        wager_odds,
+                        bet_type,
+                        TELEGRAM,
+                        screenshot_path=screenshot_path,
+                    )
+                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                    continue
+
+                if self._my_bets_has_team_wager(team_name):
                     self.logger.warning(
-                        f"Open wager detected on My Bets for {team_name} on {self.bookmaker}; "
+                        f"Open wager for {team_name} already on My Bets ({self.bookmaker}); "
                         f"skipping duplicate placement"
                     )
                     continue

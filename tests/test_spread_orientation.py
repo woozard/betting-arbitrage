@@ -122,9 +122,11 @@ def test_build_leg_confirmed_alert_leg_one_of_two():
         other_leg_placed=False,
     )
     assert "Leg 1 of 2" in alert
-    assert "Leg: 1 of 2" in alert
-    assert "Waiting for: 3et" in alert
-    assert "waiting for 3et (leg 2 of 2)" in alert
+    assert "Book: betwar" in alert
+    assert "This bet: Pirates +140" in alert
+    assert "Waiting for leg 2 on 3et" in alert
+    assert "Screenshot: attached below" in alert
+    assert "3et" not in alert.split("This bet:")[1].split("Real money:")[0]
 
 
 def test_build_leg_confirmed_alert_leg_two_of_two():
@@ -150,8 +152,10 @@ def test_build_leg_confirmed_alert_leg_two_of_two():
         other_leg_placed=True,
     )
     assert "Leg 2 of 2" in alert
-    assert "completes arb" in alert
-    assert "full arb complete alert follows" in alert
+    assert "Book: 3et" in alert
+    assert "This bet: Nationals -133" in alert
+    assert "full arb summary follows" in alert
+    assert "Screenshot: attached below" in alert
 
 
 def test_build_arb_complete_alert_includes_header():

@@ -18,6 +18,9 @@ from utils.helpers import (
     send_telegram_photo,
     format_utc_timestamp,
     format_arb_complete_alert,
+    format_american_alert_odds,
+    normalize_spread_value,
+    BOOK_ALERT_LABELS,
 )
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
 
@@ -80,6 +83,44 @@ def _format_stake_line(stake) -> str:
         return f"${float(stake):.2f}"
     except (TypeError, ValueError):
         return str(stake)
+
+
+def _format_real_money_stake(stake) -> str:
+    """Human-readable stake for real-bets Telegram (risk + to-win)."""
+    if isinstance(stake, BaseAmountStake):
+        return (
+            f"${stake.risk:.2f} risk · ${stake.to_win:.2f} to-win "
+            f"(base ${stake.base_amount:.2f} @ {stake.american_odds:+d})"
+        )
+    try:
+        return f"${float(stake):.2f} risk"
+    except (TypeError, ValueError):
+        return str(stake)
+
+
+def _format_placed_bet_line(arb: dict, team_name: str, team_no: int, odds) -> str:
+    """Single-leg bet description for an isolated real-money alert."""
+    bet_type = arb.get("bet_type", "moneyline")
+    odds_str = format_american_alert_odds(odds)
+    if bet_type != "spread":
+        return f"{team_name} {odds_str}"
+
+    if team_no == 1:
+        line = normalize_spread_value(arb.get("spread_line_team_1"))
+        if line is None:
+            line = normalize_spread_value(arb.get("spread_value"))
+    else:
+        line = normalize_spread_value(arb.get("spread_line_team_2"))
+        if line is None:
+            spread_value = normalize_spread_value(arb.get("spread_value"))
+            line = -spread_value if spread_value is not None else None
+    if line is not None:
+        return f"{team_name} {line:+.1f} {odds_str}"
+    return f"{team_name} {odds_str}"
+
+
+def _book_alert_label(bookmaker: str) -> str:
+    return BOOK_ALERT_LABELS.get(bookmaker, bookmaker or "book")
 
 
 def _stake_risk_amount(stake) -> float:
@@ -259,19 +300,6 @@ def should_pause_first_leg_for_exposure(
     return True
 
 
-def _leg_position_label(
-    other_leg_placed: bool,
-    bookmaker: str,
-    book_1: str,
-    book_2: str,
-    other_book: str,
-) -> str:
-    pair = f"{book_1} × {book_2}"
-    if other_leg_placed:
-        return f"Leg: 2 of 2 (completes arb) | Pair: {pair} | This leg: {bookmaker}"
-    return f"Leg: 1 of 2 | Pair: {pair} | This leg: {bookmaker} | Waiting for: {other_book}"
-
-
 def _build_leg_confirmed_alert(
     arb: dict,
     bookmaker: str,
@@ -291,34 +319,36 @@ def _build_leg_confirmed_alert(
     bet_type = arb.get("bet_type", "moneyline")
     book_1 = arb.get("team_1_bookmaker")
     book_2 = arb.get("team_2_bookmaker")
-
-    leg_position = _leg_position_label(
-        other_leg_placed, bookmaker, book_1, book_2, other_book
-    )
-    if other_leg_placed:
-        status = "Both legs confirmed — full arb complete alert follows"
-    else:
-        status = f"First leg confirmed — waiting for {other_book} (leg 2 of 2)"
+    book_label = _book_alert_label(bookmaker)
+    other_label = _book_alert_label(other_book)
+    pair = f"{_book_alert_label(book_1)} × {_book_alert_label(book_2)}"
+    bet_line = _format_placed_bet_line(arb, team_name, team_no, moneyline_odd)
 
     if other_leg_placed:
-        header = "===== Leg Confirmed (Real Money) — Leg 2 of 2 ====="
+        leg_no = 2
+        header = "===== Bet Placed (Real Money) — Leg 2 of 2 ====="
+        status = "Both legs confirmed — full arb summary follows in a separate message"
     else:
-        header = "===== Leg Confirmed (Real Money) — Leg 1 of 2 ====="
+        leg_no = 1
+        header = "===== Bet Placed (Real Money) — Leg 1 of 2 ====="
+        status = f"Waiting for leg 2 on {other_label}"
+
+    market = bet_type
+    if bet_type == "spread":
+        market = f"spread ({arb.get('spread_value')})"
 
     return (
-        f"{header}\n"
-        f"{leg_position}\n"
+        f"{header}\n\n"
+        f"Book: {book_label}\n"
+        f"Leg: {leg_no} of 2 in {pair}\n"
         f"Identified At: {format_utc_timestamp(identified_at)}\n"
-        f"Sport: {sport}\n"
-        f"League: {league}\n"
+        f"Sport: {sport} · {league}\n"
         f"Date: {game_date}\n"
         f"Match: {team_1} vs {team_2}\n"
-        f"Bet Type: {bet_type}\n"
-        f"Team No: {team_no}\n"
-        f"Team: {team_name}\n"
-        f"Bookmaker: {bookmaker}\n"
-        f"Odds: {moneyline_odd}\n"
-        f"Stake: {_format_stake_line(stake)}\n"
+        f"Market: {market}\n\n"
+        f"This bet: {bet_line}\n"
+        f"Real money: {_format_real_money_stake(stake)}\n\n"
+        f"Screenshot: attached below\n"
         f"Status: {status}\n"
     )
 
