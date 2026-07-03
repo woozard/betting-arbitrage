@@ -23,7 +23,9 @@ from utils.helpers import (
     prune_debug_files,
     teams_same,
     arb_live_odds_acceptable,
+    spread_values_match,
 )
+from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -760,11 +762,12 @@ class ParadiseWagerController:
             odds = entry.get("o")
             if handicap is None or odds is None:
                 continue
+            line_id = entry.get("i")
             try:
-                return float(handicap), str(odds)
+                return float(handicap), str(odds), line_id
             except (TypeError, ValueError):
                 continue
-        return None, None
+        return None, None, None
 
     def _parse_schedule_response(self, schedule_data: list):
         games = []
@@ -794,7 +797,7 @@ class ParadiseWagerController:
                         rotation = str(team.get("rn") or "").strip()
                         moneylines = (team.get("ls") or {}).get("m") or []
                         ml = moneylines[0] if moneylines else {}
-                        spread_val, spread_odds = self._extract_team_spread_entry(team)
+                        spread_val, spread_odds, spread_line_id = self._extract_team_spread_entry(team)
                         team_entries.append({
                             "name": name,
                             "rotation": rotation,
@@ -802,6 +805,7 @@ class ParadiseWagerController:
                             "odds": ml.get("o"),
                             "spread_val": spread_val,
                             "spread_odds": spread_odds,
+                            "spread_line_id": spread_line_id,
                         })
 
                     if not team_entries[0]["rotation"] or not team_entries[1]["rotation"]:
@@ -873,6 +877,8 @@ class ParadiseWagerController:
                         "line_ids": {
                             "team_1": team_entries[0]["line_id"],
                             "team_2": team_entries[1]["line_id"],
+                            "spread_team_1": team_entries[0].get("spread_line_id"),
+                            "spread_team_2": team_entries[1].get("spread_line_id"),
                         },
                     }
                     games.append(row)
@@ -1399,10 +1405,12 @@ class ParadiseWagerController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
-        blocked = block_real_money_bet(self.logger, stake)
+        blocked = block_real_money_bet(self.logger, stake, bet_type=bet_type)
         if blocked is not None:
             self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
             return blocked
@@ -1416,6 +1424,8 @@ class ParadiseWagerController:
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
                     )
                 except Exception as e:
                     if attempt == 1 and self._message_requires_relogin(str(e)):
@@ -1448,11 +1458,16 @@ class ParadiseWagerController:
         stake: float = 1.0,
         team_1: str = None,
         team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
     ):
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+        market_label = (
+            f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+        )
         self.logger.info(
             f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-            f"Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+            f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
 
         self._refresh_session_before_wager()
@@ -1466,11 +1481,25 @@ class ParadiseWagerController:
             )
 
         line_ids = game_row.get("line_ids") or {}
-        line_id = line_ids.get(f"team_{team_no}")
-        if not line_id:
-            raise Exception(f"No moneyline line Id for {team_name} on game {game_id}")
+        if bet_type == "spread":
+            line_id = line_ids.get(f"spread_team_{team_no}")
+            market = game_row.get("spread") or {}
+            live_odds = market.get(f"team_{team_no}_odds")
+            live_spread = market.get(f"team_{team_no}_spread")
+            if spread_line is not None and live_spread is not None:
+                if not spread_values_match(live_spread, spread_line):
+                    raise Exception(
+                        f"Spread line moved: live {live_spread} differs from arb {spread_line}"
+                    )
+        else:
+            line_id = line_ids.get(f"team_{team_no}")
+            live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
 
-        live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
+        if not line_id:
+            raise Exception(
+                f"No {bet_type} line Id for {team_name} on game {game_id}"
+            )
+
         if live_odds is not None:
             if not self._arb_odds_exact_match(str(live_odds), moneyline_odd):
                 tol = getattr(self, "_odds_tolerance", 0) or 0
@@ -1648,7 +1677,7 @@ class ParadiseWagerController:
                 continue
 
             consecutive_recoveries = 0
-            arbs = self.cache.get_arbitrage(bookmaker=self.bookmaker, bet_type='moneyline')
+            arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
             if not arbs:
                 self._maybe_poll_odds_while_idle()
                 self.logger.info("Waiting for Arbitrage")
@@ -1659,10 +1688,22 @@ class ParadiseWagerController:
             for arb in arbs:
                 sport = arb.get('sport')
                 league = arb.get('league')
-                game_date = arb.get('game_date')
                 game_datetime = arb.get('game_datetime')
                 team_1 = arb.get("team_1")
                 team_2 = arb.get("team_2")
+                bet_type = arb.get("bet_type", "moneyline")
+
+                if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
+                    continue
+
+                leg = arb_leg_for_book(arb, self.bookmaker)
+                if not leg:
+                    continue
+                team_no = leg["team_no"]
+                game_id = leg["game_id"]
+                team_name = leg["team_name"]
+                wager_odds = leg["odds"]
+                spread_line = leg.get("spread_line")
 
                 if sport != self.sport_name or league != self.league:
                     continue
@@ -1675,25 +1716,8 @@ class ParadiseWagerController:
 
                 self.logger.info(f"Arbitrage | Match: {team_1} vs {team_2}")
 
-                if arb.get("team_1_bookmaker") == self.bookmaker:
-                    team_no = 1
-                    game_id = arb.get("team_1_game_id")
-                    team_name = team_1
-                    moneyline_odd = arb.get("team_1_odds")
-                elif arb.get("team_2_bookmaker") == self.bookmaker:
-                    team_no = 2
-                    game_id = arb.get("team_2_game_id")
-                    team_name = team_2
-                    moneyline_odd = arb.get("team_2_odds")
-                else:
-                    self.logger.warning("Bookmaker mismatch, skipping arb")
-                    continue
-
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
-                bet_type = arb.get("bet_type", "moneyline")
-                if should_skip_spread_arb_for_placement(arb, self.logger, self.bookmaker):
-                    continue
 
                 if not is_active_arb_pair(book_1, book_2):
                     self.logger.info(
@@ -1721,7 +1745,7 @@ class ParadiseWagerController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if self.cache.is_leg_placed(self.bookmaker, "moneyline", game_id):
+                if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
                     self.logger.info(
                         f"Skipping — leg already confirmed on {self.bookmaker} | "
                         f"{team_name} | {team_1} vs {team_2}"
@@ -1763,7 +1787,14 @@ class ParadiseWagerController:
                     continue
 
                 bet_placed, stake_used = self.__execute_bet(
-                    game_id, team_name, moneyline_odd, stake, team_1=team_1, team_2=team_2
+                    game_id,
+                    team_name,
+                    wager_odds,
+                    stake,
+                    team_1=team_1,
+                    team_2=team_2,
+                    bet_type=bet_type,
+                    spread_line=spread_line,
                 )
                 if not bet_placed and should_notify_failed_bet(self._last_bet_error):
                     maybe_notify_partial_arb_exposure(
@@ -1799,7 +1830,7 @@ class ParadiseWagerController:
                         team_name,
                         game_id,
                         stake_used,
-                        moneyline_odd,
+                        wager_odds,
                         TELEGRAM,
                     )
                     self._refresh_schedule_cache()

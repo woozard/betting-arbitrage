@@ -2,7 +2,8 @@
 
 from utils.config import SPREAD_REAL_MONEY_BETTING_ENABLED
 
-SPREAD_BETTING_UNSUPPORTED_BOOKS = frozenset({"paradisewager"})
+# Books listed here skip spread placement (alert-only). Empty = all books may bet spreads.
+SPREAD_BETTING_UNSUPPORTED_BOOKS = frozenset()
 
 
 def get_arbitrage_for_placement(cache, bookmaker: str) -> list:
