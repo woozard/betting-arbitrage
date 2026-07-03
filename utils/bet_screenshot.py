@@ -6,7 +6,12 @@ import os
 import time
 from typing import Callable
 
-from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
+from utils.stake_sizing import (
+    BaseAmountStake,
+    format_base_amount_stake,
+    stake_matches_verification_amount,
+)
+from utils.helpers import teams_same
 
 SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "screenshots")
 
@@ -51,6 +56,7 @@ def capture_element_screenshot(driver, selectors: list[str], path: str, logger) 
 
 
 def capture_betwar_my_bets(driver, path: str, logger) -> str | None:
+    """Capture full pending-wagers list (legacy / preview scripts)."""
     from selenium.webdriver.common.by import By
 
     try:
@@ -67,6 +73,113 @@ def capture_betwar_my_bets(driver, path: str, logger) -> str | None:
         path,
         logger,
     )
+
+
+def _betwar_row_matches_team(row_text: str, team_name: str) -> bool:
+    text = (row_text or "").strip()
+    if not text or not team_name:
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    desc = lines[1] if len(lines) > 1 else text
+    if team_name.lower() in desc.lower():
+        return True
+    if teams_same(desc, team_name):
+        return True
+    last_word = team_name.strip().split()[-1].lower()
+    return bool(last_word and last_word in desc.lower())
+
+
+def _betwar_row_matches_stake(row_text: str, stake) -> bool:
+    import re
+
+    first_line = (row_text or "").splitlines()[0] if row_text else ""
+    m = re.match(
+        r"^(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",
+        first_line.replace(",", "").strip(),
+    )
+    if not m:
+        return True
+    risk_raw, win_raw = m.group(1), m.group(2)
+    if stake_matches_verification_amount(stake, risk_raw):
+        return True
+    return bool(win_raw and stake_matches_verification_amount(stake, win_raw))
+
+
+def capture_betwar_open_wager(
+    driver,
+    path: str,
+    logger,
+    team_name: str,
+    stake=None,
+) -> str | None:
+    """Open My Bets, click the matching wager row, screenshot that bet only."""
+    import re
+    from selenium.webdriver.common.by import By
+
+    try:
+        tab = driver.find_element(By.CSS_SELECTOR, "#pillsPendingTab")
+        if (tab.get_attribute("aria-selected") or "").lower() != "true":
+            driver.execute_script("arguments[0].click();", tab)
+        time.sleep(0.8)
+    except Exception as exc:
+        logger.warning(f"BetWar My Bets tab not available for screenshot: {exc}")
+        return None
+
+    try:
+        rows = driver.find_elements(
+            By.CSS_SELECTOR, "#tbodyPendingBetItems tr.wager-detail-info"
+        )
+    except Exception as exc:
+        logger.warning(f"BetWar pending wager rows not found: {exc}")
+        return None
+
+    candidates = []
+    for row in rows:
+        text = (row.text or "").strip()
+        if not text or not _betwar_row_matches_team(text, team_name):
+            continue
+        candidates.append((row, text))
+
+    if not candidates:
+        logger.warning(f"BetWar My Bets: no row matched team {team_name!r}")
+        return None
+
+    matched = candidates[0]
+    if stake is not None:
+        stake_matches = [
+            (row, text)
+            for row, text in candidates
+            if _betwar_row_matches_stake(text, stake)
+        ]
+        if stake_matches:
+            matched = stake_matches[0]
+        elif len(candidates) > 1:
+            logger.warning(
+                f"BetWar My Bets: team {team_name!r} matched {len(candidates)} rows "
+                f"but none matched stake — using first match"
+            )
+
+    row, row_text = matched
+    try:
+        driver.execute_script("arguments[0].click();", row)
+        time.sleep(1.0)
+        side = row.find_elements(By.CSS_SELECTOR, ".wager-side-description")
+        if side:
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                cls = (side[0].get_attribute("class") or "").lower()
+                if "invisible" not in cls and (side[0].text or "").strip():
+                    break
+                time.sleep(0.25)
+        png = row.screenshot_as_png
+        if png:
+            preview = re.sub(r"\s+", " ", (row_text.splitlines()[0] if row_text else ""))[:60]
+            logger.info(f"BetWar single-wager screenshot | {team_name} | {preview}")
+            return _write_png(path, png, logger)
+    except Exception as exc:
+        logger.warning(f"BetWar single-wager screenshot failed: {exc}")
+
+    return None
 
 
 def capture_betamapola_betslip(driver, path: str, logger) -> str | None:
@@ -441,9 +554,15 @@ def capture_confirmed_bet_screenshot(
     bm = (bookmaker or "").strip().lower()
 
     if bm == "betwar" and driver is not None:
-        shot = capture_betwar_my_bets(driver, path, logger)
+        shot = capture_betwar_open_wager(
+            driver, path, logger, team_name=team_name, stake=stake
+        )
         if shot:
             return shot
+        logger.warning(
+            f"BetWar single-wager screenshot unavailable for {team_name}; skipping full-list fallback"
+        )
+        return None
 
     if bm == "betamapola" and driver is not None:
         shot = capture_betamapola_confirmation(

@@ -190,6 +190,7 @@ def _send_ops_alert(
     chat_id,
     label: str = "Alert",
     photo_path: str | None = None,
+    photo_only: bool = False,
 ) -> bool:
     if not chat_id:
         logger.warning("Telegram screenshots chat not set — skipping leg alert")
@@ -197,15 +198,21 @@ def _send_ops_alert(
     logger.info(f"========== {label} ==========")
     logger.info(alert)
     logger.info(f"========== {label} ==========")
+    if photo_only and photo_path and os.path.isfile(photo_path):
+        asyncio.run(send_telegram_photo(photo_path, caption=None, chat_id=chat_id))
+        return True
     asyncio.run(send_telegram_alert(alert, chat_id))
     if photo_path and os.path.isfile(photo_path):
-        caption_lines = [
-            ln.strip()
-            for ln in alert.splitlines()
-            if ln.strip() and not ln.strip().startswith("=====")
-        ]
-        photo_caption = "\n".join(caption_lines[:4])[:1024] if caption_lines else None
-        asyncio.run(send_telegram_photo(photo_path, caption=photo_caption, chat_id=chat_id))
+        if photo_only:
+            asyncio.run(send_telegram_photo(photo_path, caption=None, chat_id=chat_id))
+        else:
+            caption_lines = [
+                ln.strip()
+                for ln in alert.splitlines()
+                if ln.strip() and not ln.strip().startswith("=====")
+            ]
+            photo_caption = "\n".join(caption_lines[:4])[:1024] if caption_lines else None
+            asyncio.run(send_telegram_photo(photo_path, caption=photo_caption, chat_id=chat_id))
     return True
 
 
@@ -215,6 +222,7 @@ def _dispatch_ops_alert(
     chat_id,
     label: str = "Alert",
     photo_path: str | None = None,
+    photo_only: bool = False,
 ) -> bool:
     if not chat_id:
         logger.warning("Telegram screenshots chat not set — skipping leg alert")
@@ -225,11 +233,11 @@ def _dispatch_ops_alert(
     if TELEGRAM_ALERTS_ASYNC:
         threading.Thread(
             target=_send_ops_alert,
-            args=(logger, alert, chat_id, label, photo_path),
+            args=(logger, alert, chat_id, label, photo_path, photo_only),
             daemon=True,
         ).start()
         return True
-    return _send_ops_alert(logger, alert, chat_id, label, photo_path)
+    return _send_ops_alert(logger, alert, chat_id, label, photo_path, photo_only)
 
 
 def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
@@ -589,6 +597,7 @@ def finalize_confirmed_bet(
             screenshots_chat,
             label="Leg Confirmed Alert",
             photo_path=screenshot_path,
+            photo_only=bool(screenshot_path),
         ):
             cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
     else:
