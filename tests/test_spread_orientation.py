@@ -174,8 +174,56 @@ def test_build_leg_confirmed_alert_leg_two_of_two():
     assert "Leg 2 of 2" in alert
     assert "Book: 3et" in alert
     assert "This bet: Nationals -133" in alert
-    assert "full arb summary follows" in alert
+    assert "summary will post to Real Bets shortly" in alert
     assert "Screenshot: attached below" in alert
+
+
+def test_format_arb_complete_alert_failed():
+    arb = {
+        "team_1": "Toronto Blue Jays",
+        "team_2": "Seattle Mariners",
+        "team_1_bookmaker": "paradisewager",
+        "team_2_bookmaker": "betwar",
+        "team_1_odds": 116,
+        "team_2_odds": 116,
+        "bet_type": "moneyline",
+        "profit_pct": 7.41,
+    }
+    alert = format_arb_complete_alert(
+        arb,
+        outcome="failed",
+        leg1_stake=None,
+        leg2_stake=(20.0, 23.20),
+        leg1_failure="line moved",
+    )
+    assert "ML · +7.41% ✗" in alert
+    assert "Jays +116 paradise · NOT PLACED (line moved)" in alert
+    assert "Mariners +116 betwar · $20.00→$23.20" in alert
+
+
+def test_format_spread_complete_user_example():
+    arb = {
+        "sport": "MLB",
+        "team_1": "San Diego Padres",
+        "team_2": "Los Angeles Dodgers",
+        "team_1_bookmaker": "betamapola",
+        "team_2_bookmaker": "4casters",
+        "team_1_odds": 108,
+        "team_2_odds": -112,
+        "bet_type": "spread",
+        "profit_pct": -0.91,
+        "spread_value": 1.5,
+        "spread_line_team_1": 1.5,
+        "spread_line_team_2": -1.5,
+    }
+    alert = format_arb_complete_alert(
+        arb,
+        leg1_stake=(20.0, 21.60),
+        leg2_stake=(22.40, 20.0),
+    )
+    assert alert.startswith("Spread — run_line (+1.5) · -0.91% ✓")
+    assert "Padres +1.5 +108 amapola · $20.00→$21.60" in alert
+    assert "Dodgers -1.5 -112 4casters · $22.40→$20.00" in alert
 
 
 def test_build_arb_complete_alert_includes_header():

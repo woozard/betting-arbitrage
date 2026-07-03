@@ -35,9 +35,10 @@ REDIS = {
 }
 
 # Telegram — channel routing:
-#   TELEGRAM_CHAT_HEALTH      → KC Arb Health Status (ops agent, scanner errors, system alerts)
-#   TELEGRAM_CHAT_REAL_BETS  → KC Arb Real Bets (confirmed legs, partial/complete arbs only)
-#   TELEGRAM_CHAT_ARBITRAGE   → arb opportunity alerts (/scan bot)
+#   TELEGRAM_CHAT_HEALTH       → KC Arb Health Status (ops agent, scanner errors, system alerts)
+#   TELEGRAM_CHAT_REAL_BETS    → KC Arb Real Bets (one compact summary per arb: complete or failed)
+#   TELEGRAM_CHAT_SCREENSHOTS  → KC Arb Screenshots (per-leg bet text + confirmation screenshots)
+#   TELEGRAM_CHAT_ARBITRAGE    → arb opportunity alerts (/scan bot)
 _TELEGRAM_HEALTH = os.getenv('TELEGRAM_CHAT_HEALTH')
 
 TELEGRAM = {
@@ -53,7 +54,12 @@ TELEGRAM = {
     ),
     'ops': os.getenv('TELEGRAM_CHAT_OPS') or _TELEGRAM_HEALTH,
     'real_bets': os.getenv('TELEGRAM_CHAT_REAL_BETS'),
+    'screenshots': os.getenv('TELEGRAM_CHAT_SCREENSHOTS'),
 }
+
+# Delay before posting the single Real Bets summary (seconds; allows both legs to land in Redis).
+REAL_BETS_SUMMARY_DELAY_SEC = float(os.getenv('REAL_BETS_SUMMARY_DELAY_SEC', '30'))
+REAL_BETS_FAILED_SUMMARY_DELAY_SEC = float(os.getenv('REAL_BETS_FAILED_SUMMARY_DELAY_SEC', '5'))
 
 
 def telegram_health_chat_id():

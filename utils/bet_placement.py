@@ -13,6 +13,11 @@ from utils.config import (
     required_first_leg_book,
 )
 from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS
+from utils.arb_real_bets_summary import (
+    record_confirmed_leg,
+    schedule_complete_summary,
+    schedule_failed_summary,
+)
 from utils.helpers import (
     send_telegram_alert,
     send_telegram_photo,
@@ -170,8 +175,13 @@ def _alerts_telegram_chat(telegram_config: dict):
 
 
 def _real_bets_telegram_chat(telegram_config: dict):
-    """Leg confirmed, partial arb, and arb complete (real money)."""
+    """Single compact summary per arb (complete or failed)."""
     return telegram_config.get("real_bets")
+
+
+def _screenshots_telegram_chat(telegram_config: dict):
+    """Per-leg bet confirmations and screenshots."""
+    return telegram_config.get("screenshots") or telegram_config.get("real_bets")
 
 
 def _send_ops_alert(
@@ -182,7 +192,7 @@ def _send_ops_alert(
     photo_path: str | None = None,
 ) -> bool:
     if not chat_id:
-        logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Telegram alert")
+        logger.warning("Telegram screenshots chat not set — skipping leg alert")
         return False
     logger.info(f"========== {label} ==========")
     logger.info(alert)
@@ -207,7 +217,7 @@ def _dispatch_ops_alert(
     photo_path: str | None = None,
 ) -> bool:
     if not chat_id:
-        logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Telegram alert")
+        logger.warning("Telegram screenshots chat not set — skipping leg alert")
         return False
     logger.info(f"========== {label} ==========")
     logger.info(alert)
@@ -327,7 +337,7 @@ def _build_leg_confirmed_alert(
     if other_leg_placed:
         leg_no = 2
         header = "===== Bet Placed (Real Money) — Leg 2 of 2 ====="
-        status = "Both legs confirmed — full arb summary follows in a separate message"
+        status = "Both legs confirmed — summary will post to Real Bets shortly"
     else:
         leg_no = 1
         header = "===== Bet Placed (Real Money) — Leg 1 of 2 ====="
@@ -437,10 +447,16 @@ def maybe_notify_partial_arb_exposure(
     if cache.is_leg_placed(failed_bookmaker, bet_type, failed_game_id):
         return
 
-    real_bets_chat = _real_bets_telegram_chat(telegram_config)
-    alert = _build_partial_arb_alert(arb, other_book, failed_bookmaker, stake, reason)
-    if _dispatch_ops_alert(logger, alert, real_bets_chat, label="Partial Arb Alert"):
-        cache.mark_partial_arb_alert_sent(pair_key)
+    reason_text = format_bet_failure_reason(reason, failed_book)
+    schedule_failed_summary(
+        cache,
+        logger,
+        arb,
+        telegram_config,
+        failed_bookmaker,
+        reason_text,
+    )
+    cache.mark_partial_arb_alert_sent(pair_key)
 
 
 def capture_bet_screenshot_for_alert(
@@ -550,6 +566,11 @@ def finalize_confirmed_bet(
         logger.warning("DB - Bet Not Saved")
 
     real_bets_chat = _real_bets_telegram_chat(telegram_config)
+    screenshots_chat = _screenshots_telegram_chat(telegram_config)
+
+    record_confirmed_leg(
+        cache, pair_key, arb, bookmaker, team_no, team_name, moneyline_odd, stake
+    )
 
     if not cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
         leg_alert = _build_leg_confirmed_alert(
@@ -565,7 +586,7 @@ def finalize_confirmed_bet(
         if _dispatch_ops_alert(
             logger,
             leg_alert,
-            real_bets_chat,
+            screenshots_chat,
             label="Leg Confirmed Alert",
             photo_path=screenshot_path,
         ):
@@ -579,12 +600,10 @@ def finalize_confirmed_bet(
     if other_leg_placed:
         if cache.arb_complete_alert_already_sent(pair_key):
             logger.info(
-                f"Skipping duplicate arb-complete Telegram alert | {team_1} vs {team_2}"
+                f"Skipping duplicate Real Bets summary schedule | {team_1} vs {team_2}"
             )
         else:
-            complete_alert = _build_arb_complete_alert(arb, stake)
-            if _dispatch_ops_alert(logger, complete_alert, real_bets_chat, label="Arb Complete Alert"):
-                cache.mark_arb_complete_alert_sent(pair_key)
+            schedule_complete_summary(cache, logger, arb, telegram_config)
         return
 
     if not SEQUENTIAL_ARB_BETTING:

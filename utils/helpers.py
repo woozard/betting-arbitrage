@@ -1109,16 +1109,31 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
     return "\n".join(header_lines + [leg1, "", leg2])
 
 
-def format_arb_complete_alert(arb, base_amount=None, spread_value=None) -> str:
+def format_arb_complete_alert(
+    arb,
+    base_amount=None,
+    spread_value=None,
+    *,
+    outcome: str = "complete",
+    leg1_stake: tuple[float, float] | None = None,
+    leg2_stake: tuple[float, float] | None = None,
+    leg1_failure: str | None = None,
+    leg2_failure: str | None = None,
+) -> str:
     """Compact confirmed-arb alert (same layout as opportunity alerts + per-leg stakes).
 
-    Example:
+    Example (complete):
         ML · +1.25% ✓
         Pittsburgh Pirates vs Washington Nationals
 
         Pirates +140 betwar · $20.00→$28.00
 
         Nationals -133 3et · $26.60→$20.00
+
+    Example (failed):
+        ML · +1.25% ✗
+        ...
+        Nationals -133 paradise · NOT PLACED
     """
     from utils.config import BET_STAKE
     from utils.stake_sizing import base_amount_stake_from_odds
@@ -1146,7 +1161,13 @@ def format_arb_complete_alert(arb, base_amount=None, spread_value=None) -> str:
     short_1 = team_1.split()[-1] if team_1 else "team_1"
     short_2 = team_2.split()[-1] if team_2 else "team_2"
 
-    def _stake_suffix(odds) -> str:
+    def _stake_suffix(odds, actual: tuple[float, float] | None = None, failure: str | None = None) -> str:
+        if failure:
+            short = failure if len(failure) <= 48 else failure[:45] + "..."
+            return f" · NOT PLACED ({short})"
+        if actual is not None:
+            risk, to_win = actual
+            return f" · ${risk:.2f}→${to_win:.2f}"
         plan = base_amount_stake_from_odds(odds, base)
         return f" · ${plan.risk:.2f}→${plan.to_win:.2f}"
 
@@ -1159,12 +1180,14 @@ def format_arb_complete_alert(arb, base_amount=None, spread_value=None) -> str:
         except (TypeError, ValueError):
             profit_suffix = ""
 
+    status_mark = "✓" if outcome == "complete" else "✗"
+
     header_lines = []
     if bet_type == "spread":
         market = spread_market_label(spread_value, sport)
-        header_lines.append(f"Spread — {market}{profit_suffix} ✓")
+        header_lines.append(f"Spread — {market}{profit_suffix} {status_mark}")
     else:
-        header_lines.append(f"ML{profit_suffix} ✓")
+        header_lines.append(f"ML{profit_suffix} {status_mark}")
 
     header_lines.append(f"{team_1} vs {team_2}")
     header_lines.append("")
@@ -1177,14 +1200,32 @@ def format_arb_complete_alert(arb, base_amount=None, spread_value=None) -> str:
         if line2 is None and line1 is not None:
             line2 = -line1
         if line1 is None or line2 is None:
-            leg1 = f"{short_1} {odds1} {book1}{_stake_suffix(_attr('team_1_odds'))}"
-            leg2 = f"{short_2} {odds2} {book2}{_stake_suffix(_attr('team_2_odds'))}"
+            leg1 = (
+                f"{short_1} {odds1} {book1}"
+                f"{_stake_suffix(_attr('team_1_odds'), leg1_stake, leg1_failure)}"
+            )
+            leg2 = (
+                f"{short_2} {odds2} {book2}"
+                f"{_stake_suffix(_attr('team_2_odds'), leg2_stake, leg2_failure)}"
+            )
         else:
-            leg1 = f"{short_1} {line1:+.1f} {odds1} {book1}{_stake_suffix(_attr('team_1_odds'))}"
-            leg2 = f"{short_2} {line2:+.1f} {odds2} {book2}{_stake_suffix(_attr('team_2_odds'))}"
+            leg1 = (
+                f"{short_1} {line1:+.1f} {odds1} {book1}"
+                f"{_stake_suffix(_attr('team_1_odds'), leg1_stake, leg1_failure)}"
+            )
+            leg2 = (
+                f"{short_2} {line2:+.1f} {odds2} {book2}"
+                f"{_stake_suffix(_attr('team_2_odds'), leg2_stake, leg2_failure)}"
+            )
     else:
-        leg1 = f"{short_1} {odds1} {book1}{_stake_suffix(_attr('team_1_odds'))}"
-        leg2 = f"{short_2} {odds2} {book2}{_stake_suffix(_attr('team_2_odds'))}"
+        leg1 = (
+            f"{short_1} {odds1} {book1}"
+            f"{_stake_suffix(_attr('team_1_odds'), leg1_stake, leg1_failure)}"
+        )
+        leg2 = (
+            f"{short_2} {odds2} {book2}"
+            f"{_stake_suffix(_attr('team_2_odds'), leg2_stake, leg2_failure)}"
+        )
 
     return "\n".join(header_lines + [leg1, "", leg2])
 
