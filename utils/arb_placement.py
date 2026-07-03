@@ -1,6 +1,6 @@
 """Shared helpers for arb betting loops (moneyline + spread)."""
 
-from utils.config import spread_real_money_betting_enabled
+from utils.config import SPREAD_REAL_MONEY_BETTING_ENABLED
 
 SPREAD_BETTING_UNSUPPORTED_BOOKS = frozenset({"paradisewager"})
 
@@ -8,7 +8,7 @@ SPREAD_BETTING_UNSUPPORTED_BOOKS = frozenset({"paradisewager"})
 def get_arbitrage_for_placement(cache, bookmaker: str) -> list:
     """Return cached arbs this book should attempt to place (ML always; spread when enabled)."""
     bet_types = ["moneyline"]
-    if spread_real_money_betting_enabled():
+    if SPREAD_REAL_MONEY_BETTING_ENABLED:
         bet_types.append("spread")
 
     results = []
