@@ -506,19 +506,55 @@ class BetamapolaController:
         except Exception:
             return ""
 
+    def _betslip_stake_inputs_visible(self) -> bool:
+        from utils.stake_entry import (
+            DEFAULT_RISK_SELECTORS,
+            DEFAULT_WIN_SELECTORS,
+            _find_stake_input,
+        )
+
+        scope = "#betSlipDiv"
+        return bool(
+            _find_stake_input(self.driver, DEFAULT_RISK_SELECTORS, scope)
+            or _find_stake_input(self.driver, DEFAULT_WIN_SELECTORS, scope)
+        )
+
     def _betslip_has_team(self, team_name: str) -> bool:
         slip = self._betslip_text().lower()
         if not slip or "bet slip is empty" in slip:
             return False
-        return team_name.lower() in slip
+        if team_name.lower() in slip:
+            return True
+        last_word = team_name.strip().split()[-1].lower() if team_name.strip() else ""
+        return bool(last_word and last_word in slip)
 
     def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._betslip_has_team(team_name):
+            if self._betslip_has_team(team_name) and self._betslip_stake_inputs_visible():
                 return True
             time.sleep(0.4)
         return False
+
+    def _invoke_add_line_to_bet_slip(self, elem) -> bool:
+        try:
+            return bool(self.driver.execute_script("""
+                var el = arguments[0];
+                if (!el) return false;
+                if (typeof addLineToBetSlip === 'function') {
+                    addLineToBetSlip(el);
+                    return true;
+                }
+                if (typeof el.onclick === 'function') {
+                    el.onclick.call(el);
+                    return true;
+                }
+                el.click();
+                return true;
+            """, elem))
+        except Exception as e:
+            self.logger.warning(f"addLineToBetSlip failed: {e}")
+            return False
 
     def _add_moneyline_to_slip(
         self, game_line: dict, team_no: int, team_name: str,
@@ -631,6 +667,14 @@ class BetamapolaController:
                     txt = (candidates[0].text or candidates[0].get_attribute("innerText") or "").strip()
                     if self._odds_text_matches(txt, wager_odds):
                         return candidates[0]
+                    if spread_line is not None:
+                        spread_txt = re.search(r"([+-]?\d+(?:\.\d+)?)", txt)
+                        if spread_txt and spread_values_match(spread_txt.group(1), spread_line):
+                            self.logger.info(
+                                f"Using spread button {candidates[0].get_attribute('id')} "
+                                f"with live odds {txt} (arb {wager_odds})"
+                            )
+                            return candidates[0]
 
         if game_num is not None:
             for prefix in ("S1_", "S2_"):
@@ -680,6 +724,9 @@ class BetamapolaController:
             self.logger.info(f"Spread element located: {spread_elem.get_attribute('id')}")
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", spread_elem)
             time.sleep(0.4)
+            if self._invoke_add_line_to_bet_slip(spread_elem):
+                if self._wait_for_betslip_team(team_name, timeout=5):
+                    return True
             self.driver.execute_script("arguments[0].click();", spread_elem)
             self.logger.info("Spread element clicked")
             if self._wait_for_betslip_team(team_name, timeout=4):

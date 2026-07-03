@@ -9,6 +9,10 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from utils.stake_sizing import BaseAmountStake
 
 DEFAULT_RISK_SELECTORS: tuple[str, ...] = (
+    "#betSlipDiv input.txtRiskAmount",
+    "#betSlipDiv input.txtWinAmount",
+    "#betSlipDiv input[id^='risk_']",
+    "#betSlipDiv input[id^='win_']",
     "input[id^='risk_']",
     "input[name*='risk']",
     "input[ng-model*='risk']",

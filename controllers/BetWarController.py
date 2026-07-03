@@ -1339,6 +1339,20 @@ class BetWarController:
                 continue
         return ""
 
+    def _betslip_stake_inputs_visible(self) -> bool:
+        from utils.stake_entry import (
+            DEFAULT_RISK_SELECTORS,
+            DEFAULT_WIN_SELECTORS,
+            _find_stake_input,
+        )
+
+        for scope in ("#divBetSlip", "#pills-betslip", "#div-betSlip"):
+            if _find_stake_input(self.driver, DEFAULT_RISK_SELECTORS, scope):
+                return True
+            if _find_stake_input(self.driver, DEFAULT_WIN_SELECTORS, scope):
+                return True
+        return False
+
     def _betslip_has_team(self, team_name: str) -> bool:
         slip = self._betslip_text()
         slip_l = slip.lower()
@@ -1354,7 +1368,7 @@ class BetWarController:
     def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._betslip_has_team(team_name):
+            if self._betslip_has_team(team_name) and self._betslip_stake_inputs_visible():
                 return True
             time.sleep(0.4)
         return False
@@ -1859,6 +1873,12 @@ class BetWarController:
                             continue
                     if odds and self._odds_text_matches(odds, wager_odds):
                         return ps_elem
+                    if spread_line is not None and spread is not None:
+                        if spread_values_match(spread, spread_line):
+                            self.logger.info(
+                                f"Using spread line {spread} @ {odds} (arb odds {wager_odds})"
+                            )
+                            return ps_elem
 
         game_num = (game_line or {}).get("GameNum")
         if game_num is not None and team_no in (1, 2):
@@ -1871,6 +1891,13 @@ class BetWarController:
                     txt = (candidates[0].text or candidates[0].get_attribute("innerText") or "").strip()
                     if self._odds_text_matches(txt, wager_odds):
                         return candidates[0]
+                    if spread_line is not None:
+                        spread, odds = self._parse_betwar_ps_line_text(txt)
+                        if spread is not None and spread_values_match(spread, spread_line):
+                            self.logger.info(
+                                f"Using spread button {selector} live {txt} (arb {wager_odds})"
+                            )
+                            return candidates[0]
         return None
 
     def _add_spread_to_slip(
@@ -1907,6 +1934,7 @@ class BetWarController:
         if click_line_via_angular(self.driver, game_line, team_no, "S"):
             if self._wait_for_betslip_team(team_name, timeout=6):
                 return True
+            self.logger.warning("Angular GameLineAction (spread) did not populate bet slip")
 
         btn = self._wait_for_spread_button(game_num, team_no, timeout=3)
         if btn:
