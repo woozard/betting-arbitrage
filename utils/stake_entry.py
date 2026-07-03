@@ -33,6 +33,12 @@ DEFAULT_WIN_SELECTORS: tuple[str, ...] = (
     "input[name='win']",
     "input[name='towin']",
     "input.towin",
+    "#betSlipDiv input[type='text']",
+    "#betSlipDiv input[type='number']",
+    "input[placeholder*='Risk']",
+    "input[placeholder*='risk']",
+    "input[placeholder*='Win']",
+    "input[placeholder*='win']",
 )
 
 

@@ -506,6 +506,15 @@ class BetamapolaController:
         except Exception:
             return ""
 
+    def _betslip_has_spread_pick(self, team_name: str) -> bool:
+        slip = self._betslip_text().lower()
+        if "spread" not in slip:
+            return False
+        if team_name.lower() in slip:
+            return True
+        last_word = team_name.strip().split()[-1].lower() if team_name.strip() else ""
+        return bool(last_word and last_word in slip)
+
     def _betslip_stake_inputs_visible(self) -> bool:
         from utils.stake_entry import (
             DEFAULT_RISK_SELECTORS,
@@ -531,6 +540,8 @@ class BetamapolaController:
     def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._betslip_has_spread_pick(team_name):
+                return True
             if self._betslip_has_team(team_name) and self._betslip_stake_inputs_visible():
                 return True
             time.sleep(0.4)
@@ -1972,11 +1983,15 @@ class BetamapolaController:
             self.logger.info("Bet slip appeared")
 
             if not add_to_slip():
-                slip_preview = self._betslip_text()[:200]
-                raise Exception(
-                    f"Bet slip still empty after click attempts for {team_name} "
-                    f"(GameNum={game_num}): {slip_preview or missing_line_msg}"
-                )
+                time.sleep(1.0)
+                if bet_type == "spread" and self._betslip_has_spread_pick(team_name):
+                    self.logger.info("Spread pick present in bet slip after delayed render")
+                else:
+                    slip_preview = self._betslip_text()[:200]
+                    raise Exception(
+                        f"Bet slip still empty after click attempts for {team_name} "
+                        f"(GameNum={game_num}): {slip_preview or missing_line_msg}"
+                    )
 
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
