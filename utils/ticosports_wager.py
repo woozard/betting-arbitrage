@@ -1,5 +1,77 @@
 """TicoSports-family wager helpers (Betamapola, BetWar)."""
 
+import json
+
+
+def wager_network_entry_confirms(entry: dict) -> bool:
+    """True when a hooked network response indicates a ticket was posted (not GetWagerPicks poll)."""
+    url = (entry.get("url") or "").lower()
+    body_l = (entry.get("body") or "").lower()
+    if not url or not body_l:
+        return False
+    if any(
+        skip in url
+        for skip in (
+            "getwagerpicks",
+            "getsportoffering",
+            "getlines",
+            "getcustomer",
+            "wagertypes.json",
+        )
+    ):
+        return False
+    if not any(
+        token in url
+        for token in ("processticket", "postticket", "saveticket", "placewager", "submit")
+    ):
+        return False
+    if any(m in body_l for m in ("rejected", "declined", "error", "not accepted")):
+        return False
+    return any(
+        m in body_l
+        for m in (
+            "ticketnumber",
+            "confirmationnumber",
+            "wagernumber",
+            "reference",
+            "accepted",
+            "confirmed",
+        )
+    )
+
+
+def pick_looks_like_open_wager(pick) -> bool:
+    if not isinstance(pick, dict):
+        return False
+    for key in (
+        "Team1ID", "Team2ID", "TeamName", "Description", "LineDescription",
+        "team1id", "team2id", "description", "Selection", "selection",
+    ):
+        if pick.get(key):
+            return True
+    text = json.dumps(pick).lower()
+    if "team" in text and any(m in text for m in ("amount", "risk", "towin", "odds")):
+        return True
+    return False
+
+
+def betslip_text_confirms_wager(slip: str) -> bool:
+    import re
+
+    slip_l = (slip or "").lower()
+    if any(
+        marker in slip_l
+        for marker in (
+            "wager(s) confirmed",
+            "wagers confirmed",
+            "your selections are now active",
+            "ticket accepted",
+            "wager accepted",
+        )
+    ):
+        return True
+    return bool(re.search(r"reference\s*id\s*#?\s*\d+", slip_l, re.I))
+
 
 def click_line_via_angular(driver, game_line: dict, team_no: int, line_type: str) -> bool:
     """Add a pick via Angular GameLineAction — line_type 'M' (ML) or 'S' (spread)."""

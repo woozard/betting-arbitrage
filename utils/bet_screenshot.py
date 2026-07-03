@@ -70,7 +70,122 @@ def capture_betwar_my_bets(driver, path: str, logger) -> str | None:
 
 
 def capture_betamapola_betslip(driver, path: str, logger) -> str | None:
-    return capture_element_screenshot(driver, ["#betSlipDiv"], path, logger)
+    """Capture Betamapola post-acceptance UI (not the pre-submit Place Bet slip)."""
+    return capture_betamapola_confirmation(driver, path, logger)
+
+
+def capture_betamapola_confirmation(
+    driver,
+    path: str,
+    logger,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+) -> str | None:
+    import time
+
+    from selenium.webdriver.common.by import By
+
+    from utils.ticosports_wager import betslip_text_confirms_wager
+
+    def _slip_text() -> str:
+        try:
+            return (driver.find_element(By.ID, "betSlipDiv").text or "").strip()
+        except Exception:
+            return ""
+
+    def _slip_confirmed(text: str) -> bool:
+        return betslip_text_confirms_wager(text)
+
+    def _place_bet_visible() -> bool:
+        try:
+            for btn in driver.find_elements(By.CSS_SELECTOR, "#betSlipDiv button, #betSlipDiv a"):
+                label = (btn.text or "").strip().lower()
+                if "place bet" in label and btn.is_displayed():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        try:
+            alert = driver.find_element(By.CSS_SELECTOR, "#alertSuccess")
+            if alert.is_displayed():
+                png = alert.screenshot_as_png
+                if png:
+                    return _write_png(path, png, logger)
+        except Exception:
+            pass
+
+        slip = _slip_text()
+        if _slip_confirmed(slip) and not _place_bet_visible():
+            shot = capture_element_screenshot(
+                driver,
+                ["#alertSuccess", "#betSlipDiv .alert-success", "#betSlipDiv"],
+                path,
+                logger,
+            )
+            if shot:
+                return shot
+
+        time.sleep(0.4)
+
+    if _place_bet_visible() and not _slip_confirmed(_slip_text()):
+        logger.warning(
+            "Betamapola bet slip still shows Place Bet — skipping pre-confirmation screenshot"
+        )
+        return None
+
+    base_url = (driver.current_url or "").split("#")[0].rstrip("/")
+    if not base_url:
+        base_url = "https://betamapola.com/sports"
+    open_bets_url = f"{base_url}#/openBets"
+    sport_url = driver.current_url
+
+    try:
+        driver.get(open_bets_url)
+        time.sleep(2.5)
+        element = driver.execute_script(
+            """
+            const needles = [arguments[0], arguments[1], arguments[2]]
+              .filter(Boolean)
+              .map(s => String(s).toLowerCase());
+            const selectors = [
+              '.open-bets', '.openBets', '.wager-item', '.bet-item',
+              'table tbody tr', '.card', '[ng-repeat*="wager"]', '[ng-repeat*="pick"]',
+              'main', '#content', '.content-wrapper'
+            ];
+            for (const sel of selectors) {
+              for (const el of document.querySelectorAll(sel)) {
+                const t = (el.innerText || '').trim();
+                if (t.length < 20) continue;
+                const tl = t.toLowerCase();
+                if (needles.some(n => n && tl.includes(n))) return el;
+              }
+            }
+            return document.querySelector('.open-bets, .openBets, main, #content')
+                || document.body;
+            """,
+            team_name,
+            team_1,
+            team_2,
+        )
+        if element:
+            png = element.screenshot_as_png
+            if png:
+                return _write_png(path, png, logger)
+    except Exception as exc:
+        logger.warning(f"Betamapola open-bets screenshot failed: {exc}")
+    finally:
+        if sport_url:
+            try:
+                driver.get(sport_url)
+                time.sleep(1.0)
+            except Exception:
+                pass
+
+    return None
 
 
 def capture_s411_open_bet(
@@ -331,7 +446,14 @@ def capture_confirmed_bet_screenshot(
             return shot
 
     if bm == "betamapola" and driver is not None:
-        shot = capture_betamapola_betslip(driver, path, logger)
+        shot = capture_betamapola_confirmation(
+            driver,
+            path,
+            logger,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+        )
         if shot:
             return shot
 

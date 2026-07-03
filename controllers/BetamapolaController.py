@@ -19,7 +19,7 @@ from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines, spread_values_match
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
-from utils.ticosports_wager import click_line_via_angular
+from utils.ticosports_wager import click_line_via_angular, wager_network_entry_confirms, pick_looks_like_open_wager, betslip_text_confirms_wager
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -1544,14 +1544,7 @@ class BetamapolaController:
 
     @staticmethod
     def _pick_looks_like_open_wager(pick) -> bool:
-        if not isinstance(pick, dict):
-            return False
-        text = json.dumps(pick).lower()
-        wager_markers = (
-            "amount", "risk", "towin", "wageramount", "wageramt", "pickamount",
-            "ticketnumber", "wagernumber", "confirmation", "pickid", "wagerstatus",
-        )
-        return any(marker in text for marker in wager_markers)
+        return pick_looks_like_open_wager(pick)
 
     def _pick_matches_open_wager(self, pick, team_name: str, team_1: str, team_2: str) -> bool:
         if not self._pick_looks_like_open_wager(pick):
@@ -1770,11 +1763,30 @@ class BetamapolaController:
             self.logger.info("Accepted line changes / odds update prompts")
         return accepted
 
+    def _betslip_shows_wager_confirmed(self) -> bool:
+        return betslip_text_confirms_wager(self._betslip_text())
+
+    def _betslip_awaiting_place_bet(self) -> bool:
+        try:
+            for btn in self.driver.find_elements(
+                By.CSS_SELECTOR, "#betSlipDiv button, #betSlipDiv a"
+            ):
+                if "place bet" in (btn.text or "").lower() and btn.is_displayed():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _wager_network_entry_confirms(entry: dict) -> bool:
+        return wager_network_entry_confirms(entry)
+
     def _confirm_bet_accepted(self, team_name: str, team_1: str, team_2: str, stake: float, timeout: int = 25):
         deadline = time.time() + timeout
         success_markers = (
             "wager accepted", "bet accepted", "ticket accepted",
             "successfully placed", "your wager has been accepted",
+            "wager(s) confirmed", "wagers confirmed",
         )
 
         while time.time() < deadline:
@@ -1785,20 +1797,23 @@ class BetamapolaController:
                 self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
                 return False, reject_msg
 
+            if self._betslip_shows_wager_confirmed():
+                return True, "Bet slip shows wager confirmed"
+
             page_l = (self.driver.page_source or "").lower()
             for marker in success_markers:
                 if marker in page_l:
                     return True, marker
 
             for entry in self._get_wager_network_log():
-                body_l = (entry.get("body") or "").lower()
-                url = entry.get("url") or ""
-                if any(m in body_l for m in ("rejected", "declined", "error", "another user")):
-                    self.logger.error(f"Wager API rejection ({url}): {entry.get('body', '')[:500]}")
-                    return False, f"Wager API rejected: {url}"
-                if any(m in body_l for m in ("accepted", "confirmed", "success", "ticket")):
-                    self.logger.info(f"Wager API success ({url}): {entry.get('body', '')[:300]}")
-                    return True, "Wager API confirmed"
+                if self._wager_network_entry_confirms(entry):
+                    self.logger.info(
+                        f"Wager API success ({entry.get('url')}): "
+                        f"{(entry.get('body') or '')[:300]}"
+                    )
+                    if self._betslip_awaiting_place_bet() and not self._betslip_shows_wager_confirmed():
+                        continue
+                    return True, "Wager post API confirmed"
 
             for pick in self._fetch_open_wagers_via_api():
                 if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
@@ -1810,11 +1825,15 @@ class BetamapolaController:
             f"Bet not confirmed within {timeout}s; final GetWagerPicks retries"
         )
         for attempt in range(1, 4):
+            if self._betslip_shows_wager_confirmed():
+                return True, "Bet slip shows wager confirmed (retry)"
             for pick in self._fetch_open_wagers_via_api():
                 if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
                     return True, "Open wager found via GetWagerPicks (retry)"
             if attempt < 3:
                 time.sleep(5)
+        if self._betslip_awaiting_place_bet():
+            return False, "Place Bet still visible — wager not submitted"
         return False, "Bet not confirmed by bookmaker"
 
     # --------------------------------------------------------
