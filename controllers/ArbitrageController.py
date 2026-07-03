@@ -37,6 +37,7 @@ from utils.helpers import (
     align_cross_book_spreads,
     spread_market_label,
     format_arb_opportunity_alert,
+    spread_lines_from_row,
 )
 from utils.timing import time_it
 from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
@@ -510,9 +511,13 @@ class ArbitrageController:
         if bet_type == "spread":
             default_t1_odds = t1.get("spread_team_1")
             default_t2_odds = t2.get("spread_team_2")
+            spread_line_team_1, _ = spread_lines_from_row(t1)
+            _, spread_line_team_2 = spread_lines_from_row(t2)
         else:
             default_t1_odds = t1.get("moneyline_team_1")
             default_t2_odds = t2.get("moneyline_team_2")
+            spread_line_team_1 = None
+            spread_line_team_2 = None
 
         return {
             "sport": o1["sport"],
@@ -536,6 +541,8 @@ class ArbitrageController:
 
             "bet_type": bet_type,
             "spread_value": spread_value,
+            "spread_line_team_1": spread_line_team_1,
+            "spread_line_team_2": spread_line_team_2,
             "arb_total_prob": float(arb_total),
             "profit_pct": float(round((Decimal(1) - arb_total) * 100, 2)),
             "read": False,
@@ -674,7 +681,12 @@ class ArbitrageController:
                     f"{arb.team_1_bookmaker} vs {arb.team_2_bookmaker}"
                 )
             else:
-                self.__send_alert(arb, arb_data.get("identified_at"), spread_value=spread_value)
+                self.__send_alert(
+                    arb,
+                    arb_data.get("identified_at"),
+                    spread_value=spread_value,
+                    arb_data=arb_data,
+                )
                 self.cache.mark_arb_opportunity_alert_sent(
                     arb.team_1,
                     arb.team_2,
@@ -729,11 +741,14 @@ class ArbitrageController:
     # --------------------------------------------------------
     # Send Alert
     # --------------------------------------------------------
-    def __send_alert(self, arb, identified_at=None, spread_value=None):
+    def __send_alert(self, arb, identified_at=None, spread_value=None, arb_data=None):
         try:
             self.logger.info("========== Arbitrage - Send Alerts (START) ==========")
 
-            alert = format_arb_opportunity_alert(arb, spread_value=spread_value)
+            alert = format_arb_opportunity_alert(
+                arb_data if arb_data else arb,
+                spread_value=spread_value,
+            )
 
             self.logger.info(f"========== Alert ==========")
             self.logger.info(alert)

@@ -22,7 +22,6 @@ from utils.config import TELEGRAM, is_active_arb_pair, THREEET_MLB_COMPETITION_I
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.helpers import (
     decimal_to_american,
-    fix_spread_odds_orientation,
     is_game_pregame,
     parse_to_mysql_datetime,
     send_monitoring_alert,
@@ -265,6 +264,7 @@ class ThreeEtController:
         ml_team_1 = ml_team_2 = None
         ml_id_1 = ml_id_2 = None
         spread_val = None
+        spread_2_val = None
         spread_1_odds = spread_2_odds = None
         spread_id_1 = spread_id_2 = None
 
@@ -317,6 +317,7 @@ class ThreeEtController:
                                 spread_1_odds = american
                                 spread_id_1 = rid
                             elif self._team_name_matches(name, team_2):
+                                spread_2_val = handicap
                                 spread_2_odds = american
                                 spread_id_2 = rid
 
@@ -337,11 +338,13 @@ class ThreeEtController:
                 spread_val = float(spread_val)
             except (TypeError, ValueError):
                 spread_val = None
-
-        if spread_val is not None and spread_1_odds is not None and spread_2_odds is not None:
-            spread_1_odds, spread_2_odds = fix_spread_odds_orientation(
-                spread_val, spread_1_odds, spread_2_odds
-            )
+        if spread_2_val is not None:
+            try:
+                spread_2_val = float(spread_2_val)
+            except (TypeError, ValueError):
+                spread_2_val = None
+        elif spread_val is not None:
+            spread_2_val = -spread_val
 
         return {
             "bookmaker": self.bookmaker,
@@ -355,7 +358,7 @@ class ThreeEtController:
             "moneyline": {"team_1": ml_team_1, "team_2": ml_team_2},
             "spread": {
                 "team_1_spread": spread_val,
-                "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                "team_2_spread": spread_2_val,
                 "team_1_odds": spread_1_odds,
                 "team_2_odds": spread_2_odds,
             },

@@ -17,7 +17,7 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -805,6 +805,7 @@ class BetamapolaController:
             spread_val = gl.get("Spread")
             spread_a1 = gl.get("SpreadAdj1")
             spread_a2 = gl.get("SpreadAdj2")
+            team_1_spread, team_2_spread = resolve_ticosports_spread_lines(spread_val, ml1, ml2)
 
             total_val = gl.get("TotalPoints")
             ttl_a1 = gl.get("TtlPtsAdj1")
@@ -838,8 +839,8 @@ class BetamapolaController:
                     "team_2": str(ml2) if ml2 is not None else None
                 },
                 "spread": {
-                    "team_1_spread": spread_val,
-                    "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                    "team_1_spread": team_1_spread,
+                    "team_2_spread": team_2_spread,
                     "team_1_odds": spread_a1,
                     "team_2_odds": spread_a2
                 },

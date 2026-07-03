@@ -22,7 +22,6 @@ from utils.config import TELEGRAM, is_active_arb_pair, FOURCASTERS_MLB_LEAGUE
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.fourcasters_client import FourCastersApiError, FourCastersClient
 from utils.helpers import (
-    fix_spread_odds_orientation,
     is_game_pregame,
     parse_to_mysql_datetime,
     send_monitoring_alert,
@@ -113,7 +112,7 @@ class FourCastersController:
 
     @classmethod
     def _pick_run_line(cls, away_spreads: list, home_spreads: list, away_id: str, home_id: str):
-        """Prefer standard ±1.5 run line; return (team_1_spread, t1_odds, t2_odds)."""
+        """Prefer standard ±1.5 run line; return (away_sp, home_sp, t1_odds, t2_odds)."""
         away_candidates = []
         for order in away_spreads or []:
             if order.get("participantID") != away_id:
@@ -137,8 +136,8 @@ class FourCastersController:
                 if abs(home_sp - target_home) < 0.05 or abs(home_sp + away_sp) < 0.05:
                     t1_odds = cls._format_american_str(away_order.get("odds"))
                     t2_odds = cls._format_american_str(order.get("odds"))
-                    return away_sp, t1_odds, t2_odds
-        return None, None, None
+                    return away_sp, home_sp, t1_odds, t2_odds
+        return None, None, None, None
 
     def _parse_game_row(self, game: dict) -> dict | None:
         if game.get("live") or game.get("ended"):
@@ -162,16 +161,12 @@ class FourCastersController:
         if ml_away is None or ml_home is None:
             return None
 
-        spread_val, spread_1_odds, spread_2_odds = self._pick_run_line(
+        spread_val, spread_2_val, spread_1_odds, spread_2_odds = self._pick_run_line(
             game.get("awaySpreads") or [],
             game.get("homeSpreads") or [],
             away_id,
             home_id,
         )
-        if spread_val is not None and spread_1_odds and spread_2_odds:
-            spread_1_odds, spread_2_odds = fix_spread_odds_orientation(
-                spread_val, spread_1_odds, spread_2_odds
-            )
 
         start = game.get("start") or ""
         game_dt = parse_to_mysql_datetime(
@@ -197,7 +192,7 @@ class FourCastersController:
             },
             "spread": {
                 "team_1_spread": spread_val,
-                "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                "team_2_spread": spread_2_val,
                 "team_1_odds": spread_1_odds,
                 "team_2_odds": spread_2_odds,
             },

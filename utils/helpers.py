@@ -832,8 +832,30 @@ def is_plausible_moneyline_pair(ml_1, ml_2) -> bool:
     return (a > 0 and b < 0) or (a < 0 and b > 0)
 
 
-def is_plausible_spread_pair(spread_value, spread_team_1, spread_team_2) -> bool:
-    if normalize_spread_value(spread_value) is None:
+def spread_lines_from_row(row: dict) -> tuple[float | None, float | None]:
+    """Return (team_1 spread line, team_2 spread line) from a spread odds row."""
+    line_1 = normalize_spread_value(row.get("spread_value"))
+    if line_1 is None:
+        return None, None
+    line_2 = normalize_spread_value(row.get("spread_line_team_2"))
+    if line_2 is None:
+        line_2 = -line_1
+    return line_1, line_2
+
+
+def is_plausible_spread_pair(
+    spread_value,
+    spread_team_1,
+    spread_team_2,
+    *,
+    team_2_spread=None,
+) -> bool:
+    """Validate spread juice; do not infer orientation from juice sign (MLB RL uses + on fav)."""
+    line_1 = normalize_spread_value(spread_value)
+    if line_1 is None:
+        return False
+    line_2 = normalize_spread_value(team_2_spread)
+    if line_2 is not None and not spread_values_match(line_1, -line_2):
         return False
     try:
         a = float(spread_team_1)
@@ -842,35 +864,58 @@ def is_plausible_spread_pair(spread_value, spread_team_1, spread_team_2) -> bool
         return False
     if a == 0.0 or b == 0.0:
         return False
-    if not ((a > 0 and b < 0) or (a < 0 and b > 0)):
-        return False
-    return spread_odds_match_line_side(spread_value, spread_team_1, spread_team_2)
+    return True
 
 
 def spread_odds_match_line_side(spread_value, spread_team_1, spread_team_2) -> bool:
-    """Favorite (negative line on team_1) should have negative juice; dog positive."""
-    sv = normalize_spread_value(spread_value)
-    if sv is None:
-        return False
-    try:
-        t1 = float(spread_team_1)
-        t2 = float(spread_team_2)
-    except (TypeError, ValueError):
-        return False
-    if sv < 0:
-        return t1 < 0 and t2 > 0
-    if sv > 0:
-        return t1 > 0 and t2 < 0
-    return False
+    """Legacy helper — kept for callers; juice sign does not determine spread side."""
+    return is_plausible_spread_pair(spread_value, spread_team_1, spread_team_2)
 
 
 def fix_spread_odds_orientation(spread_value, spread_team_1, spread_team_2):
-    """Swap spread odds when they contradict spread_value / favorite side."""
-    if spread_odds_match_line_side(spread_value, spread_team_1, spread_team_2):
+    """Keep odds paired with their team; never swap based on juice sign."""
+    if is_plausible_spread_pair(spread_value, spread_team_1, spread_team_2):
         return spread_team_1, spread_team_2
-    if spread_odds_match_line_side(spread_value, spread_team_2, spread_team_1):
-        return spread_team_2, spread_team_1
     return spread_team_1, spread_team_2
+
+
+def resolve_ticosports_spread_lines(spread, ml1, ml2):
+    """
+    Map GetSportOffering Spread + SpreadAdj1/2 to each team's run line.
+
+    Spread is team_1's line when its sign matches the moneyline favorite side;
+    otherwise flip so team_1/team_2 lines are opposite and match the board.
+    """
+    try:
+        raw = float(spread)
+        m1 = float(ml1)
+        m2 = float(ml2)
+    except (TypeError, ValueError):
+        return None, None
+    if abs(raw) < 0.01:
+        return None, None
+
+    mag = abs(raw)
+    if m1 < m2:
+        expected_t1 = -mag
+    elif m2 < m1:
+        expected_t1 = mag
+    else:
+        expected_t1 = raw
+
+    if raw > 0:
+        api_t1 = mag
+    elif raw < 0:
+        api_t1 = -mag
+    else:
+        api_t1 = raw
+
+    if (api_t1 > 0) == (expected_t1 > 0):
+        team_1_spread = api_t1
+    else:
+        team_1_spread = expected_t1
+    team_2_spread = -team_1_spread
+    return team_1_spread, team_2_spread
 
 
 def spread_odds_rows_fresh_for_arb(
@@ -982,14 +1027,19 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
     header_lines.append(f"{team_1} vs {team_2}")
     header_lines.append("")
 
-    if bet_type == "spread" and spread_value is not None:
-        line1 = normalize_spread_value(spread_value)
+    if bet_type == "spread":
+        line1 = normalize_spread_value(_attr("spread_line_team_1"))
+        line2 = normalize_spread_value(_attr("spread_line_team_2"))
         if line1 is None:
+            line1 = normalize_spread_value(spread_value)
+        if line2 is None and line1 is not None:
+            line2 = -line1
+        if line1 is None or line2 is None:
             leg1 = f"{short_1} {odds1} {book1}"
             leg2 = f"{short_2} {odds2} {book2}"
         else:
             leg1 = f"{short_1} {line1:+.1f} {odds1} {book1}"
-            leg2 = f"{short_2} {(-line1):+.1f} {odds2} {book2}"
+            leg2 = f"{short_2} {line2:+.1f} {odds2} {book2}"
     else:
         leg1 = f"{short_1} {odds1} {book1}"
         leg2 = f"{short_2} {odds2} {book2}"
@@ -1020,11 +1070,16 @@ def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None
 
 
 def sanitize_spread_odds(spread: dict) -> dict | None:
-    """Normalize spread juice orientation and reject impossible favorite/dog pairs."""
+    """Validate spread lines + juice; keep each team's odds on the correct side."""
     if not spread:
         return None
-    sv = normalize_spread_value(spread.get("team_1_spread"))
-    if sv is None:
+    line_1 = normalize_spread_value(spread.get("team_1_spread"))
+    line_2 = normalize_spread_value(spread.get("team_2_spread"))
+    if line_1 is None:
+        return None
+    if line_2 is None:
+        line_2 = -line_1
+    elif not spread_values_match(line_1, -line_2):
         return None
     try:
         s1_raw = spread.get("team_1_odds")
@@ -1036,16 +1091,12 @@ def sanitize_spread_odds(spread: dict) -> dict | None:
     except (TypeError, ValueError):
         return None
 
-    s1, s2 = fix_spread_odds_orientation(sv, s1, s2)
-    if not is_plausible_spread_pair(sv, s1, s2):
+    if not is_plausible_spread_pair(line_1, s1, s2, team_2_spread=line_2):
         return None
 
-    team_2_spread = spread.get("team_2_spread")
-    if normalize_spread_value(team_2_spread) is None:
-        team_2_spread = -sv
     return {
-        "team_1_spread": sv,
-        "team_2_spread": normalize_spread_value(team_2_spread),
+        "team_1_spread": line_1,
+        "team_2_spread": line_2,
         "team_1_odds": s1,
         "team_2_odds": s2,
     }
@@ -1068,16 +1119,7 @@ def build_spread_odd_row(base: dict, spread: dict) -> dict | None:
         "over_odds": None,
         "under_odds": None,
     }
-    """Reject obvious scrape glitches for 2-way American moneylines."""
-    try:
-        a = float(ml_1)
-        b = float(ml_2)
-    except (TypeError, ValueError):
-        return False
-    if a == 0.0 or b == 0.0:
-        return False
-    # One side must be the underdog (+) and the other the favorite (-).
-    return (a > 0 and b < 0) or (a < 0 and b > 0)
+
 
 def parse_odds(payload: dict) -> list[dict]:
     rows = []
