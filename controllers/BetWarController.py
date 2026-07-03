@@ -4944,11 +4944,11 @@ class BetWarController:
                         self.logger,
                         arb,
                         self.bookmaker,
+                        team_no,
                         team_name,
                         game_id,
                         stake_plan,
                         wager_odds,
-                        bet_type,
                         TELEGRAM,
                         screenshot_path=screenshot_path,
                     )
