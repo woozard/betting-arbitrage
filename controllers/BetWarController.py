@@ -775,6 +775,12 @@ class BetWarController:
         parts = (linekey or "").split("-")
         return len(parts) >= 5 and parts[1] == "1" and parts[3] == "1"
 
+    @staticmethod
+    def _linekey_is_full_game_spread(linekey: str) -> bool:
+        """Full-game spread keys use {GameNum}-1-{team}-2-{period}; alt periods use -8- etc."""
+        parts = (linekey or "").split("-")
+        return len(parts) >= 5 and parts[1] == "1" and parts[3] == "2"
+
     def _element_is_full_game_moneyline(self, elem) -> bool:
         """True only when the DOM target is a full-game moneyline (not F5 / half / alt period)."""
         if not elem:
@@ -876,6 +882,32 @@ class BetWarController:
                 return elem
         return None
 
+    def _find_spread_element_by_linekey(self, game_num, team_no: int):
+        if not game_num or team_no not in (1, 2):
+            return None
+        needle = f"{game_num}-1-{team_no}-2-"
+        for elem in self.driver.find_elements(
+            By.CSS_SELECTOR,
+            "div.btnPSLine[data-linekey], div.gc-line.btnPSLine[data-linekey], "
+            ".btnPSLine.modern-bet-card[data-linekey]",
+        ):
+            lk = (elem.get_attribute("data-linekey") or "").strip()
+            if lk.startswith(str(game_num)) and needle in lk:
+                return elem
+        return None
+
+    def _element_is_full_game_spread(self, elem) -> bool:
+        if not elem:
+            return False
+        linekey = self._extract_data_linekey(elem)
+        if linekey:
+            return self._linekey_is_full_game_spread(linekey)
+        elem_id = (elem.get_attribute("id") or "").strip()
+        match = re.match(r"S(\d)_(\d+)_(\d+)", elem_id, re.I)
+        if match:
+            return int(match.group(3)) == 0
+        return False
+
     def _moneyline_cards_for_rotation_row(self, rot_span):
         team_row = rot_span.find_element(
             By.XPATH,
@@ -884,6 +916,17 @@ class BetWarController:
         return team_row.find_elements(
             By.CSS_SELECTOR,
             "div.btnMLLine, div.gc-line.btnMLLine, div.divMLLine .gc-line",
+        )
+
+    def _spread_cards_for_rotation_row(self, rot_span):
+        team_row = rot_span.find_element(
+            By.XPATH,
+            "./ancestor::div[contains(@class,'row')][.//span[contains(@class,'lblRotation')]][1]",
+        )
+        return team_row.find_elements(
+            By.CSS_SELECTOR,
+            "div.btnPSLine[data-linekey], div.gc-line.btnPSLine[data-linekey], "
+            ".btnPSLine.modern-bet-card[data-linekey]",
         )
 
     def _find_moneyline_by_rotation(
@@ -955,6 +998,128 @@ class BetWarController:
                 )
                 return fallback
 
+        return None
+
+    def _find_spread_by_rotation(
+        self,
+        game_id: str,
+        team_name: str,
+        wager_odds,
+        team_no: int | None = None,
+        spread_line: float | None = None,
+    ):
+        """Find full-game spread/run-line by rotation row (modern BetWar portal layout)."""
+        rotations = set(self._game_rotations(game_id))
+        if not rotations:
+            return None
+
+        target_rot = self._target_rotation(game_id, team_name, team_no)
+        fallback = None
+
+        for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
+            rot_text = (rot_span.text or "").strip()
+            if rot_text not in rotations:
+                continue
+            if target_rot and rot_text != target_rot:
+                continue
+
+            try:
+                team_block = rot_span.find_element(
+                    By.XPATH,
+                    "./ancestor::div[contains(@class,'row')][.//span[contains(@class,'lblRotation')]][1]",
+                )
+                team_label = team_block.find_element(By.CSS_SELECTOR, "span.lblTeamName")
+                label_text = (team_label.text or "").strip()
+            except Exception:
+                label_text = ""
+
+            if target_rot and rot_text == target_rot and team_no in (1, 2):
+                pass
+            elif label_text and not self._team_name_matches(label_text, team_name):
+                continue
+
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", rot_span
+            )
+            time.sleep(0.3)
+
+            for ps_card in self._spread_cards_for_rotation_row(rot_span):
+                linekey = (ps_card.get_attribute("data-linekey") or "").strip()
+                if linekey and not self._linekey_is_full_game_spread(linekey):
+                    continue
+                if team_no in (1, 2):
+                    seg = self._linekey_team_segment(linekey)
+                    if seg is not None and seg != team_no:
+                        continue
+                txt = (ps_card.text or ps_card.get_attribute("innerText") or "").strip()
+                spread, odds = self._parse_betwar_ps_line_text(txt)
+                if spread_line is not None and spread is not None:
+                    if not spread_values_match(spread, spread_line):
+                        continue
+                if odds and self._odds_text_matches(odds, wager_odds):
+                    return ps_card
+                if spread_line is not None and spread is not None:
+                    if spread_values_match(spread, spread_line):
+                        self.logger.info(
+                            f"Using spread line {spread} @ {odds} (arb odds {wager_odds})"
+                        )
+                        return ps_card
+                if fallback is None and (linekey or ps_card.get_attribute("onclick")):
+                    fallback = ps_card
+
+            if fallback is not None and (
+                getattr(self, "_odds_tolerance", 0) or spread_line is not None
+            ):
+                self.logger.info(
+                    f"Using rotation-row spread for {label_text or team_name} @ {rot_text} "
+                    f"(expected {wager_odds}, tolerance active)"
+                )
+                return fallback
+
+        return None
+
+    def _find_spread_by_linekey_first(
+        self,
+        game_id: str,
+        team_name: str,
+        wager_odds,
+        team_no: int | None = None,
+        spread_line: float | None = None,
+    ):
+        """Prefer exact full-game spread linekey match when GameNum is known."""
+        try:
+            api_gl, api_team_no = None, None
+            try:
+                api_gl, api_team_no = self._lookup_game_line_from_api(game_id, team_name)
+            except SessionUnauthorizedError:
+                pass
+            except Exception as e:
+                self.logger.debug(f"GetSportOffering spread linekey lookup skipped: {e}")
+
+            rots = self._game_rotations(game_id)
+            game_num = (api_gl or {}).get("GameNum")
+            if game_num is None and len(rots) >= 2:
+                game_num = self._resolve_game_num_from_dom_rotations(rots[0], rots[1])
+            tn = team_no if team_no in (1, 2) else api_team_no
+            if game_num is None or tn not in (1, 2):
+                return None
+            keyed = self._find_spread_element_by_linekey(game_num, tn)
+            if not keyed:
+                return None
+            txt = (keyed.text or keyed.get_attribute("innerText") or "").strip()
+            spread, odds = self._parse_betwar_ps_line_text(txt)
+            if spread_line is not None and spread is not None:
+                if not spread_values_match(spread, spread_line):
+                    return None
+            tol = getattr(self, "_odds_tolerance", 0) or 0
+            if odds and (self._odds_text_matches(odds, wager_odds) or tol > 0 or spread_line is not None):
+                self.logger.info(
+                    f"Full-game spread via linekey {self._extract_data_linekey(keyed)} "
+                    f"for {team_name} @ {wager_odds}"
+                )
+                return keyed
+        except Exception as e:
+            self.logger.debug(f"Linekey-first spread lookup failed: {e}")
         return None
 
     @staticmethod
@@ -1040,6 +1205,13 @@ class BetWarController:
                     parts = linekey.split("-")
                     if parts and str(parts[0]).isdigit():
                         return int(parts[0])
+                for ps_card in self._spread_cards_for_rotation_row(rot_span):
+                    linekey = self._extract_data_linekey(ps_card)
+                    if not linekey or not self._linekey_is_full_game_spread(linekey):
+                        continue
+                    parts = linekey.split("-")
+                    if parts and str(parts[0]).isdigit():
+                        return int(parts[0])
         except Exception:
             pass
         return None
@@ -1057,6 +1229,29 @@ class BetWarController:
 
         elem_id = (elem.get_attribute("id") or "").strip()
         match = re.match(r"M(\d)_(\d+)_(\d+)", elem_id, re.I)
+        if match:
+            team_no = int(match.group(1))
+            return {
+                "GameNum": int(match.group(2)),
+                "PeriodNumber": int(match.group(3)),
+                "Team1RotNum": rotations[0] if len(rotations) > 0 else "",
+                "Team2RotNum": rotations[1] if len(rotations) > 1 else "",
+            }, team_no
+        return self._minimal_game_line_from_rotations(rotations), None
+
+    def _parse_game_line_from_spread_button(self, elem, game_id: str):
+        """Extract GameNum/team_no from portal spread element (linekey or legacy id)."""
+        rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
+        linekey = self._extract_data_linekey(elem)
+        if linekey and not self._linekey_is_full_game_spread(linekey):
+            linekey = None
+        if linekey:
+            game_line, team_no = self._parse_game_line_from_linekey(linekey, rotations)
+            if game_line:
+                return game_line, team_no
+
+        elem_id = (elem.get_attribute("id") or "").strip()
+        match = re.match(r"S(\d)_(\d+)_(\d+)", elem_id, re.I)
         if match:
             team_no = int(match.group(1))
             return {
@@ -1365,11 +1560,14 @@ class BetWarController:
             return True
         return False
 
-    def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
+    def _wait_for_betslip_team(
+        self, team_name: str, timeout: int = 8, require_stake_inputs: bool = False
+    ) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._betslip_has_team(team_name) and self._betslip_stake_inputs_visible():
-                return True
+            if self._betslip_has_team(team_name):
+                if not require_stake_inputs or self._betslip_stake_inputs_visible():
+                    return True
             time.sleep(0.4)
         return False
 
@@ -1846,58 +2044,61 @@ class BetWarController:
         spread_line: float | None = None,
         game_line: dict | None = None,
     ):
-        """Locate a clickable spread/run-line on the BetWar board."""
-        rotations = set(self._game_rotations(game_id))
-        if rotations:
-            target_rot = self._target_rotation(game_id, team_name, team_no)
-            for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
-                rot_text = (rot_span.text or "").strip()
-                if rot_text not in rotations:
-                    continue
-                if target_rot and rot_text != target_rot:
-                    continue
-                try:
-                    team_block = rot_span.find_element(
-                        By.XPATH,
-                        "./ancestor::div[contains(@class,'divGameTeam')][1]",
-                    )
-                except Exception:
-                    continue
-                for ps_elem in team_block.find_elements(
-                    By.CSS_SELECTOR, ".btnPSLine, .divPSLine .gc-line, div.btnPSLine"
-                ):
-                    txt = (ps_elem.text or ps_elem.get_attribute("innerText") or "").strip()
-                    spread, odds = self._parse_betwar_ps_line_text(txt)
-                    if spread_line is not None and spread is not None:
-                        if not spread_values_match(spread, spread_line):
-                            continue
-                    if odds and self._odds_text_matches(odds, wager_odds):
-                        return ps_elem
-                    if spread_line is not None and spread is not None:
-                        if spread_values_match(spread, spread_line):
-                            self.logger.info(
-                                f"Using spread line {spread} @ {odds} (arb odds {wager_odds})"
-                            )
-                            return ps_elem
+        """Locate a clickable full-game spread/run-line on the BetWar board."""
+        elem = self._find_spread_by_linekey_first(
+            game_id,
+            team_name,
+            wager_odds,
+            team_no=team_no,
+            spread_line=spread_line,
+        )
+        if elem:
+            return elem
+
+        elem = self._find_spread_by_rotation(
+            game_id,
+            team_name,
+            wager_odds,
+            team_no=team_no,
+            spread_line=spread_line,
+        )
+        if elem and self._element_is_full_game_spread(elem):
+            return elem
 
         game_num = (game_line or {}).get("GameNum")
         if game_num is not None and team_no in (1, 2):
-            for selector in (
-                f"button#S{team_no}_{game_num}_0",
-                f"#S{team_no}_{game_num}_0",
-            ):
-                candidates = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                if candidates:
-                    txt = (candidates[0].text or candidates[0].get_attribute("innerText") or "").strip()
-                    if self._odds_text_matches(txt, wager_odds):
-                        return candidates[0]
-                    if spread_line is not None:
-                        spread, odds = self._parse_betwar_ps_line_text(txt)
-                        if spread is not None and spread_values_match(spread, spread_line):
-                            self.logger.info(
-                                f"Using spread button {selector} live {txt} (arb {wager_odds})"
-                            )
-                            return candidates[0]
+            keyed = self._find_spread_element_by_linekey(game_num, team_no)
+            if keyed:
+                txt = (keyed.text or keyed.get_attribute("innerText") or "").strip()
+                spread, odds = self._parse_betwar_ps_line_text(txt)
+                if spread_line is None or (
+                    spread is not None and spread_values_match(spread, spread_line)
+                ):
+                    if odds and self._odds_text_matches(odds, wager_odds):
+                        return keyed
+                    if spread_line is not None and spread is not None:
+                        return keyed
+
+        for selector_tpl in (
+            "button#S{team}_{game}_0",
+            "#S{team}_{game}_0",
+        ):
+            if game_num is None or team_no not in (1, 2):
+                break
+            selector = selector_tpl.format(team=team_no, game=game_num)
+            candidates = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            if not candidates:
+                continue
+            txt = (candidates[0].text or candidates[0].get_attribute("innerText") or "").strip()
+            if self._odds_text_matches(txt, wager_odds):
+                return candidates[0]
+            if spread_line is not None:
+                spread, odds = self._parse_betwar_ps_line_text(txt)
+                if spread is not None and spread_values_match(spread, spread_line):
+                    self.logger.info(
+                        f"Using legacy spread button {selector} live {txt} (arb {wager_odds})"
+                    )
+                    return candidates[0]
         return None
 
     def _add_spread_to_slip(
@@ -2262,23 +2463,61 @@ class BetWarController:
         return None
 
     @staticmethod
+    def _parse_betwar_spread_handicap(text: str) -> float | None:
+        raw = (text or "").strip().replace("½", ".5").replace(" ", "")
+        if not raw:
+            return None
+        if raw in (".5", "+.5"):
+            return 0.5
+        if raw == "-.5":
+            return -0.5
+        try:
+            spread = float(raw)
+            if spread == 0.0:
+                return None
+            return spread
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_betwar_spread_odds_token(text: str) -> str | None:
+        token = (text or "").strip()
+        if not token:
+            return None
+        lowered = token.lower()
+        if lowered in ("even", "ev", "pk", "pick", "pickem"):
+            return "+100"
+        if re.match(r"^[+-]?\d+$", token):
+            return token if token.startswith(("+", "-")) else f"+{token}"
+        return None
+
+    @staticmethod
     def _parse_betwar_ps_line_text(text: str) -> tuple[float | None, str | None]:
-        """Parse BetWar point-spread/run-line text like '+1½-230' or '+1.5 -110'."""
+        """Parse BetWar point-spread/run-line text like '+1½\\n-230' or '+1.5 -110'."""
         raw = (text or "").strip()
         if not raw:
             return None, None
-        normalized = raw.replace("½", ".5").replace(" ", "")
-        match = re.match(r"^([+-]?\d+(?:\.\d+)?)([+-]\d+)$", normalized)
-        if not match:
-            return None, None
-        try:
-            spread = float(match.group(1))
-            odds = match.group(2)
-            if spread == 0.0:
-                return None, None
-            return spread, odds
-        except (TypeError, ValueError):
-            return None, None
+
+        lines = [ln.strip() for ln in raw.replace("\r", "").split("\n") if ln.strip()]
+        if len(lines) >= 2:
+            spread = BetWarController._parse_betwar_spread_handicap(lines[0])
+            odds = BetWarController._parse_betwar_spread_odds_token(lines[1])
+            if spread is not None and odds:
+                return spread, odds
+
+        normalized = raw.replace("½", ".5").replace(" ", "").replace("\n", "").replace("\r", "")
+        match = re.match(
+            r"^([+-]?(?:\d+(?:\.\d+)?|\.?\d+))([+-]?\d+|Even|EV|Pk|Pick)$",
+            normalized,
+            re.I,
+        )
+        if match:
+            spread = BetWarController._parse_betwar_spread_handicap(match.group(1))
+            odds = BetWarController._parse_betwar_spread_odds_token(match.group(2))
+            if spread is not None and odds:
+                return spread, odds
+
+        return None, None
 
     def _get_side_spread_from_getlines(self, side: dict) -> tuple[float | None, str | None]:
         """Extract run-line handicap + American odds from a GetLines side object."""
@@ -2705,17 +2944,24 @@ class BetWarController:
         return games
 
     def _parse_player_portal_spread_by_rotation(self, html: str = None) -> dict:
-        """Map rotation number -> (handicap, American odds) from btnPSLine cells."""
+        """Map rotation number -> (handicap, American odds) from modern spread line cards."""
         source = html if html is not None else (self.driver.page_source or "")
         soup = BeautifulSoup(source, "html.parser")
         by_rot = {}
-        for row in soup.select("div.divTeamContent, div.divGameTeam"):
-            rot_el = row.select_one("span.lblRotation")
-            ps_el = row.select_one(".btnPSLine, .divPSLine")
-            if not rot_el or not ps_el:
-                continue
+        for rot_el in soup.select("span.lblRotation"):
             rot = rot_el.get_text(strip=True)
             if not rot:
+                continue
+            row = rot_el.find_parent("div", class_=lambda c: c and "row" in c.split())
+            if not row:
+                continue
+            ps_el = row.select_one(
+                "div.btnPSLine[data-linekey], div.gc-line.btnPSLine[data-linekey]"
+            )
+            if not ps_el:
+                continue
+            linekey = (ps_el.get("data-linekey") or "").strip()
+            if linekey and not self._linekey_is_full_game_spread(linekey):
                 continue
             spread, odds = self._parse_betwar_ps_line_text(ps_el.get_text(strip=True))
             if spread is None or not odds:
@@ -4194,11 +4440,16 @@ class BetWarController:
                             f"(game_id={game_id}; board rotations={visible[:12]})"
                         )
                 elif not game_line or game_line.get("GameNum") is None:
-                    if not game_line:
-                        game_line = self._fallback_game_line_from_rotations(game_id)
-                    game_line, parsed_team_no = self._resolve_game_line_for_bet(
-                        game_id, team_name, None, team_no=team_no
-                    )
+                    if spread_elem and self._element_is_full_game_spread(spread_elem):
+                        game_line, parsed_team_no = self._parse_game_line_from_spread_button(
+                            spread_elem, game_id
+                        )
+                    else:
+                        if not game_line:
+                            game_line = self._fallback_game_line_from_rotations(game_id)
+                        game_line, parsed_team_no = self._resolve_game_line_for_bet(
+                            game_id, team_name, None, team_no=team_no
+                        )
                     if not game_line:
                         game_line = self._fallback_game_line_from_rotations(game_id)
                     if team_no is None:
@@ -4278,7 +4529,7 @@ class BetWarController:
                         if self._click_moneyline_via_angular(game_line, team_no):
                             slip_populated = self._wait_for_betslip_team(slip_team, timeout=6)
 
-            if not self._wait_for_betslip_team(slip_team, timeout=8):
+            if not self._wait_for_betslip_team(slip_team, timeout=8, require_stake_inputs=True):
                 slip_preview = self._betslip_text()[:200]
                 raise Exception(
                     f"Bet slip still empty after click for {slip_team} (game_id={game_id}): {slip_preview}"

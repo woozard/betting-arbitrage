@@ -12,7 +12,7 @@ from utils.config import (
     required_first_leg_book,
 )
 from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS
-from utils.helpers import send_telegram_alert, format_utc_timestamp
+from utils.helpers import send_telegram_alert, format_utc_timestamp, format_arb_complete_alert
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
 
 REAL_MONEY_BETTING_PAUSED_MSG = "Real money betting paused (REAL_MONEY_BETTING_ENABLED=false)"
@@ -273,39 +273,12 @@ def _build_leg_confirmed_alert(
     )
 
 
-def _build_arb_complete_alert(arb: dict, stake: float) -> str:
-    identified_at = arb.get("identified_at")
-    sport = arb.get("sport")
-    league = arb.get("league")
-    game_date = arb.get("game_date")
-    team_1 = arb.get("team_1")
-    team_2 = arb.get("team_2")
-    bet_type = arb.get("bet_type", "moneyline")
-    book_1 = arb.get("team_1_bookmaker")
-    book_2 = arb.get("team_2_bookmaker")
-    odds_1 = arb.get("team_1_odds")
-    odds_2 = arb.get("team_2_odds")
-    profit_pct = arb.get("profit_pct")
-
-    profit_line = f"Estimated Profit: {profit_pct}%\n" if profit_pct is not None else ""
-    return (
-        f"===== Arbitrage Complete =====\n"
-        f"Identified At: {format_utc_timestamp(identified_at)}\n"
-        f"Sport: {sport}\n"
-        f"League: {league}\n"
-        f"Date: {game_date}\n"
-        f"Match: {team_1} vs {team_2}\n"
-        f"Bet Type: {bet_type}\n\n"
-        f"Leg 1: {team_1}\n"
-        f"Bookmaker: {book_1}\n"
-        f"Odds: {odds_1}\n"
-        f"Stake: {_format_stake_line(stake)}\n\n"
-        f"Leg 2: {team_2}\n"
-        f"Bookmaker: {book_2}\n"
-        f"Odds: {odds_2}\n"
-        f"Stake: {_format_stake_line(stake)}\n\n"
-        f"{profit_line}"
-        f"Status: Both legs confirmed\n"
+def _build_arb_complete_alert(arb: dict, stake) -> str:
+    base_amount = stake.base_amount if isinstance(stake, BaseAmountStake) else None
+    return format_arb_complete_alert(
+        arb,
+        base_amount=base_amount,
+        spread_value=arb.get("spread_value"),
     )
 
 

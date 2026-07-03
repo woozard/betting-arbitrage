@@ -1047,6 +1047,86 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
     return "\n".join(header_lines + [leg1, "", leg2])
 
 
+def format_arb_complete_alert(arb, base_amount=None, spread_value=None) -> str:
+    """Compact confirmed-arb alert (same layout as opportunity alerts + per-leg stakes).
+
+    Example:
+        ML · +1.25% ✓
+        Pittsburgh Pirates vs Washington Nationals
+
+        Pirates +140 betwar · $20.00→$28.00
+
+        Nationals -133 3et · $26.60→$20.00
+    """
+    from utils.config import BET_STAKE
+    from utils.stake_sizing import base_amount_stake_from_odds
+
+    base = round(float(base_amount if base_amount is not None else BET_STAKE), 2)
+
+    def _attr(name, default=None):
+        if isinstance(arb, dict):
+            return arb.get(name, default)
+        return getattr(arb, name, default)
+
+    team_1 = _attr("team_1") or "team_1"
+    team_2 = _attr("team_2") or "team_2"
+    sport = _attr("sport")
+    bet_type = _attr("bet_type") or "moneyline"
+    profit_pct = _attr("profit_pct")
+    if spread_value is None:
+        spread_value = _attr("spread_value")
+
+    book1 = BOOK_ALERT_LABELS.get(_attr("team_1_bookmaker"), _attr("team_1_bookmaker"))
+    book2 = BOOK_ALERT_LABELS.get(_attr("team_2_bookmaker"), _attr("team_2_bookmaker"))
+    odds1 = format_american_alert_odds(_attr("team_1_odds"))
+    odds2 = format_american_alert_odds(_attr("team_2_odds"))
+
+    short_1 = team_1.split()[-1] if team_1 else "team_1"
+    short_2 = team_2.split()[-1] if team_2 else "team_2"
+
+    def _stake_suffix(odds) -> str:
+        plan = base_amount_stake_from_odds(odds, base)
+        return f" · ${plan.risk:.2f}→${plan.to_win:.2f}"
+
+    profit_suffix = ""
+    if profit_pct is not None:
+        try:
+            pct = float(profit_pct)
+            sign = "+" if pct >= 0 else ""
+            profit_suffix = f" · {sign}{pct:.2f}%"
+        except (TypeError, ValueError):
+            profit_suffix = ""
+
+    header_lines = []
+    if bet_type == "spread":
+        market = spread_market_label(spread_value, sport)
+        header_lines.append(f"Spread — {market}{profit_suffix} ✓")
+    else:
+        header_lines.append(f"ML{profit_suffix} ✓")
+
+    header_lines.append(f"{team_1} vs {team_2}")
+    header_lines.append("")
+
+    if bet_type == "spread":
+        line1 = normalize_spread_value(_attr("spread_line_team_1"))
+        line2 = normalize_spread_value(_attr("spread_line_team_2"))
+        if line1 is None:
+            line1 = normalize_spread_value(spread_value)
+        if line2 is None and line1 is not None:
+            line2 = -line1
+        if line1 is None or line2 is None:
+            leg1 = f"{short_1} {odds1} {book1}{_stake_suffix(_attr('team_1_odds'))}"
+            leg2 = f"{short_2} {odds2} {book2}{_stake_suffix(_attr('team_2_odds'))}"
+        else:
+            leg1 = f"{short_1} {line1:+.1f} {odds1} {book1}{_stake_suffix(_attr('team_1_odds'))}"
+            leg2 = f"{short_2} {line2:+.1f} {odds2} {book2}{_stake_suffix(_attr('team_2_odds'))}"
+    else:
+        leg1 = f"{short_1} {odds1} {book1}{_stake_suffix(_attr('team_1_odds'))}"
+        leg2 = f"{short_2} {odds2} {book2}{_stake_suffix(_attr('team_2_odds'))}"
+
+    return "\n".join(header_lines + [leg1, "", leg2])
+
+
 def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None]:
     """Parse handicap + American odds from a spread/run-line bet label."""
     import re

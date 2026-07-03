@@ -2,6 +2,7 @@ from utils.helpers import (
     align_cross_book_spreads,
     build_spread_odd_row,
     fix_spread_odds_orientation,
+    format_arb_complete_alert,
     format_arb_opportunity_alert,
     resolve_ticosports_spread_lines,
     sanitize_spread_odds,
@@ -77,6 +78,24 @@ def test_spread_alert_shows_per_team_lines():
     alert = format_arb_opportunity_alert(arb)
     assert "Tigers -1.5 -189 3et" in alert
     assert "Rangers +1.5 +203 amapola" in alert
+
+
+def test_format_arb_complete_alert_per_leg_stakes():
+    arb = {
+        "team_1": "Pittsburgh Pirates",
+        "team_2": "Washington Nationals",
+        "team_1_bookmaker": "betwar",
+        "team_2_bookmaker": "3et",
+        "team_1_odds": 140,
+        "team_2_odds": -133,
+        "bet_type": "moneyline",
+        "profit_pct": 1.25,
+    }
+    alert = format_arb_complete_alert(arb, base_amount=20)
+    assert alert.startswith("ML · +1.25% ✓")
+    assert "Pirates +140 betwar · $20.00→$28.00" in alert
+    assert "Nationals -133 3et · $26.60→$20.00" in alert
+    assert "Identified At:" not in alert
 
 
 def test_build_spread_odd_row_from_threeet_style():
