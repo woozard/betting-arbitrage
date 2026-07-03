@@ -94,8 +94,11 @@ elif MIN_ARB_PROFIT_PCT != 0:
 else:
     ARB_MAX_TOTAL_PROB = 1.0
 
-# Spread/run-line uses same min profit threshold as ML by default (1.01%).
-MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '1.01'))
+# Spread/run-line alert threshold (negative = allow slightly negative-edge lines through).
+MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '-1.01'))
+SPREAD_REAL_MONEY_BETTING_ENABLED = os.getenv(
+    'SPREAD_REAL_MONEY_BETTING_ENABLED', 'false'
+).lower() in ('1', 'true', 'yes')
 if os.getenv('ARB_MAX_TOTAL_PROB_SPREAD') is not None:
     ARB_MAX_TOTAL_PROB_SPREAD = float(os.getenv('ARB_MAX_TOTAL_PROB_SPREAD'))
 else:

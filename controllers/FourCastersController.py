@@ -13,6 +13,7 @@ from utils.bet_placement import (
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
+    should_skip_spread_arb_for_placement,
 )
 from utils.betting_watchdog import (
     BettingLoopWatchdog,
@@ -626,6 +627,8 @@ class FourCastersController:
                     league = arb.get("league")
                     game_datetime = arb.get("game_datetime")
                     bet_type = arb.get("bet_type", "moneyline")
+                    if should_skip_spread_arb_for_placement(arb, self.logger):
+                        continue
                     team_1 = arb.get("team_1")
                     team_2 = arb.get("team_2")
 

@@ -33,6 +33,7 @@ from utils.bet_placement import (
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
+    should_skip_spread_arb_for_placement,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.betting_watchdog import (
@@ -1691,6 +1692,8 @@ class ParadiseWagerController:
                 book_1 = arb.get("team_1_bookmaker")
                 book_2 = arb.get("team_2_bookmaker")
                 bet_type = arb.get("bet_type", "moneyline")
+                if should_skip_spread_arb_for_placement(arb, self.logger):
+                    continue
 
                 if not is_active_arb_pair(book_1, book_2):
                     self.logger.info(
