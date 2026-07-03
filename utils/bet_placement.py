@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import threading
 
@@ -12,7 +13,12 @@ from utils.config import (
     required_first_leg_book,
 )
 from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS
-from utils.helpers import send_telegram_alert, format_utc_timestamp, format_arb_complete_alert
+from utils.helpers import (
+    send_telegram_alert,
+    send_telegram_photo,
+    format_utc_timestamp,
+    format_arb_complete_alert,
+)
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
 
 REAL_MONEY_BETTING_PAUSED_MSG = "Real money betting paused (REAL_MONEY_BETTING_ENABLED=false)"
@@ -127,7 +133,13 @@ def _real_bets_telegram_chat(telegram_config: dict):
     return telegram_config.get("real_bets")
 
 
-def _send_ops_alert(logger, alert: str, chat_id, label: str = "Alert") -> bool:
+def _send_ops_alert(
+    logger,
+    alert: str,
+    chat_id,
+    label: str = "Alert",
+    photo_path: str | None = None,
+) -> bool:
     if not chat_id:
         logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Telegram alert")
         return False
@@ -135,10 +147,24 @@ def _send_ops_alert(logger, alert: str, chat_id, label: str = "Alert") -> bool:
     logger.info(alert)
     logger.info(f"========== {label} ==========")
     asyncio.run(send_telegram_alert(alert, chat_id))
+    if photo_path and os.path.isfile(photo_path):
+        caption_lines = [
+            ln.strip()
+            for ln in alert.splitlines()
+            if ln.strip() and not ln.strip().startswith("=====")
+        ]
+        photo_caption = "\n".join(caption_lines[:4])[:1024] if caption_lines else None
+        asyncio.run(send_telegram_photo(photo_path, caption=photo_caption, chat_id=chat_id))
     return True
 
 
-def _dispatch_ops_alert(logger, alert: str, chat_id, label: str = "Alert") -> bool:
+def _dispatch_ops_alert(
+    logger,
+    alert: str,
+    chat_id,
+    label: str = "Alert",
+    photo_path: str | None = None,
+) -> bool:
     if not chat_id:
         logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Telegram alert")
         return False
@@ -148,11 +174,11 @@ def _dispatch_ops_alert(logger, alert: str, chat_id, label: str = "Alert") -> bo
     if TELEGRAM_ALERTS_ASYNC:
         threading.Thread(
             target=_send_ops_alert,
-            args=(logger, alert, chat_id, label),
+            args=(logger, alert, chat_id, label, photo_path),
             daemon=True,
         ).start()
         return True
-    return _send_ops_alert(logger, alert, chat_id, label)
+    return _send_ops_alert(logger, alert, chat_id, label, photo_path)
 
 
 def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
@@ -233,6 +259,19 @@ def should_pause_first_leg_for_exposure(
     return True
 
 
+def _leg_position_label(
+    other_leg_placed: bool,
+    bookmaker: str,
+    book_1: str,
+    book_2: str,
+    other_book: str,
+) -> str:
+    pair = f"{book_1} × {book_2}"
+    if other_leg_placed:
+        return f"Leg: 2 of 2 (completes arb) | Pair: {pair} | This leg: {bookmaker}"
+    return f"Leg: 1 of 2 | Pair: {pair} | This leg: {bookmaker} | Waiting for: {other_book}"
+
+
 def _build_leg_confirmed_alert(
     arb: dict,
     bookmaker: str,
@@ -250,14 +289,25 @@ def _build_leg_confirmed_alert(
     team_1 = arb.get("team_1")
     team_2 = arb.get("team_2")
     bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+
+    leg_position = _leg_position_label(
+        other_leg_placed, bookmaker, book_1, book_2, other_book
+    )
+    if other_leg_placed:
+        status = "Both legs confirmed — full arb complete alert follows"
+    else:
+        status = f"First leg confirmed — waiting for {other_book} (leg 2 of 2)"
 
     if other_leg_placed:
-        status = "Both legs now confirmed"
+        header = "===== Leg Confirmed (Real Money) — Leg 2 of 2 ====="
     else:
-        status = f"Real money placed — waiting for {other_book} leg"
+        header = "===== Leg Confirmed (Real Money) — Leg 1 of 2 ====="
 
     return (
-        f"===== Leg Confirmed (Real Money) =====\n"
+        f"{header}\n"
+        f"{leg_position}\n"
         f"Identified At: {format_utc_timestamp(identified_at)}\n"
         f"Sport: {sport}\n"
         f"League: {league}\n"
@@ -275,11 +325,12 @@ def _build_leg_confirmed_alert(
 
 def _build_arb_complete_alert(arb: dict, stake) -> str:
     base_amount = stake.base_amount if isinstance(stake, BaseAmountStake) else None
-    return format_arb_complete_alert(
+    body = format_arb_complete_alert(
         arb,
         base_amount=base_amount,
         spread_value=arb.get("spread_value"),
     )
+    return f"===== Arb Complete (Real Money) =====\n\n{body}"
 
 
 def _build_partial_arb_alert(
@@ -362,6 +413,42 @@ def maybe_notify_partial_arb_exposure(
         cache.mark_partial_arb_alert_sent(pair_key)
 
 
+def capture_bet_screenshot_for_alert(
+    logger,
+    bookmaker: str,
+    arb: dict,
+    team_name: str,
+    game_id: str,
+    stake,
+    odds,
+    *,
+    driver=None,
+    open_bets_url: str | None = None,
+    return_to_sport=None,
+    extra_lines: list[str] | None = None,
+) -> str | None:
+    from utils.bet_screenshot import capture_confirmed_bet_screenshot
+
+    bet_type = arb.get("bet_type", "moneyline")
+    spread_line = arb.get("spread_value") if bet_type == "spread" else None
+    return capture_confirmed_bet_screenshot(
+        bookmaker=bookmaker,
+        game_id=game_id,
+        team_name=team_name,
+        team_1=arb.get("team_1") or "",
+        team_2=arb.get("team_2") or "",
+        odds=odds,
+        stake=stake,
+        bet_type=bet_type,
+        spread_line=spread_line,
+        driver=driver,
+        open_bets_url=open_bets_url,
+        return_to_sport=return_to_sport,
+        extra_lines=extra_lines,
+        logger=logger,
+    )
+
+
 def finalize_confirmed_bet(
     cache,
     storage,
@@ -374,6 +461,7 @@ def finalize_confirmed_bet(
     stake: float,
     moneyline_odd,
     telegram_config: dict,
+    screenshot_path: str | None = None,
 ):
     """Run after a bookmaker has confirmed bet acceptance (not merely clicked Place Bet)."""
     sport = arb.get("sport")
@@ -444,7 +532,13 @@ def finalize_confirmed_bet(
             other_book,
             other_leg_placed,
         )
-        if _dispatch_ops_alert(logger, leg_alert, real_bets_chat, label="Leg Confirmed Alert"):
+        if _dispatch_ops_alert(
+            logger,
+            leg_alert,
+            real_bets_chat,
+            label="Leg Confirmed Alert",
+            photo_path=screenshot_path,
+        ):
             cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
     else:
         logger.info(

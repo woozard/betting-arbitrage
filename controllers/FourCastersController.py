@@ -9,6 +9,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
     should_notify_failed_bet,
@@ -324,6 +325,7 @@ class FourCastersController:
             raise FourCastersApiError("Order not matched (fillAndKill found no liquidity)")
 
         fill = matched[0]
+        self._last_fill = fill
         tx_id = fill.get("txID") or fill.get("wagerRequestID")
         return True, f"matched tx={tx_id} risk={fill.get('risk')} win={fill.get('win')}"
 
@@ -708,6 +710,25 @@ class FourCastersController:
                         spread_line=spread_line,
                     )
                     if bet_placed:
+                        fill = getattr(self, "_last_fill", None) or {}
+                        extra_lines = []
+                        tx_id = fill.get("txID") or fill.get("wagerRequestID")
+                        if tx_id:
+                            extra_lines.append(f"Tx: {tx_id}")
+                        if fill.get("risk") is not None:
+                            extra_lines.append(f"Risk: ${fill.get('risk')}")
+                        if fill.get("win") is not None:
+                            extra_lines.append(f"Win: ${fill.get('win')}")
+                        screenshot_path = capture_bet_screenshot_for_alert(
+                            self.logger,
+                            self.bookmaker,
+                            arb,
+                            team_name,
+                            game_id,
+                            stake_used,
+                            wager_odds,
+                            extra_lines=extra_lines or None,
+                        )
                         finalize_confirmed_bet(
                             self.cache,
                             self.storage,
@@ -720,6 +741,7 @@ class FourCastersController:
                             stake_used,
                             wager_odds,
                             TELEGRAM,
+                            screenshot_path=screenshot_path,
                         )
                     else:
                         if should_notify_failed_bet(self._last_bet_error):

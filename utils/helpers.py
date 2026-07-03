@@ -300,6 +300,29 @@ async def send_telegram_alert(alert, chat_id = None) -> None:
     except Exception as e:
         print(f"Telegram alert failed (non-fatal) for chat_id={chat_id}: {e}")
 
+
+async def send_telegram_photo(photo_path, caption=None, chat_id=None) -> None:
+    tracemalloc.start()
+    try:
+        from telegram import Bot
+        token = TELEGRAM.get('bot_token')
+        if not token:
+            print("Telegram alerts disabled (no bot_token) - skipping photo")
+            return
+        chat_id = chat_id or TELEGRAM.get('chat_id')
+        if not chat_id:
+            print("No chat_id for telegram photo - skipping")
+            return
+        if not photo_path or not os.path.isfile(photo_path):
+            print(f"Telegram photo missing: {photo_path}")
+            return
+        bot = Bot(token=token)
+        cap = (caption or "")[:1024] if caption else None
+        with open(photo_path, "rb") as photo_file:
+            await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=cap)
+    except Exception as e:
+        print(f"Telegram photo failed (non-fatal) for chat_id={chat_id}: {e}")
+
 async def send_monitoring_alert(website, account, ex, chat_id = None) -> None:
     tracemalloc.start()
     try:

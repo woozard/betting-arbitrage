@@ -9,6 +9,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
     should_notify_failed_bet,
@@ -494,8 +495,9 @@ class ThreeEtController:
             f"odds={api_odds} type={self._session_odds_type}"
         )
         result = self.api.post("/betting/v3/bets", json_body=body)
-        accepted, message, retryable, _bet = self._parse_bet_api_response(result)
+        accepted, message, retryable, bet = self._parse_bet_api_response(result)
         if accepted:
+            self._last_bet_api_payload = bet
             return True, message
         raise ThreeEtApiError(message)
 
@@ -595,8 +597,9 @@ class ThreeEtController:
                 f"odds={api_odds} type={self._session_odds_type} attempt={attempt}/{max_attempts}"
             )
             result = self.api.post("/betting/v3/bets", json_body=body)
-            accepted, message, retryable, _bet = self._parse_bet_api_response(result)
+            accepted, message, retryable, bet = self._parse_bet_api_response(result)
             if accepted:
+                self._last_bet_api_payload = bet
                 if attempt > 1:
                     self.logger.info(
                         f"3et bet accepted on attempt {attempt}/{max_attempts}: {message}"
@@ -970,6 +973,24 @@ class ThreeEtController:
                     spread_line=spread_line,
                 )
                 if bet_placed:
+                    extra_lines = []
+                    bet_payload = getattr(self, "_last_bet_api_payload", None) or {}
+                    bet_id = bet_payload.get("id") or bet_payload.get("betId")
+                    if bet_id:
+                        extra_lines.append(f"Bet ID: {bet_id}")
+                    status = bet_payload.get("status")
+                    if status:
+                        extra_lines.append(f"Status: {status}")
+                    screenshot_path = capture_bet_screenshot_for_alert(
+                        self.logger,
+                        self.bookmaker,
+                        arb,
+                        team_name,
+                        game_id,
+                        stake_used,
+                        wager_odds,
+                        extra_lines=extra_lines or None,
+                    )
                     finalize_confirmed_bet(
                         self.cache,
                         self.storage,
@@ -982,6 +1003,7 @@ class ThreeEtController:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
+                        screenshot_path=screenshot_path,
                     )
                 else:
                     if should_notify_failed_bet(self._last_bet_error):

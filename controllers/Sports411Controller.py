@@ -29,6 +29,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
     should_notify_failed_bet,
@@ -2982,6 +2983,18 @@ class Sports411Controller:
                 if bet_placed:
                     self._arb_fail_counts.pop(f"{game_id}:{team_name}".lower(), None)
                     self.logger.info("Bet Placement Completed")
+                    screenshot_path = capture_bet_screenshot_for_alert(
+                        self.logger,
+                        self.bookmaker,
+                        arb,
+                        team_name,
+                        game_id,
+                        stake_used,
+                        wager_odds,
+                        driver=self.driver,
+                        open_bets_url=self._open_bets_url(),
+                        return_to_sport=self._return_to_sport_page,
+                    )
                     finalize_confirmed_bet(
                         self.cache,
                         self.storage,
@@ -2994,6 +3007,7 @@ class Sports411Controller:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
+                        screenshot_path=screenshot_path,
                     )
                     self.logger.info("Returning to sport page and resuming odds watch")
                     self._resume_odds_watch_on_sport_page()

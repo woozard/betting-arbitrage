@@ -30,6 +30,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
     should_notify_failed_bet,
@@ -1057,6 +1058,7 @@ class ParadiseWagerController:
             status_code = confirm_data.get("Status")
             if status_code == 2:
                 self.logger.info(f"Bet confirmed (TicketNumber={ticket_number})")
+                self._last_ticket_number = ticket_number
                 return True, f"TicketNumber={ticket_number}"
 
             if status_code in (3, 4):
@@ -1820,6 +1822,20 @@ class ParadiseWagerController:
 
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
+                    extra_lines = []
+                    ticket = getattr(self, "_last_ticket_number", None)
+                    if ticket:
+                        extra_lines.append(f"Ticket: {ticket}")
+                    screenshot_path = capture_bet_screenshot_for_alert(
+                        self.logger,
+                        self.bookmaker,
+                        arb,
+                        team_name,
+                        game_id,
+                        stake_used,
+                        wager_odds,
+                        extra_lines=extra_lines or None,
+                    )
                     finalize_confirmed_bet(
                         self.cache,
                         self.storage,
@@ -1832,6 +1848,7 @@ class ParadiseWagerController:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
+                        screenshot_path=screenshot_path,
                     )
                     self._refresh_schedule_cache()
 

@@ -26,3 +26,4 @@ zenrows
 playwright
 redis
 py-clob-client-v2>=1.0.1
+Pillow>=10.0.0

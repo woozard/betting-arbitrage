@@ -1,0 +1,292 @@
+"""Capture bet confirmation UI (Selenium) or render receipts (API books) for Telegram."""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Callable
+
+from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
+
+SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "screenshots")
+
+
+def get_screenshots_dir() -> str:
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+    return SCREENSHOTS_DIR
+
+
+def bet_screenshot_path(bookmaker: str, game_id: str) -> str:
+    safe_book = "".join(c if c.isalnum() else "_" for c in (bookmaker or "book"))
+    safe_game = "".join(c if c.isalnum() else "_" for c in str(game_id or "unknown"))[:40]
+    return os.path.join(get_screenshots_dir(), f"{safe_book}_{safe_game}_{int(time.time())}.png")
+
+
+def _write_png(path: str, png_bytes: bytes, logger) -> str | None:
+    try:
+        with open(path, "wb") as fh:
+            fh.write(png_bytes)
+        logger.info(f"Bet screenshot saved: {path}")
+        return path
+    except OSError as exc:
+        logger.warning(f"Could not write bet screenshot {path}: {exc}")
+        return None
+
+
+def capture_element_screenshot(driver, selectors: list[str], path: str, logger) -> str | None:
+    """Try each CSS selector; screenshot the first visible element."""
+    from selenium.webdriver.common.by import By
+
+    for selector in selectors:
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, selector)
+            if not element.is_displayed():
+                continue
+            png = element.screenshot_as_png
+            if png:
+                return _write_png(path, png, logger)
+        except Exception:
+            continue
+    return None
+
+
+def capture_betwar_my_bets(driver, path: str, logger) -> str | None:
+    from selenium.webdriver.common.by import By
+
+    try:
+        tab = driver.find_element(By.CSS_SELECTOR, "#pillsPendingTab")
+        if (tab.get_attribute("aria-selected") or "").lower() != "true":
+            driver.execute_script("arguments[0].click();", tab)
+        time.sleep(0.8)
+    except Exception as exc:
+        logger.warning(f"BetWar My Bets tab not available for screenshot: {exc}")
+
+    return capture_element_screenshot(
+        driver,
+        ["#pills-pending", "#pills-pending .list-group", "#pills-pending .card"],
+        path,
+        logger,
+    )
+
+
+def capture_betamapola_betslip(driver, path: str, logger) -> str | None:
+    return capture_element_screenshot(driver, ["#betSlipDiv"], path, logger)
+
+
+def capture_s411_open_bet(
+    driver,
+    open_bets_url: str,
+    team_name: str,
+    path: str,
+    logger,
+    return_to_sport: Callable[[], None] | None = None,
+) -> str | None:
+    try:
+        driver.get(open_bets_url)
+        time.sleep(2.5)
+        element = driver.execute_script(
+            """
+            const needle = (arguments[0] || '').toLowerCase();
+            const selectors = [
+              '.bet-item', '.wager-item', '.open-bet', '.pending-bet',
+              'tr', '.card', '[class*="Wager"]', '[class*="wager"]',
+              'main section', '.content', '.open-bets-list'
+            ];
+            for (const sel of selectors) {
+              for (const el of document.querySelectorAll(sel)) {
+                const t = (el.innerText || '').trim();
+                if (t.length > 20 && t.toLowerCase().includes(needle)) return el;
+              }
+            }
+            return document.querySelector('main, .open-bets, #content, .content-wrapper')
+                || document.body;
+            """,
+            team_name,
+        )
+        if element:
+            png = element.screenshot_as_png
+            if png:
+                return _write_png(path, png, logger)
+
+        return capture_element_screenshot(
+            driver,
+            ["main", ".open-bets", "#content", "body"],
+            path,
+            logger,
+        )
+    except Exception as exc:
+        logger.warning(f"S411 open-bets screenshot failed: {exc}")
+        return None
+    finally:
+        if return_to_sport:
+            try:
+                return_to_sport()
+            except Exception as exc:
+                logger.warning(f"S411 return to sport page after screenshot failed: {exc}")
+
+
+def _stake_display(stake) -> str:
+    if isinstance(stake, BaseAmountStake):
+        return format_base_amount_stake(stake)
+    try:
+        return f"${float(stake):.2f}"
+    except (TypeError, ValueError):
+        return str(stake)
+
+
+def _bet_type_label(bet_type: str, spread_line) -> str:
+    bt = (bet_type or "moneyline").lower()
+    if bt == "spread" and spread_line is not None:
+        try:
+            line = float(spread_line)
+            sign = "+" if line > 0 else ""
+            return f"Spread {sign}{line:g}"
+        except (TypeError, ValueError):
+            return "Spread"
+    return "Moneyline"
+
+
+def render_bet_receipt(
+    path: str,
+    bookmaker: str,
+    *,
+    team_1: str,
+    team_2: str,
+    team_name: str,
+    odds,
+    stake,
+    bet_type: str = "moneyline",
+    spread_line=None,
+    extra_lines: list[str] | None = None,
+    logger=None,
+) -> str | None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        if logger:
+            logger.warning("Pillow not installed — skipping API bet receipt screenshot")
+        return None
+
+    width, height = 720, 420
+    img = Image.new("RGB", (width, height), color=(18, 24, 38))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        body_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+    except OSError:
+        title_font = ImageFont.load_default()
+        body_font = title_font
+        small_font = title_font
+
+    y = 24
+    draw.text((24, y), f"{(bookmaker or 'book').upper()} — BET CONFIRMED", fill=(76, 175, 80), font=title_font)
+    y += 44
+    draw.line([(24, y), (width - 24, y)], fill=(60, 70, 90), width=1)
+    y += 16
+
+    lines = [
+        f"Match: {team_1} vs {team_2}",
+        f"Selection: {team_name}",
+        f"Market: {_bet_type_label(bet_type, spread_line)}",
+        f"Odds: {odds}",
+        f"Stake: {_stake_display(stake)}",
+    ]
+    if extra_lines:
+        lines.extend(extra_lines)
+
+    for line in lines:
+        draw.text((24, y), line, fill=(230, 235, 245), font=body_font)
+        y += 32
+
+    draw.text(
+        (24, height - 36),
+        time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        fill=(130, 140, 160),
+        font=small_font,
+    )
+
+    try:
+        img.save(path, format="PNG")
+        if logger:
+            logger.info(f"Bet receipt screenshot saved: {path}")
+        return path
+    except OSError as exc:
+        if logger:
+            logger.warning(f"Could not save bet receipt {path}: {exc}")
+        return None
+
+
+def capture_confirmed_bet_screenshot(
+    *,
+    bookmaker: str,
+    game_id: str,
+    team_name: str,
+    team_1: str,
+    team_2: str,
+    odds,
+    stake,
+    bet_type: str = "moneyline",
+    spread_line=None,
+    driver=None,
+    open_bets_url: str | None = None,
+    return_to_sport: Callable[[], None] | None = None,
+    extra_lines: list[str] | None = None,
+    logger=None,
+) -> str | None:
+    """Best-effort screenshot for a confirmed real-money bet."""
+    if not logger:
+        return None
+
+    path = bet_screenshot_path(bookmaker, game_id)
+    bm = (bookmaker or "").strip().lower()
+
+    if bm == "betwar" and driver is not None:
+        shot = capture_betwar_my_bets(driver, path, logger)
+        if shot:
+            return shot
+
+    if bm == "betamapola" and driver is not None:
+        shot = capture_betamapola_betslip(driver, path, logger)
+        if shot:
+            return shot
+
+    if bm == "sports411" and driver is not None and open_bets_url:
+        shot = capture_s411_open_bet(
+            driver,
+            open_bets_url,
+            team_name,
+            path,
+            logger,
+            return_to_sport=return_to_sport,
+        )
+        if shot:
+            return shot
+
+    return render_bet_receipt(
+        path,
+        bookmaker,
+        team_1=team_1,
+        team_2=team_2,
+        team_name=team_name,
+        odds=odds,
+        stake=stake,
+        bet_type=bet_type,
+        spread_line=spread_line,
+        extra_lines=extra_lines,
+        logger=logger,
+    )
+
+
+def prune_screenshots(max_age_hours: int = 72) -> None:
+    """Remove old bet screenshots from screenshots/."""
+    directory = get_screenshots_dir()
+    cutoff = time.time() - max_age_hours * 3600
+    try:
+        for fname in os.listdir(directory):
+            fpath = os.path.join(directory, fname)
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+    except OSError:
+        pass

@@ -29,6 +29,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    capture_bet_screenshot_for_alert,
     format_bet_failure_reason,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
@@ -4901,6 +4902,16 @@ class BetWarController:
                     )
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
+                    screenshot_path = capture_bet_screenshot_for_alert(
+                        self.logger,
+                        self.bookmaker,
+                        arb,
+                        team_name,
+                        game_id,
+                        stake_used,
+                        wager_odds,
+                        driver=self.driver,
+                    )
                     finalize_confirmed_bet(
                         self.cache,
                         self.storage,
@@ -4913,6 +4924,7 @@ class BetWarController:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
+                        screenshot_path=screenshot_path,
                     )
                     self.logger.info("Re-establishing sport offering before next arbitrage")
                     self.__ensure_sport_offering_loaded()
