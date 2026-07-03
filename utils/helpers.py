@@ -941,6 +941,45 @@ def resolve_ticosports_spread_lines(spread, ml1, ml2):
     return team_1_spread, team_2_spread
 
 
+def resolve_paradise_team_spread_lines(handicap_1, handicap_2, ml1=None, ml2=None):
+    """
+    Map Paradise per-team spread handicaps (each team's ``h`` field) to team_1/team_2 lines.
+
+    Paradise returns an independent handicap per team; do not derive team_2 as -team_1
+    from only the first team's value (rotation order varies vs canonical arb teams).
+    """
+    h1 = normalize_spread_value(handicap_1)
+    h2 = normalize_spread_value(handicap_2)
+
+    if h1 is not None and h2 is not None:
+        if spread_values_match(h1, -h2):
+            return h1, h2
+        if spread_values_match(h2, -h1):
+            return h2, h1
+        if ml1 is not None and ml2 is not None:
+            oriented = resolve_ticosports_spread_lines(h1, ml1, ml2)
+            if oriented[0] is not None and spread_values_match(oriented[0], h1):
+                return oriented
+            oriented = resolve_ticosports_spread_lines(h2, ml1, ml2)
+            if oriented[0] is not None:
+                return oriented[1], oriented[0]
+        return h1, h2
+
+    if h1 is not None:
+        if ml1 is not None and ml2 is not None:
+            return resolve_ticosports_spread_lines(h1, ml1, ml2)
+        return h1, -h1
+
+    if h2 is not None:
+        if ml1 is not None and ml2 is not None:
+            t1, t2 = resolve_ticosports_spread_lines(h2, ml1, ml2)
+            if t1 is not None:
+                return t2, t1
+        return -h2, h2
+
+    return None, None
+
+
 def spread_odds_rows_fresh_for_arb(
     created_at_1,
     created_at_2,

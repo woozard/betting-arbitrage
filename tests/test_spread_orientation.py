@@ -5,6 +5,7 @@ from utils.helpers import (
     fix_spread_odds_orientation,
     format_arb_complete_alert,
     format_arb_opportunity_alert,
+    resolve_paradise_team_spread_lines,
     resolve_ticosports_spread_lines,
     sanitize_spread_odds,
 )
@@ -41,6 +42,25 @@ def test_tigers_rangers_amapola_lines():
     team_1_spread, team_2_spread = resolve_ticosports_spread_lines(-1.5, 154, -185)
     assert team_1_spread == 1.5
     assert team_2_spread == -1.5
+
+
+def test_paradise_per_team_handicaps_twins_yankees():
+    """Paradise returns each team's h field — do not flip team_2 from team_1 only."""
+    # Rotation lists Twins first (+1.5), Yankees second (-1.5).
+    t1, t2 = resolve_paradise_team_spread_lines(1.5, -1.5, 110, -130)
+    assert t1 == 1.5
+    assert t2 == -1.5
+
+    # Same game, Yankees listed first in API payload.
+    t1, t2 = resolve_paradise_team_spread_lines(-1.5, 1.5, -130, 110)
+    assert t1 == -1.5
+    assert t2 == 1.5
+
+
+def test_paradise_single_handicap_falls_back_to_moneyline():
+    t1, t2 = resolve_paradise_team_spread_lines(1.5, None, 110, -130)
+    assert t1 == 1.5
+    assert t2 == -1.5
 
 
 def test_cross_book_rejects_opposite_team_1_lines():

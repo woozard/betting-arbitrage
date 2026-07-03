@@ -24,6 +24,7 @@ from utils.helpers import (
     teams_same,
     arb_live_odds_acceptable,
     spread_values_match,
+    resolve_paradise_team_spread_lines,
 )
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.bet_placement import (
@@ -438,6 +439,52 @@ class ParadiseWagerController:
         refreshed = self._refresh_schedule_cache()
         return self._find_game_by_teams(refreshed, team_name, team_1, team_2)
 
+    def _resolve_spread_bet_context(
+        self,
+        game_row: dict,
+        team_name: str,
+        team_no: int,
+        spread_line: float | None,
+    ):
+        """
+        Resolve spread line_id, live odds, and team slot by team name.
+
+        Paradise rotation order may differ from arb canonical team_1/team_2; always
+        anchor on the named team's handicap from the schedule row.
+        """
+        market = game_row.get("spread") or {}
+        line_ids = game_row.get("line_ids") or {}
+
+        for slot in (1, 2):
+            if not self._team_name_matches(game_row.get(f"team_{slot}"), team_name):
+                continue
+            live_spread = market.get(f"team_{slot}_spread")
+            live_odds = market.get(f"team_{slot}_odds")
+            line_id = line_ids.get(f"spread_team_{slot}")
+            if slot != team_no:
+                self.logger.info(
+                    f"Paradise spread slot corrected for {team_name}: "
+                    f"team_no {team_no} → {slot}"
+                )
+            if spread_line is not None and live_spread is not None:
+                if not spread_values_match(live_spread, spread_line):
+                    raise Exception(
+                        f"Spread line moved: live {live_spread:+.1f} differs from "
+                        f"arb {spread_line:+.1f} for {team_name}"
+                    )
+            return line_id, live_odds, live_spread, slot
+
+        live_spread = market.get(f"team_{team_no}_spread")
+        live_odds = market.get(f"team_{team_no}_odds")
+        line_id = line_ids.get(f"spread_team_{team_no}")
+        if spread_line is not None and live_spread is not None:
+            if not spread_values_match(live_spread, spread_line):
+                raise Exception(
+                    f"Spread line moved: live {live_spread:+.1f} differs from "
+                    f"arb {spread_line:+.1f}"
+                )
+        return line_id, live_odds, live_spread, team_no
+
     def _api_call(self, method: str, path: str, body=None, auth: bool = True):
         """Execute player-api request inside the authenticated browser context."""
         token = self._access_token if auth else None
@@ -819,35 +866,40 @@ class ParadiseWagerController:
                         league_date, game.get("t") or game.get("to") or "", tz_name
                     )
 
-                    spread_val = team_entries[0].get("spread_val")
+                    spread_h1 = team_entries[0].get("spread_val")
+                    spread_h2 = team_entries[1].get("spread_val")
                     spread_1_odds = team_entries[0].get("spread_odds")
                     spread_2_odds = team_entries[1].get("spread_odds")
-                    if spread_val is None:
-                        spread_val = team_entries[1].get("spread_val")
-                        if spread_val is not None:
-                            spread_val = -float(spread_val)
+                    spread_line_1, spread_line_2 = resolve_paradise_team_spread_lines(
+                        spread_h1,
+                        spread_h2,
+                        team_entries[0]["odds"],
+                        team_entries[1]["odds"],
+                    )
                     if spread_1_odds is not None and spread_2_odds is not None:
                         spread_1_odds, spread_2_odds = (
                             self._normalize_paradise_spread_american_odds(
                                 spread_1_odds,
                                 spread_2_odds,
-                                team_entries[0].get("spread_val"),
-                                team_entries[1].get("spread_val"),
+                                spread_h1,
+                                spread_h2,
                             )
                         )
                         from utils.helpers import sanitize_spread_odds
                         cleaned = sanitize_spread_odds(
                             {
-                                "team_1_spread": spread_val,
-                                "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                                "team_1_spread": spread_line_1,
+                                "team_2_spread": spread_line_2,
                                 "team_1_odds": spread_1_odds,
                                 "team_2_odds": spread_2_odds,
                             }
                         )
                         if cleaned is None:
+                            spread_line_1 = spread_line_2 = None
                             spread_1_odds = spread_2_odds = None
                         else:
-                            spread_val = cleaned["team_1_spread"]
+                            spread_line_1 = cleaned["team_1_spread"]
+                            spread_line_2 = cleaned["team_2_spread"]
                             spread_1_odds = cleaned["team_1_odds"]
                             spread_2_odds = cleaned["team_2_odds"]
 
@@ -865,8 +917,8 @@ class ParadiseWagerController:
                             "team_2": str(team_entries[1]["odds"]),
                         },
                         "spread": {
-                            "team_1_spread": spread_val,
-                            "team_2_spread": -spread_val if isinstance(spread_val, (int, float)) else None,
+                            "team_1_spread": spread_line_1,
+                            "team_2_spread": spread_line_2,
                             "team_1_odds": spread_1_odds,
                             "team_2_odds": spread_2_odds,
                         },
@@ -1484,15 +1536,9 @@ class ParadiseWagerController:
 
         line_ids = game_row.get("line_ids") or {}
         if bet_type == "spread":
-            line_id = line_ids.get(f"spread_team_{team_no}")
-            market = game_row.get("spread") or {}
-            live_odds = market.get(f"team_{team_no}_odds")
-            live_spread = market.get(f"team_{team_no}_spread")
-            if spread_line is not None and live_spread is not None:
-                if not spread_values_match(live_spread, spread_line):
-                    raise Exception(
-                        f"Spread line moved: live {live_spread} differs from arb {spread_line}"
-                    )
+            line_id, live_odds, live_spread, team_no = self._resolve_spread_bet_context(
+                game_row, team_name, team_no, spread_line
+            )
         else:
             line_id = line_ids.get(f"team_{team_no}")
             live_odds = (game_row.get("moneyline") or {}).get(f"team_{team_no}")
