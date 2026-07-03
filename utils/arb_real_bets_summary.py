@@ -1,13 +1,15 @@
 """Deferred single-message Real Bets summaries (complete or failed) per arb pair."""
 from __future__ import annotations
 
+import asyncio
 import threading
 
 from utils.config import (
     REAL_BETS_FAILED_SUMMARY_DELAY_SEC,
     REAL_BETS_SUMMARY_DELAY_SEC,
+    TELEGRAM_ALERTS_ASYNC,
 )
-from utils.helpers import format_arb_complete_alert
+from utils.helpers import format_arb_complete_alert, send_telegram_alert
 from utils.stake_sizing import BaseAmountStake
 
 _timer_lock = threading.Lock()
@@ -146,12 +148,46 @@ def _build_summary_alert(cache, pair_key: str, outcome: str) -> str | None:
     return f"{header}\n\n{body}"
 
 
+def _send_real_bets_summary(logger, alert: str, chat_id, label: str) -> bool:
+    if not chat_id:
+        logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Real Bets summary")
+        return False
+    logger.info(f"========== {label} ==========")
+    logger.info(alert)
+    logger.info(f"========== {label} ==========")
+    try:
+        asyncio.run(send_telegram_alert(alert, chat_id))
+    except Exception:
+        logger.exception(f"Failed to send Real Bets summary to Telegram | label={label}")
+        return False
+    return True
+
+
+def _dispatch_real_bets_summary(
+    logger,
+    alert: str,
+    chat_id,
+    label: str,
+    on_success=None,
+) -> bool:
+    def _run():
+        if _send_real_bets_summary(logger, alert, chat_id, label) and on_success:
+            on_success()
+
+    if TELEGRAM_ALERTS_ASYNC:
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    if not _send_real_bets_summary(logger, alert, chat_id, label):
+        return False
+    if on_success:
+        on_success()
+    return True
+
+
 def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config: dict) -> None:
-    import asyncio
+    logger.info(f"Publishing Real Bets summary | pair_key={pair_key} outcome={outcome}")
 
-    from utils.helpers import send_telegram_alert
-
-    if cache.arb_complete_alert_already_sent(pair_key):
+    if cache.real_bets_summary_already_sent(pair_key):
         logger.info(
             f"Skipping duplicate Real Bets summary | pair_key={pair_key} outcome={outcome}"
         )
@@ -163,17 +199,15 @@ def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config
         return
 
     chat_id = telegram_config.get("real_bets")
-    if not chat_id:
-        logger.warning("TELEGRAM_CHAT_REAL_BETS not set — skipping Real Bets summary")
-        return
-
     label = "Arb Complete Alert" if outcome == "complete" else "Arb Failed Alert"
-    logger.info(f"========== {label} ==========")
-    logger.info(alert)
-    logger.info(f"========== {label} ==========")
-    asyncio.run(send_telegram_alert(alert, chat_id))
-    cache.mark_arb_complete_alert_sent(pair_key)
-    cache.redis.delete(_summary_redis_key(pair_key))
+
+    def _mark_sent():
+        cache.mark_real_bets_summary_sent(pair_key)
+        cache.redis.delete(_summary_redis_key(pair_key))
+        logger.info(f"Real Bets summary sent | pair_key={pair_key} outcome={outcome}")
+
+    if not _dispatch_real_bets_summary(logger, alert, chat_id, label, on_success=_mark_sent):
+        return
 
 
 def schedule_complete_summary(cache, logger, arb: dict, telegram_config: dict) -> None:

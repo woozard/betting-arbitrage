@@ -229,6 +229,19 @@ class ArbitrageCache:
             ttl=self.lock_ttl,
         )
 
+    def _real_bets_summary_key(self, pair_key):
+        return f"real_bets_summary_sent:{pair_key}"
+
+    def real_bets_summary_already_sent(self, pair_key):
+        return bool(self.redis.get(self._real_bets_summary_key(pair_key)))
+
+    def mark_real_bets_summary_sent(self, pair_key):
+        self.redis.set(
+            self._real_bets_summary_key(pair_key),
+            {"sent_at": "now"},
+            ttl=self.lock_ttl,
+        )
+
     def _partial_arb_alert_key(self, pair_key):
         return f"partial_arb_alert_sent:{pair_key}"
 

@@ -598,12 +598,7 @@ def finalize_confirmed_bet(
         )
 
     if other_leg_placed:
-        if cache.arb_complete_alert_already_sent(pair_key):
-            logger.info(
-                f"Skipping duplicate Real Bets summary schedule | {team_1} vs {team_2}"
-            )
-        else:
-            schedule_complete_summary(cache, logger, arb, telegram_config)
+        schedule_complete_summary(cache, logger, arb, telegram_config)
         return
 
     if not SEQUENTIAL_ARB_BETTING:
