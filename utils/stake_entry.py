@@ -9,8 +9,8 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from utils.stake_sizing import BaseAmountStake
 
 DEFAULT_RISK_SELECTORS: tuple[str, ...] = (
-    "#betSlipDiv input[id^='R_']",
     "#betSlipBody input[id^='R_']",
+    "#betSlipDiv input[id^='R_']",
     "input.js-kioskboard-input[id^='R_']",
     "#betSlipDiv input.txtRiskAmount",
     "#betSlipDiv input.txtWinAmount",
@@ -27,8 +27,9 @@ DEFAULT_RISK_SELECTORS: tuple[str, ...] = (
 )
 
 DEFAULT_WIN_SELECTORS: tuple[str, ...] = (
-    "#betSlipDiv input[id^='W_']",
     "#betSlipBody input[id^='W_']",
+    "#betSlipBody input.txtWinAmount",
+    "#betSlipDiv input[id^='W_']",
     "input.js-kioskboard-input[id^='W_']",
     "input[id^='win_']",
     "input[name*='win']",
@@ -53,12 +54,15 @@ def _find_stake_input(
     selectors: Sequence[str],
     scope_css: str | None = None,
 ):
-    roots = [driver]
     if scope_css:
         try:
-            roots = driver.find_elements(By.CSS_SELECTOR, scope_css) or [driver]
+            roots = driver.find_elements(By.CSS_SELECTOR, scope_css)
         except Exception:
-            roots = [driver]
+            return None
+        if not roots:
+            return None
+    else:
+        roots = [driver]
 
     for root in roots:
         for selector in selectors:

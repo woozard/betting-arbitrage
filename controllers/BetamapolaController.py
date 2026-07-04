@@ -19,7 +19,16 @@ from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines, spread_values_match
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
-from utils.ticosports_wager import click_line_via_angular, wager_network_entry_confirms, pick_looks_like_open_wager, betslip_text_confirms_wager
+from utils.ticosports_wager import (
+    click_line_via_angular,
+    wager_network_entry_confirms,
+    pick_looks_like_open_wager,
+    betslip_text_confirms_wager,
+    betamapola_wager_item_count,
+    betamapola_betslip_is_empty,
+    invoke_betamapola_process_ticket,
+    sync_betamapola_stake_models,
+)
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -507,7 +516,17 @@ class BetamapolaController:
         except Exception:
             return ""
 
+    def _betslip_wager_count(self) -> int:
+        return betamapola_wager_item_count(self.driver)
+
+    def _betslip_is_empty(self) -> bool:
+        return betamapola_betslip_is_empty(
+            self._betslip_text(), self._betslip_wager_count()
+        )
+
     def _betslip_has_spread_pick(self, team_name: str) -> bool:
+        if self._betslip_is_empty():
+            return False
         slip = self._betslip_text().lower()
         if "spread" not in slip:
             return False
@@ -523,56 +542,76 @@ class BetamapolaController:
             _find_stake_input,
         )
 
-        scope = "#betSlipDiv"
+        scope = "#betSlipBody"
         return bool(
             _find_stake_input(self.driver, DEFAULT_RISK_SELECTORS, scope)
             or _find_stake_input(self.driver, DEFAULT_WIN_SELECTORS, scope)
         )
 
     def _betslip_has_team(self, team_name: str) -> bool:
-        slip = self._betslip_text().lower()
-        if not slip or "bet slip is empty" in slip:
+        if self._betslip_is_empty():
             return False
+        slip = self._betslip_text().lower()
         if team_name.lower() in slip:
             return True
         last_word = team_name.strip().split()[-1].lower() if team_name.strip() else ""
         return bool(last_word and last_word in slip)
 
-    def _wait_for_betslip_team(self, team_name: str, timeout: int = 8) -> bool:
+    def _betslip_has_pick(self, team_name: str, bet_type: str = "moneyline") -> bool:
+        if bet_type == "spread":
+            return self._betslip_has_spread_pick(team_name)
+        return self._betslip_has_team(team_name)
+
+    def _wait_for_betslip_team(
+        self, team_name: str, timeout: int = 8, bet_type: str = "moneyline"
+    ) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self._betslip_has_spread_pick(team_name):
-                return True
-            if self._betslip_has_team(team_name) and self._betslip_stake_inputs_visible():
+            if self._betslip_wager_count() > 0 and self._betslip_has_pick(team_name, bet_type):
                 return True
             time.sleep(0.4)
         return False
 
-    def _invoke_add_line_to_bet_slip(self, elem) -> bool:
+    def _prepare_bet_slip_for_wager(self):
+        """Clear stale picks so GameLineAction adds to an empty straight bet slip."""
+        if self._betslip_is_empty():
+            return
         try:
-            return bool(self.driver.execute_script("""
-                var el = arguments[0];
-                if (!el) return false;
-                if (typeof addLineToBetSlip === 'function') {
-                    addLineToBetSlip(el);
-                    return true;
+            cleared = self.driver.execute_script("""
+                function betamapolaBetSlipScope() {
+                    var root = document.getElementById('betSlipDiv');
+                    if (!root || typeof angular === 'undefined') return null;
+                    var scope = angular.element(root).scope();
+                    while (scope) {
+                        if (typeof scope.CancelAction === 'function') return scope;
+                        scope = scope.$parent;
+                    }
+                    return null;
                 }
-                if (typeof el.onclick === 'function') {
-                    el.onclick.call(el);
-                    return true;
+                var scope = betamapolaBetSlipScope();
+                if (scope) {
+                    scope.CancelAction(true);
+                    if (scope.$apply) scope.$apply();
+                    return 'CancelAction';
                 }
-                el.click();
-                return true;
-            """, elem))
+                var btn = document.querySelector(
+                    "#betSlipDiv button[ng-click*='CancelAction'], #betSlipDiv .btn-cancelbet"
+                );
+                if (btn) { btn.click(); return 'cancel_button'; }
+                return null;
+            """)
+            if cleared:
+                self.logger.info(f"Cleared existing bet slip picks ({cleared})")
+                time.sleep(0.5)
         except Exception as e:
-            self.logger.warning(f"addLineToBetSlip failed: {e}")
-            return False
+            self.logger.warning(f"Could not clear bet slip: {e}")
 
     def _add_moneyline_to_slip(
         self, game_line: dict, team_no: int, team_name: str,
         moneyline_elem=None,
     ) -> bool:
         """Click DOM and/or Angular until the bet slip actually contains the team."""
+        self._prepare_bet_slip_for_wager()
         game_num = game_line.get("GameNum")
 
         if moneyline_elem:
@@ -581,14 +620,14 @@ class BetamapolaController:
             time.sleep(0.4)
             self.driver.execute_script("arguments[0].click();", moneyline_elem)
             self.logger.info("Moneyline element clicked")
-            if self._wait_for_betslip_team(team_name, timeout=4):
+            if self._wait_for_betslip_team(team_name, timeout=5, bet_type="moneyline"):
                 return True
             self.logger.warning(
                 f"DOM click on M{team_no}_{game_num}_0 did not populate bet slip; trying Angular"
             )
 
         if self._click_moneyline_via_angular(game_line, team_no):
-            if self._wait_for_betslip_team(team_name, timeout=6):
+            if self._wait_for_betslip_team(team_name, timeout=6, bet_type="moneyline"):
                 return True
             self.logger.warning("Angular GameLineAction did not populate bet slip")
 
@@ -730,32 +769,30 @@ class BetamapolaController:
         spread_elem=None,
     ) -> bool:
         """Click DOM and/or Angular until the bet slip contains the spread pick."""
+        self._prepare_bet_slip_for_wager()
         game_num = game_line.get("GameNum")
 
         if spread_elem:
             self.logger.info(f"Spread element located: {spread_elem.get_attribute('id')}")
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", spread_elem)
             time.sleep(0.4)
-            if self._invoke_add_line_to_bet_slip(spread_elem):
-                if self._wait_for_betslip_team(team_name, timeout=5):
-                    return True
             self.driver.execute_script("arguments[0].click();", spread_elem)
             self.logger.info("Spread element clicked")
-            if self._wait_for_betslip_team(team_name, timeout=4):
+            if self._wait_for_betslip_team(team_name, timeout=5, bet_type="spread"):
                 return True
             self.logger.warning(
                 f"DOM click on S{team_no}_{game_num}_0 did not populate bet slip; trying Angular"
             )
 
         if click_line_via_angular(self.driver, game_line, team_no, "S"):
-            if self._wait_for_betslip_team(team_name, timeout=6):
+            if self._wait_for_betslip_team(team_name, timeout=6, bet_type="spread"):
                 return True
             self.logger.warning("Angular GameLineAction (spread) did not populate bet slip")
 
         btn = self._wait_for_spread_button(game_num, team_no, timeout=3)
         if btn:
             self.driver.execute_script("arguments[0].click();", btn)
-            if self._wait_for_betslip_team(team_name, timeout=4):
+            if self._wait_for_betslip_team(team_name, timeout=4, bet_type="spread"):
                 return True
 
         return False
@@ -1739,10 +1776,26 @@ class BetamapolaController:
     def _accept_line_changes(self):
         accepted = False
         try:
-            for cb in self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"):
-                cb_id = (cb.get_attribute("id") or "").lower()
-                cb_class = (cb.get_attribute("class") or "").lower()
-                if "accept" in cb_id or "accept" in cb_class:
+            for cb in self.driver.find_elements(
+                By.CSS_SELECTOR, "#betSlipDiv input[type='checkbox'], #betSlipBody input[type='checkbox']"
+            ):
+                label_bits = " ".join(
+                    filter(
+                        None,
+                        (
+                            cb.get_attribute("id") or "",
+                            cb.get_attribute("class") or "",
+                            cb.get_attribute("ng-model") or "",
+                        ),
+                    )
+                ).lower()
+                nearby = ""
+                try:
+                    parent = cb.find_element(By.XPATH, "./..")
+                    nearby = (parent.text or "").lower()
+                except Exception:
+                    pass
+                if "accept" in label_bits or "accept" in nearby or "auto accept" in nearby:
                     if not cb.is_selected():
                         self.driver.execute_script("arguments[0].click();", cb)
                         accepted = True
@@ -1762,6 +1815,66 @@ class BetamapolaController:
         if accepted:
             self.logger.info("Accepted line changes / odds update prompts")
         return accepted
+
+    def _fill_betamapola_stake(self, stake_plan) -> bool:
+        if self._betslip_is_empty():
+            self.logger.warning("Cannot enter stake: bet slip has no wager items")
+            return False
+
+        filled = fill_betslip_stake_input(
+            self.driver,
+            stake_plan,
+            self.logger,
+            scope_css="#betSlipBody",
+        )
+        if filled:
+            time.sleep(0.3)
+            sync_betamapola_stake_models(
+                self.driver,
+                stake_plan.risk,
+                stake_plan.to_win,
+                stake_plan.entry_field,
+            )
+            return True
+
+        self.logger.warning(
+            "Bet slip stake inputs not found in DOM; trying Angular ticket models"
+        )
+        return sync_betamapola_stake_models(
+            self.driver,
+            stake_plan.risk,
+            stake_plan.to_win,
+            stake_plan.entry_field,
+        )
+
+    def _click_process_ticket(self) -> bool:
+        self._accept_line_changes()
+        submitted = invoke_betamapola_process_ticket(self.driver)
+        if submitted == "ProcessTicket":
+            self.logger.info("ProcessTicket invoked via Angular betSlipController")
+            return True
+        if submitted == "unsafe":
+            self.logger.warning(
+                "ProcessTicket blocked: IsSafeToPostTicket() is false after stake entry"
+            )
+
+        place_btn = None
+        for b in self.driver.find_elements(By.CSS_SELECTOR, "#betSlipDiv button, #betSlipDiv a"):
+            ng_click = (b.get_attribute("ng-click") or "").lower()
+            if "processticket" in ng_click or "place bet" in (b.text or "").lower():
+                place_btn = b
+                break
+        if not place_btn:
+            return False
+
+        btn_class = (place_btn.get_attribute("class") or "").lower()
+        if "btn-disabled" in btn_class or place_btn.get_attribute("disabled"):
+            self.logger.warning("Place Bet button is disabled")
+            return False
+
+        self.driver.execute_script("arguments[0].click();", place_btn)
+        self.logger.info("Place Bet clicked (DOM fallback)")
+        return True
 
     def _betslip_shows_wager_confirmed(self) -> bool:
         return betslip_text_confirms_wager(self._betslip_text())
@@ -2004,8 +2117,8 @@ class BetamapolaController:
 
             if not add_to_slip():
                 time.sleep(1.0)
-                if bet_type == "spread" and self._betslip_has_spread_pick(team_name):
-                    self.logger.info("Spread pick present in bet slip after delayed render")
+                if self._betslip_has_pick(team_name, bet_type):
+                    self.logger.info(f"{bet_type.title()} pick present in bet slip after delayed render")
                 else:
                     slip_preview = self._betslip_text()[:200]
                     raise Exception(
@@ -2013,25 +2126,19 @@ class BetamapolaController:
                         f"(GameNum={game_num}): {slip_preview or missing_line_msg}"
                     )
 
+            if not self._betslip_has_pick(team_name, bet_type):
+                raise Exception(
+                    f"Bet slip missing {bet_type} pick for {team_name}: "
+                    f"{self._betslip_text()[:200]}"
+                )
+
             limits_text = self._betslip_text()
             self.logger.info(f"Bet slip populated: {limits_text[:200]}")
 
-            if not fill_betslip_stake_input(
-                self.driver, stake_plan, self.logger, scope_css="#betSlipDiv"
-            ):
+            if not self._fill_betamapola_stake(stake_plan):
                 raise Exception("Could not locate bet slip stake input for base amount")
 
             self._accept_line_changes()
-
-            # Click Place Bet (ng-click=ProcessTicket() or text)
-            place_btn = None
-            for b in self.driver.find_elements(By.CSS_SELECTOR, "#betSlipDiv button, #betSlipDiv a"):
-                if "place bet" in b.text.lower() or "process" in (b.get_attribute("ng-click") or "").lower():
-                    place_btn = b
-                    break
-
-            if not place_btn:
-                raise Exception("Place Bet button not found")
 
             if self._page_has_login_required_marker():
                 self._invalidate_wager_session()
@@ -2039,8 +2146,8 @@ class BetamapolaController:
 
             self._install_wager_network_hook()
             self._accept_line_changes()
-            self.driver.execute_script("arguments[0].click();", place_btn)
-            self.logger.info("Place Bet clicked")
+            if not self._click_process_ticket():
+                raise Exception("Place Bet button not found or disabled")
             network_log = self._get_wager_network_log()
             if network_log:
                 self.logger.info(f"Wager network activity after click: {network_log[-3:]}")
