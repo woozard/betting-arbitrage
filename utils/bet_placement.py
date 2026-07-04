@@ -6,6 +6,7 @@ import threading
 from utils.config import (
     REAL_MONEY_BETTING_ENABLED,
     SPREAD_REAL_MONEY_BETTING_ENABLED,
+    BETAMAPOLA_REAL_MONEY_BETTING_ENABLED,
     SEQUENTIAL_ARB_BETTING,
     TELEGRAM_ALERTS_ASYNC,
     SECOND_LEG_ODDS_TOLERANCE,
@@ -32,6 +33,9 @@ from utils.helpers import (
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake, base_amount_stake_from_odds
 
 REAL_MONEY_BETTING_PAUSED_MSG = "Real money betting paused (REAL_MONEY_BETTING_ENABLED=false)"
+BETAMAPOLA_REAL_MONEY_PAUSED_MSG = (
+    "Betamapola real-money betting paused (BETAMAPOLA_REAL_MONEY_BETTING_ENABLED=false)"
+)
 SPREAD_BETTING_PAUSED_MSG = (
     "Spread real-money betting disabled (SPREAD_REAL_MONEY_BETTING_ENABLED=false)"
 )
@@ -62,9 +66,18 @@ def should_skip_spread_arb_for_placement(
     return True
 
 
-def block_real_money_bet(logger, stake: float, bet_type: str = "moneyline"):
+def block_real_money_bet(
+    logger,
+    stake: float,
+    bet_type: str = "moneyline",
+    bookmaker: str | None = None,
+):
     """Return (False, stake) when real-money betting is paused; else None."""
     bt = (bet_type or "moneyline").lower()
+    bm = (bookmaker or "").strip().lower()
+    if bm == "betamapola" and not BETAMAPOLA_REAL_MONEY_BETTING_ENABLED:
+        logger.info(BETAMAPOLA_REAL_MONEY_PAUSED_MSG)
+        return False, float(stake)
     if bt == "spread" and not spread_real_money_betting_enabled():
         logger.info(SPREAD_BETTING_PAUSED_MSG)
         return False, float(stake)
@@ -79,6 +92,8 @@ def should_notify_failed_bet(last_error: str | None) -> bool:
     if not last_error:
         return True
     if last_error.startswith("Real money betting paused"):
+        return False
+    if last_error.startswith("Betamapola real-money betting paused"):
         return False
     return not last_error.startswith("Spread real-money betting disabled")
 

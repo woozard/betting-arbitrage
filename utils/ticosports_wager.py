@@ -219,10 +219,12 @@ def sync_betamapola_stake_models(driver, risk: float, to_win: float, entry_field
                     item.ToWinAmount = toWin;
                     item.WinAmount = toWin;
                     item.ToWin = toWin;
+                    item.AmountEntered = toWin;
                     if (typeof calculateBStxtRisk === 'function') calculateBStxtRisk();
                 } else {
                     item.RiskAmount = risk;
                     item.Risk = risk;
+                    item.AmountEntered = risk;
                     if (typeof calculateBStxtWin === 'function') calculateBStxtWin();
                 }
                 if (scope.$apply) scope.$apply();

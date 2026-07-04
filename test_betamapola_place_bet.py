@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """One-off Betamapola placement test via GetSportOffering API."""
 import argparse
+import os
 import sys
 import time
+
+if "--api-only" in sys.argv:
+    os.environ["BETAMAPOLA_API_PLACEMENT"] = "true"
 
 from cache.arbitrage_cache import ArbitrageCache
 from controllers.BetamapolaController import BetamapolaController
@@ -30,6 +34,11 @@ def main():
     parser.add_argument("--stake", type=float, default=20.0)
     parser.add_argument("--team-name", required=True)
     parser.add_argument("--list-only", action="store_true")
+    parser.add_argument(
+        "--api-only",
+        action="store_true",
+        help="Force BETAMAPOLA_API_PLACEMENT=true for this run",
+    )
     args = parser.parse_args()
 
     if not BETAMAPOLA_ACCOUNT or not BETAMAPOLA_PASSWORD:
@@ -42,6 +51,8 @@ def main():
         label=BETAMAPOLA_LABEL,
     )
     controller = BetamapolaController(account, BETAMAPOLA, sport="baseball")
+    if args.api_only:
+        controller.API_PLACEMENT_ENABLED = True
     logger = Logger.get_logger("amapola-placement-test")
     storage = Storage(logger)
     cache = ArbitrageCache()

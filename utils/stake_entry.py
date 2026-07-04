@@ -118,22 +118,25 @@ def fill_betslip_stake_input(
         stake_input.clear()
         stake_input.send_keys(amount_str)
     except Exception:
-        recalc_line = ""
-        if recalc_fn:
-            recalc_line = f"if (typeof {recalc_fn} === 'function') {recalc_fn}(el);"
-        driver.execute_script(
-            f"""
-            var el = arguments[0];
-            var val = arguments[1];
-            el.focus();
-            el.value = val;
-            el.dispatchEvent(new Event('input', {{bubbles: true}}));
-            el.dispatchEvent(new Event('change', {{bubbles: true}}));
-            {recalc_line}
-            """,
-            stake_input,
-            amount_str,
-        )
+        pass
+
+    recalc_line = ""
+    if recalc_fn:
+        recalc_line = f"if (typeof {recalc_fn} === 'function') {recalc_fn}(el);"
+    driver.execute_script(
+        f"""
+        var el = arguments[0];
+        var val = arguments[1];
+        el.focus();
+        el.value = val;
+        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        el.dispatchEvent(new Event('keyup', {{bubbles: true}}));
+        {recalc_line}
+        """,
+        stake_input,
+        amount_str,
+    )
     field_label = "to-win" if entry_stake.entry_field == "to_win" else "risk"
     logger.info(
         f"Base-amount stake entered in {field_label}: {amount_str} "

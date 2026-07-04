@@ -14,7 +14,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
+from utils.config import (
+    PROXY1,
+    PROXY2,
+    TELEGRAM,
+    ZENROWS_API_KEY,
+    is_active_arb_pair,
+    BETAMAPOLA_API_PLACEMENT,
+)
+from utils.betamapola_wager_api import (
+    accept_betamapola_line_changes,
+    betamapola_process_ticket_via_api,
+    click_line_via_dom_button,
+    ensure_betamapola_stake_ready,
+    parse_process_ticket_response,
+    wait_for_angular_game_lines,
+    wait_for_betamapola_wager_items,
+)
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines, spread_values_match
@@ -65,6 +81,7 @@ class BetamapolaController:
     ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("BETAMAPOLA_ODDS_FORCE_SCAN_SEC", "5"))
     ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_IDLE_POLL_SEC", "5"))
     ODDS_OBSERVER_SELECTORS = ["#GameLines", "#gamesAccordion", "#GameLinesCtrl"]
+    API_PLACEMENT_ENABLED = BETAMAPOLA_API_PLACEMENT
 
     # ===================================================================
     # Betamapola.com - uses identical browser/scraping stack as Sports411
@@ -1950,6 +1967,186 @@ class BetamapolaController:
             return False, "Place Bet still visible — wager not submitted"
         return False, "Bet not confirmed by bookmaker"
 
+    def _confirm_bet_accepted_fast(
+        self,
+        team_name: str,
+        team_1: str,
+        team_2: str,
+        process_data: dict | None = None,
+        timeout: int = 12,
+    ):
+        """API-first confirmation: ProcessTicket response, then GetWagerPicks."""
+        if process_data:
+            ok, ticket_number, msg = parse_process_ticket_response(process_data)
+            if ok and ticket_number and int(ticket_number) > 0:
+                return True, msg
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rejected, reject_msg = self._scan_rejection_ui()
+            if rejected:
+                if self._message_requires_relogin(reject_msg):
+                    self._invalidate_wager_session()
+                return False, reject_msg
+
+            for pick in self._fetch_open_wagers_via_api():
+                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
+                    return True, "Open wager found via GetWagerPicks"
+
+            if self._betslip_shows_wager_confirmed():
+                return True, "Bet slip shows wager confirmed"
+
+            time.sleep(0.25)
+
+        for attempt in range(1, 4):
+            for pick in self._fetch_open_wagers_via_api():
+                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
+                    return True, "Open wager found via GetWagerPicks (retry)"
+            if attempt < 3:
+                time.sleep(2)
+        return False, "Bet not confirmed via API within timeout"
+
+    def _execute_bet_attempt_api(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd: str,
+        stake: float = 1.0,
+        team_1: str = None,
+        team_2: str = None,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
+    ):
+        """Fast path: API line lookup, Angular pick/stake, ProcessTicket HTTP."""
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+        market_label = (
+            f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+        )
+        self.logger.info(
+            f"API placement | Game ID: {game_id} | Team: {team_name} | "
+            f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+        )
+
+        self._refresh_session_before_wager()
+
+        game_line, team_no = self._lookup_game_line_from_api(
+            game_id, team_name, team_1=team_1, team_2=team_2
+        )
+        if not game_line:
+            self.__ensure_sport_offering_loaded(fast=True)
+            game_line, team_no = self._lookup_game_line_from_api(
+                game_id, team_name, team_1=team_1, team_2=team_2
+            )
+        if not game_line:
+            raise Exception(
+                f"Game {game_id} ({team_name}) not found in live {self.sport_name} API offering"
+            )
+
+        game_num = game_line.get("GameNum")
+        self.logger.info(
+            f"API resolved GameNum={game_num}, team_no={team_no}, "
+            f"rot={game_line.get('Team1RotNum')}-{game_line.get('Team2RotNum')}"
+        )
+
+        if bet_type == "spread":
+            live_odds = game_line.get(f"SpreadAdj{team_no}")
+            if live_odds is not None and not self._odds_text_matches(str(live_odds), moneyline_odd):
+                raise Exception(
+                    f"Line moved: live spread odds {live_odds} differ from arb odds {moneyline_odd}"
+                )
+            if spread_line is not None:
+                spread_val = game_line.get("Spread")
+                team_1_spread, team_2_spread = resolve_ticosports_spread_lines(
+                    spread_val, game_line.get("MoneyLine1"), game_line.get("MoneyLine2")
+                )
+                live_spread = team_1_spread if team_no == 1 else team_2_spread
+                if live_spread is not None and not spread_values_match(live_spread, spread_line):
+                    raise Exception(
+                        f"Spread line moved: live {live_spread} differs from arb {spread_line}"
+                    )
+
+        dom_ready = False
+        if bet_type == "moneyline" and game_num and team_no:
+            dom_ready = bool(self._wait_for_moneyline_button(game_num, team_no, timeout=3))
+        elif bet_type == "spread" and game_num and team_no:
+            dom_ready = bool(self._wait_for_spread_button(game_num, team_no, timeout=3))
+
+        angular_ready = wait_for_angular_game_lines(self.driver, timeout=4)
+        if not angular_ready and not dom_ready:
+            self.logger.info("Pick paths not ready; loading full sport offering")
+            self.__ensure_sport_offering_loaded(game_num=game_num, team_no=team_no)
+            angular_ready = wait_for_angular_game_lines(self.driver, timeout=10)
+            if bet_type == "moneyline" and game_num and team_no:
+                dom_ready = bool(self._wait_for_moneyline_button(game_num, team_no, timeout=5))
+            elif bet_type == "spread" and game_num and team_no:
+                dom_ready = bool(self._wait_for_spread_button(game_num, team_no, timeout=5))
+
+        if not angular_ready and not dom_ready:
+            raise Exception("Neither Angular GameLineAction nor DOM line button is available")
+
+        self._prepare_bet_slip_for_wager()
+        if bet_type == "spread":
+            if not self._add_spread_to_slip(game_line, team_no, team_name):
+                raise Exception(f"Could not add spread pick for {team_name} (GameNum={game_num})")
+        elif not self._add_moneyline_to_slip(game_line, team_no, team_name):
+            raise Exception(f"Could not add moneyline pick for {team_name} (GameNum={game_num})")
+
+        wager_count = wait_for_betamapola_wager_items(self.driver, min_count=1, timeout=3.0)
+        if wager_count < 1:
+            raise Exception(
+                f"Bet slip has no wager items after pick for {team_name}"
+            )
+
+        if not self._fill_betamapola_stake(stake_plan):
+            raise Exception("Could not set stake on bet slip")
+
+        if not ensure_betamapola_stake_ready(
+            self.driver,
+            stake_plan.risk,
+            stake_plan.to_win,
+            stake_plan.entry_field,
+            timeout=3.0,
+        ):
+            self.logger.warning("Angular stake models not confirmed safe; retrying after line accept")
+
+        if accept_betamapola_line_changes(self.driver):
+            self.logger.info("Accepted line changes after stake entry")
+            self._fill_betamapola_stake(stake_plan)
+            ensure_betamapola_stake_ready(
+                self.driver,
+                stake_plan.risk,
+                stake_plan.to_win,
+                stake_plan.entry_field,
+                timeout=3.0,
+            )
+
+        if self._page_has_login_required_marker():
+            self._invalidate_wager_session()
+            raise Exception("Rejection marker on page: please log in")
+
+        posted, process_data, post_msg = betamapola_process_ticket_via_api(self.driver)
+        if not posted:
+            raise Exception(post_msg or "ProcessTicket API failed")
+
+        self.logger.info(f"ProcessTicket submitted: {post_msg}")
+        process_payload = None
+        if isinstance(process_data, dict):
+            process_payload = process_data
+
+        matchup_1 = team_1 or game_line.get("Team1ID") or ""
+        matchup_2 = team_2 or game_line.get("Team2ID") or ""
+        confirmed, message = self._confirm_bet_accepted_fast(
+            team_name,
+            matchup_1,
+            matchup_2,
+            process_data=process_payload,
+        )
+        if not confirmed:
+            raise Exception(message or "Bet not accepted by bookmaker")
+
+        self.logger.info(f"Bet accepted by bookmaker (API path): {message}")
+        return True, stake_plan
+
     # --------------------------------------------------------
     # Execute Bet (adapted for Betamapola /sports#/ SPA + betSlipDiv)
     # --------------------------------------------------------
@@ -1966,7 +2163,9 @@ class BetamapolaController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
-        blocked = block_real_money_bet(self.logger, stake, bet_type=bet_type)
+        blocked = block_real_money_bet(
+            self.logger, stake, bet_type=bet_type, bookmaker=self.bookmaker
+        )
         if blocked is not None:
             self._last_bet_error = REAL_MONEY_BETTING_PAUSED_MSG
             return blocked
@@ -1977,6 +2176,18 @@ class BetamapolaController:
                 try:
                     if attempt > 1:
                         self.logger.info(f"Retrying wager after re-login (attempt {attempt}/2)")
+                    if self.API_PLACEMENT_ENABLED:
+                        try:
+                            return self._execute_bet_attempt_api(
+                                game_id, team_name, moneyline_odd, stake,
+                                team_1=team_1, team_2=team_2,
+                                bet_type=bet_type,
+                                spread_line=spread_line,
+                            )
+                        except Exception as api_exc:
+                            self.logger.warning(
+                                f"API placement failed ({api_exc}); falling back to DOM path"
+                            )
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
@@ -2146,7 +2357,6 @@ class BetamapolaController:
                 raise Exception("Rejection marker on page: please log in")
 
             self._install_wager_network_hook()
-            self._accept_line_changes()
             if not self._click_process_ticket():
                 raise Exception("Place Bet button not found or disabled")
             network_log = self._get_wager_network_log()

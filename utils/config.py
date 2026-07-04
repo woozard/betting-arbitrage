@@ -90,6 +90,10 @@ BET_STAKE = float(os.getenv('BET_STAKE', '20'))
 REAL_MONEY_BETTING_ENABLED = os.getenv('REAL_MONEY_BETTING_ENABLED', 'true').lower() in (
     '1', 'true', 'yes',
 )
+# Per-book real-money gate (Betamapola paused while account/placement issues are investigated).
+BETAMAPOLA_REAL_MONEY_BETTING_ENABLED = os.getenv(
+    'BETAMAPOLA_REAL_MONEY_BETTING_ENABLED', 'false'
+).lower() in ('1', 'true', 'yes')
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in (
     '1', 'true', 'yes',
 )
@@ -152,6 +156,11 @@ INLINE_ARB_SCAN_ENABLED = os.getenv("INLINE_ARB_SCAN_ENABLED", "true").lower() i
 BET_WAKE_BLPOP_MS = int(os.getenv("BET_WAKE_BLPOP_MS", "50"))
 BETTING_IDLE_POLL_SECONDS = float(os.getenv("BETTING_IDLE_POLL_SEC", "5"))
 
+# Betamapola: Angular pick + ProcessTicket HTTP (skip DOM bet-slip UI when possible).
+BETAMAPOLA_API_PLACEMENT = os.getenv("BETAMAPOLA_API_PLACEMENT", "true").lower() in (
+    "1", "true", "yes",
+)
+
 # Ops health agent — staleness thresholds and remediation cooldowns.
 OPS_ODDS_STALE_SECONDS = int(os.getenv("OPS_ODDS_STALE_SEC", "90"))
 OPS_ARB_SCAN_STALE_SECONDS = int(os.getenv("OPS_ARB_SCAN_STALE_SEC", "30"))
@@ -168,11 +177,10 @@ ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
-        "sports411:betwar,betamapola:betwar,paradisewager:betwar,"
-        "sports411:lowvig,betamapola:lowvig,paradisewager:lowvig,betwar:lowvig,"
-        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et,"
-        "sports411:4casters,betamapola:4casters,paradisewager:4casters,"
+        "sports411:paradisewager,sports411:betwar,paradisewager:betwar,"
+        "sports411:lowvig,paradisewager:lowvig,betwar:lowvig,"
+        "sports411:3et,paradisewager:3et,betwar:3et,"
+        "sports411:4casters,paradisewager:4casters,"
         "betwar:4casters,lowvig:4casters,3et:4casters",
     ).split(",")
     if part.strip() and ":" in part
@@ -181,11 +189,10 @@ ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
     (parts[0].strip().lower(), parts[1].strip().lower())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,sports411:paradisewager,"
-        "sports411:betwar,betamapola:betwar,paradisewager:betwar,"
-        "sports411:lowvig,betamapola:lowvig,paradisewager:lowvig,betwar:lowvig,"
-        "sports411:3et,betamapola:3et,paradisewager:3et,betwar:3et,"
-        "sports411:4casters,betamapola:4casters,paradisewager:4casters,"
+        "sports411:paradisewager,sports411:betwar,paradisewager:betwar,"
+        "sports411:lowvig,paradisewager:lowvig,betwar:lowvig,"
+        "sports411:3et,paradisewager:3et,betwar:3et,"
+        "sports411:4casters,paradisewager:4casters,"
         "betwar:4casters,lowvig:4casters,3et:4casters",
     ).split(",")
     if part.strip() and ":" in part

@@ -22,10 +22,11 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 20
 
-  - name: betamapola_betting
-    script: betamapola_betting.py
-    interval_seconds: 30
-    start_offset_seconds: 30
+  # Betamapola real-money paused — re-enable in jobs.yml when account/placement is fixed.
+  # - name: betamapola_betting
+  #   script: betamapola_betting.py
+  #   interval_seconds: 30
+  #   start_offset_seconds: 30
 
   - name: betwar_betting
     script: betwar_betting.py
