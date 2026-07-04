@@ -9,10 +9,11 @@ from utils.config import (
     SEQUENTIAL_ARB_BETTING,
     TELEGRAM_ALERTS_ASYNC,
     SECOND_LEG_ODDS_TOLERANCE,
+    BET_STAKE,
     arb_pair_legs,
     required_first_leg_book,
 )
-from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS
+from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS, arb_leg_for_book
 from utils.arb_real_bets_summary import (
     record_confirmed_leg,
     schedule_complete_summary,
@@ -25,9 +26,10 @@ from utils.helpers import (
     format_arb_complete_alert,
     format_american_alert_odds,
     normalize_spread_value,
+    american_odds_to_int,
     BOOK_ALERT_LABELS,
 )
-from utils.stake_sizing import BaseAmountStake, format_base_amount_stake
+from utils.stake_sizing import BaseAmountStake, format_base_amount_stake, base_amount_stake_from_odds
 
 REAL_MONEY_BETTING_PAUSED_MSG = "Real money betting paused (REAL_MONEY_BETTING_ENABLED=false)"
 SPREAD_BETTING_PAUSED_MSG = (
@@ -174,6 +176,86 @@ def _alerts_telegram_chat(telegram_config: dict):
     return telegram_config.get("arbitrage")
 
 
+_API_RECEIPT_SCREENSHOT_BOOKS = frozenset({"4casters", "3et", "paradisewager"})
+
+
+def _dispatch_other_api_leg_screenshot(
+    cache,
+    logger,
+    arb: dict,
+    bookmaker: str,
+    telegram_config: dict,
+) -> None:
+    """When the second leg completes, send the other API book's receipt if it was placed earlier."""
+    from utils.bet_screenshot import bet_screenshot_path, render_bet_receipt
+
+    bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    other_book = book_2 if bookmaker == book_1 else book_1
+    other_bm = (other_book or "").strip().lower()
+    if other_bm not in _API_RECEIPT_SCREENSHOT_BOOKS:
+        return
+
+    other_game_id = (
+        arb["team_2_game_id"] if bookmaker == arb["team_1_bookmaker"] else arb["team_1_game_id"]
+    )
+    if not cache.is_leg_placed(other_book, bet_type, other_game_id):
+        return
+
+    leg = arb_leg_for_book(arb, other_book)
+    if not leg:
+        return
+
+    pair_key = cache.arb_pair_key_from_arb(arb)
+    summary = cache.redis.get(f"arb_real_bets_summary:{pair_key}") or {}
+    side = "leg1" if other_bm == (arb.get("team_1_bookmaker") or "").strip().lower() else "leg2"
+    leg_data = summary.get(side) or {}
+
+    team_name = leg_data.get("team_name") or leg.get("team_name")
+    odds = leg_data.get("odds") if leg_data.get("odds") is not None else leg.get("odds")
+    risk = leg_data.get("risk")
+    to_win = leg_data.get("to_win")
+    if risk is not None and to_win is not None:
+        stake = BaseAmountStake(
+            base_amount=float(leg_data.get("base_amount") or BET_STAKE),
+            american_odds=american_odds_to_int(odds),
+            entry_field="risk",
+            entry_amount=float(risk),
+            risk=float(risk),
+            to_win=float(to_win),
+        )
+    else:
+        stake = base_amount_stake_from_odds(odds, BET_STAKE)
+
+    spread_line = leg.get("spread_line") if bet_type == "spread" else None
+    path = bet_screenshot_path(other_book, other_game_id)
+    shot = render_bet_receipt(
+        path,
+        other_book,
+        team_1=arb.get("team_1") or "",
+        team_2=arb.get("team_2") or "",
+        team_name=team_name,
+        odds=odds,
+        stake=stake,
+        bet_type=bet_type,
+        spread_line=spread_line,
+        logger=logger,
+    )
+    if not shot:
+        return
+
+    screenshots_chat = _screenshots_telegram_chat(telegram_config)
+    _dispatch_ops_alert(
+        logger,
+        "",
+        screenshots_chat,
+        label="Leg Screenshot (deferred)",
+        photo_path=shot,
+        photo_only=True,
+    )
+
+
 def _real_bets_telegram_chat(telegram_config: dict):
     """Single compact summary per arb (complete or failed)."""
     return telegram_config.get("real_bets")
@@ -297,13 +379,7 @@ def should_pause_first_leg_for_exposure(
     if arb is None:
         return cache.has_partial_exposure()
 
-    pair_key = cache.matchup_pair_key(
-        arb.get("team_1"),
-        arb.get("team_2"),
-        book_1,
-        book_2,
-        arb.get("game_date"),
-    )
+    pair_key = cache.arb_pair_key_from_arb(arb)
     if not cache.has_partial_exposure_for_pair(pair_key):
         return False
 
@@ -437,7 +513,7 @@ def maybe_notify_partial_arb_exposure(
     game_date = arb.get("game_date")
     team_1 = arb.get("team_1")
     team_2 = arb.get("team_2")
-    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    pair_key = cache.arb_pair_key_from_arb(arb)
 
     if cache.partial_arb_alert_already_sent(pair_key):
         return
@@ -526,10 +602,15 @@ def finalize_confirmed_bet(
     bet_type = arb.get("bet_type", "moneyline")
     book_1 = arb.get("team_1_bookmaker")
     book_2 = arb.get("team_2_bookmaker")
-    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    pair_key = cache.arb_pair_key_from_arb(arb)
+    event_date = cache.event_date_for_arb(arb)
+    spread_value = arb.get("spread_value") if bet_type == "spread" else None
 
     cache.mark_leg_placed(bookmaker, bet_type, game_id)
-    cache.lock_arb_scan(team_1, team_2, book_1, book_2, game_date)
+    cache.lock_arb_scan(
+        team_1, team_2, book_1, book_2, event_date,
+        bet_type=bet_type, spread_value=spread_value,
+    )
 
     other_book = book_2 if bookmaker == book_1 else book_1
     other_game_id = (
@@ -607,6 +688,9 @@ def finalize_confirmed_bet(
         )
 
     if other_leg_placed:
+        _dispatch_other_api_leg_screenshot(
+            cache, logger, arb, bookmaker, telegram_config
+        )
         schedule_complete_summary(cache, logger, arb, telegram_config)
         return
 

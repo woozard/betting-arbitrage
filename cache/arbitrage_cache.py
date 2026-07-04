@@ -121,6 +121,37 @@ class ArbitrageCache:
         self.redis.delete(key)
 
     @staticmethod
+    def event_date_for_arb(arb: dict) -> str:
+        """Slate date for pair keys (Eastern for MLB), stable across UTC midnight."""
+        from utils.helpers import parse_game_datetime
+
+        gdt_raw = (arb or {}).get("game_datetime")
+        if gdt_raw:
+            gdt = parse_game_datetime(gdt_raw)
+            if gdt:
+                import pytz
+
+                eastern = pytz.timezone("America/New_York")
+                utc = pytz.utc.localize(gdt)
+                return utc.astimezone(eastern).strftime("%Y-%m-%d")
+        gd = (arb or {}).get("game_date")
+        return str(gd)[:10] if gd else ""
+
+    @staticmethod
+    def arb_pair_key_from_arb(arb: dict) -> str:
+        bet_type = ((arb or {}).get("bet_type") or "moneyline").strip().lower()
+        spread_value = (arb or {}).get("spread_value") if bet_type == "spread" else None
+        return ArbitrageCache.matchup_pair_key(
+            (arb or {}).get("team_1"),
+            (arb or {}).get("team_2"),
+            (arb or {}).get("team_1_bookmaker"),
+            (arb or {}).get("team_2_bookmaker"),
+            ArbitrageCache.event_date_for_arb(arb),
+            bet_type=bet_type,
+            spread_value=spread_value,
+        )
+
+    @staticmethod
     def matchup_pair_key(team_1, team_2, book_1, book_2, game_date=None, bet_type=None, spread_value=None):
         teams = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
         books = tuple(sorted([(book_1 or "").strip().lower(), (book_2 or "").strip().lower()]))

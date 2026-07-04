@@ -184,6 +184,14 @@ def _dispatch_real_bets_summary(
     return True
 
 
+def _summary_outcome(data: dict) -> str:
+    leg1 = data.get("leg1") or {}
+    leg2 = data.get("leg2") or {}
+    if leg1.get("placed") and leg2.get("placed"):
+        return "complete"
+    return "failed"
+
+
 def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config: dict) -> None:
     logger.info(f"Publishing Real Bets summary | pair_key={pair_key} outcome={outcome}")
 
@@ -213,16 +221,15 @@ def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config
 def schedule_complete_summary(cache, logger, arb: dict, telegram_config: dict) -> None:
     team_1 = arb.get("team_1")
     team_2 = arb.get("team_2")
-    book_1 = arb.get("team_1_bookmaker")
-    book_2 = arb.get("team_2_bookmaker")
-    game_date = arb.get("game_date")
-    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    pair_key = cache.arb_pair_key_from_arb(arb)
 
     _store_arb_snapshot(cache, pair_key, arb)
     delay = max(0.0, float(REAL_BETS_SUMMARY_DELAY_SEC))
 
     def _run():
-        _publish_summary(cache, logger, pair_key, "complete", telegram_config)
+        data = cache.redis.get(_summary_redis_key(pair_key)) or {}
+        outcome = _summary_outcome(data)
+        _publish_summary(cache, logger, pair_key, outcome, telegram_config)
 
     logger.info(
         f"Scheduling Real Bets complete summary in {delay:.0f}s | {team_1} vs {team_2}"
@@ -240,10 +247,7 @@ def schedule_failed_summary(
 ) -> None:
     team_1 = arb.get("team_1")
     team_2 = arb.get("team_2")
-    book_1 = arb.get("team_1_bookmaker")
-    book_2 = arb.get("team_2_bookmaker")
-    game_date = arb.get("game_date")
-    pair_key = cache.matchup_pair_key(team_1, team_2, book_1, book_2, game_date)
+    pair_key = cache.arb_pair_key_from_arb(arb)
 
     _store_arb_snapshot(cache, pair_key, arb)
     record_failed_leg(cache, pair_key, arb, failed_bookmaker, reason)
