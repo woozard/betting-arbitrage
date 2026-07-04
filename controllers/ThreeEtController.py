@@ -5,6 +5,7 @@ from datetime import datetime
 
 from cache.arbitrage_cache import ArbitrageCache
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
+from utils.betting_loop import wait_for_arb_or_idle
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -897,20 +898,25 @@ class ThreeEtController:
             return
 
         self._exposure_cleanup_at = 0.0
+        last_idle_poll_at = 0.0
         while True:
             watchdog.beat()
             self._exposure_cleanup_at = tick_exposure_cleanup(
                 self.cache, self.logger, self._exposure_cleanup_at
             )
-            time.sleep(2)
 
             arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
             if not arbs:
-                self._maybe_poll_odds_while_idle()
+                _, last_idle_poll_at = wait_for_arb_or_idle(
+                    self.cache,
+                    self.bookmaker,
+                    idle_poll_fn=self._maybe_poll_odds_while_idle,
+                    last_idle_poll_at=last_idle_poll_at,
+                )
                 self.logger.info("Waiting for Arbitrage")
                 continue
 
-            self.logger.info(f"Arbitrage opportunities: {len(arbs)}")
+            self.logger.info(f"Arbitrage opportunities: {len(arbs)} — pausing odds scan for placement")
             for arb in arbs:
                 sport = arb.get("sport")
                 league = arb.get("league")

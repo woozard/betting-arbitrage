@@ -24,6 +24,7 @@ from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, extract_spread_line_odds_from_label, spread_values_match
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
+from utils.betting_loop import wait_for_arb_or_idle
 from utils.odds_watch import persist_moneyline_games
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
@@ -2725,6 +2726,7 @@ class Sports411Controller:
         consecutive_recoveries = 0
         consecutive_soft_nav_failures = 0
         self._exposure_cleanup_at = 0.0
+        last_idle_poll_at = 0.0
         while True:
             watchdog.beat()
             self._exposure_cleanup_at = tick_exposure_cleanup(
@@ -2810,13 +2812,21 @@ class Sports411Controller:
                 if arb.get("sport") == self.sport_name and arb.get("league") == self.league
             ]
             if not matching_arbs:
-                last_force_scan, processed = self._tick_odds_watch_once(
-                    last_force_scan,
-                    force_scan_interval,
-                    idle_label="betting-idle",
+                def _idle_odds_tick():
+                    nonlocal last_force_scan
+                    last_force_scan, _processed = self._tick_odds_watch_once(
+                        last_force_scan,
+                        force_scan_interval,
+                        idle_label="betting-idle",
+                    )
+
+                _, last_idle_poll_at = wait_for_arb_or_idle(
+                    self.cache,
+                    self.bookmaker,
+                    idle_poll_fn=_idle_odds_tick,
+                    idle_poll_interval=poll_interval,
+                    last_idle_poll_at=last_idle_poll_at,
                 )
-                if not processed:
-                    time.sleep(poll_interval)
                 continue
 
             self.logger.info(f"Arbitrage: {len(matching_arbs)} — pausing odds watch for placement")

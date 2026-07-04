@@ -50,3 +50,21 @@ class RedisCache:
 
     def pipeline(self):
         return self.client.pipeline()
+
+    def lpush(self, key, value):
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, default=self._json_serializer)
+        return self.client.lpush(key, value)
+
+    def blpop(self, keys, timeout=0):
+        """Block until one of keys has a value. timeout in seconds (float ok)."""
+        if isinstance(keys, str):
+            keys = [keys]
+        result = self.client.blpop(keys, timeout=timeout)
+        if not result:
+            return None
+        key, value = result
+        try:
+            return key, json.loads(value)
+        except Exception:
+            return key, value

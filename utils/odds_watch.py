@@ -76,6 +76,12 @@ def persist_odds_games(
                 logger.warning(f"DB save failed: {db_err}")
         saved_by_type[bet_type] = saved_by_type.get(bet_type, 0) + 1
 
+        try:
+            from utils.fast_arb_scan import scan_inline_arbs_for_odds_row
+            scan_inline_arbs_for_odds_row(cache, logger, odd_row)
+        except Exception as inline_err:
+            logger.warning(f"Inline arb scan failed: {inline_err}")
+
     saved = sum(saved_by_type.values())
     if saved:
         parts = [

@@ -140,8 +140,17 @@ def min_arb_profit_pct_for_bet_type(bet_type: str) -> float:
 ODDS_WATCH_POLL_SECONDS = float(os.getenv("ODDS_WATCH_POLL_SEC", "5"))
 ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("ODDS_WATCH_FORCE_SCAN_SEC", "5"))
 
-# Arb scanner loop delay (seconds between DB scans). Target: arb → both legs < 5s.
-ARB_SCAN_DELAY_SECONDS = float(os.getenv("ARB_SCAN_DELAY_SEC", "2"))
+# Arb scanner loop delay (seconds between DB scans). Backup path when inline scan misses.
+ARB_SCAN_DELAY_SECONDS = float(os.getenv("ARB_SCAN_DELAY_SEC", "0.5"))
+
+# Inline arb detection on odds persist (Redis cross-book compare, sub-100ms wake).
+INLINE_ARB_SCAN_ENABLED = os.getenv("INLINE_ARB_SCAN_ENABLED", "true").lower() in (
+    "1", "true", "yes",
+)
+
+# Betting loops block on Redis wake queue (ms) instead of fixed multi-second sleeps.
+BET_WAKE_BLPOP_MS = int(os.getenv("BET_WAKE_BLPOP_MS", "50"))
+BETTING_IDLE_POLL_SECONDS = float(os.getenv("BETTING_IDLE_POLL_SEC", "5"))
 
 # Ops health agent — staleness thresholds and remediation cooldowns.
 OPS_ODDS_STALE_SECONDS = int(os.getenv("OPS_ODDS_STALE_SEC", "90"))

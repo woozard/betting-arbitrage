@@ -38,7 +38,9 @@ class ArbitrageCache:
             )
         ]
 
-        filtered.append(row)
+        stamped = dict(row)
+        stamped["updated_at"] = time.time()
+        filtered.append(stamped)
         self.redis.set(key, filtered, ttl=self.ttl)
 
     # ---------------- Bulk Add ----------------
@@ -97,6 +99,48 @@ class ArbitrageCache:
 
         # ✅ No json.dumps
         self.redis.set(key, arb_data, ttl=self.arb_ttl)
+        self.signal_bet_wake_for_arb(arb_data)
+
+    def _bet_wake_key(self, bookmaker: str) -> str:
+        return f"arb:wake:{(bookmaker or '').strip().lower()}"
+
+    def signal_bet_wake(self, bookmaker: str, payload: dict | None = None):
+        """Wake a book's betting loop immediately (LPUSH wake queue)."""
+        bm = (bookmaker or "").strip().lower()
+        if not bm:
+            return
+        body = payload or {"ts": time.time()}
+        self.redis.lpush(self._bet_wake_key(bm), body)
+
+    def signal_bet_wake_for_arb(self, arb_data: dict):
+        """Wake both legs as soon as an arb is actionable in Redis."""
+        if not isinstance(arb_data, dict):
+            return
+        payload = {
+            "ts": time.time(),
+            "pair_key": self.arb_pair_key_from_arb(arb_data),
+            "bet_type": arb_data.get("bet_type", "moneyline"),
+        }
+        for book in (
+            arb_data.get("team_1_bookmaker"),
+            arb_data.get("team_2_bookmaker"),
+        ):
+            self.signal_bet_wake(book, payload)
+
+    def wait_bet_wake(self, bookmaker: str, timeout_ms: int | None = None) -> dict | None:
+        """Block up to timeout_ms for a bet wake signal; returns payload or None."""
+        from utils.config import BET_WAKE_BLPOP_MS
+
+        bm = (bookmaker or "").strip().lower()
+        if not bm:
+            return None
+        ms = BET_WAKE_BLPOP_MS if timeout_ms is None else timeout_ms
+        timeout_sec = max(0.001, ms / 1000.0)
+        result = self.redis.blpop(self._bet_wake_key(bm), timeout=timeout_sec)
+        if not result:
+            return None
+        _, payload = result
+        return payload if isinstance(payload, dict) else {"raw": payload}
 
     def get_arbitrage(self, bookmaker=None, bet_type=None, game_id=None):
         b = bookmaker or "*"

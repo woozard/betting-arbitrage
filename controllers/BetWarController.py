@@ -23,6 +23,7 @@ from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, teams_same, resolve_ticosports_spread_lines, spread_values_match
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
+from utils.betting_loop import wait_for_arb_or_idle
 from utils.ticosports_wager import click_line_via_angular
 from utils.team_registry import standard_team_name
 from utils.bet_placement import (
@@ -4785,12 +4786,12 @@ class BetWarController:
 
         consecutive_recoveries = 0
         self._exposure_cleanup_at = 0.0
+        last_idle_poll_at = 0.0
         while True:
             watchdog.beat()
             self._exposure_cleanup_at = tick_exposure_cleanup(
                 self.cache, self.logger, self._exposure_cleanup_at
             )
-            time.sleep(2)
 
             try:
                 current_url = self.driver.current_url
@@ -4823,11 +4824,16 @@ class BetWarController:
             consecutive_recoveries = 0
             arbs = get_arbitrage_for_placement(self.cache, self.bookmaker)
             if not arbs:
-                self._maybe_poll_odds_while_idle()
+                _, last_idle_poll_at = wait_for_arb_or_idle(
+                    self.cache,
+                    self.bookmaker,
+                    idle_poll_fn=self._maybe_poll_odds_while_idle,
+                    last_idle_poll_at=last_idle_poll_at,
+                )
                 self.logger.info("Waiting for Arbitrage")
                 continue
 
-            self.logger.info(f"Arbitrage opportunities: {len(arbs)}")
+            self.logger.info(f"Arbitrage opportunities: {len(arbs)} — pausing odds scan for placement")
 
             for arb in arbs:
                 sport = arb.get('sport')
