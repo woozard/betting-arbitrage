@@ -10,7 +10,7 @@ from controllers.ArbitrageController import ArbitrageController
 from utils.helpers import normalize_team, teams_same
 from utils.game_registry import matchup_group_key
 
-BOOKS = ("betamapola", "sports411", "paradisewager", "betwar", "lowvig", "3et")
+BOOKS = ("betamapola", "sports411", "paradisewager", "betwar", "lowvig", "3et", "4casters")
 BOOK_PAIRS = list(combinations(BOOKS, 2))
 
 
