@@ -243,8 +243,9 @@ def _try_insert_pair(cache, logger, o1, o2, t1_from, t2_from, bet_type) -> int:
         ):
             continue
 
-        team_1_odds = leg_a if tf_a == t1_from else leg_b
-        team_2_odds = leg_b if tf_b == t2_from else leg_a
+        # leg_a/leg_b are always on tf_a/tf_b's book; must match build_arb_data(t1_from=tf_a, ...).
+        team_1_odds = leg_a
+        team_2_odds = leg_b
         if bet_type == "moneyline" and not is_plausible_moneyline_pair(
             team_1_odds, team_2_odds
         ):
