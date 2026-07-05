@@ -601,6 +601,26 @@ def capture_confirmed_bet_screenshot(
         if shot:
             return shot
 
+    if bm == "4casters" and driver is not None:
+        from utils.fourcasters_web import capture_fourcasters_active_wager
+
+        shot = capture_fourcasters_active_wager(
+            driver,
+            path,
+            logger,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            stake=stake,
+            open_bets_url=open_bets_url,
+        )
+        if shot:
+            return shot
+        logger.warning(
+            f"4casters Active Wagers screenshot unavailable for {team_name}; "
+            "falling back to rendered receipt"
+        )
+
     return render_bet_receipt(
         path,
         bookmaker,

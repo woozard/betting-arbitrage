@@ -79,6 +79,33 @@ class FourCastersController:
         self.game_tz = "US/Eastern"
         self._schedule_cache = []
         self._force_relogin = False
+        self._screenshot_driver = None
+
+    def _ensure_screenshot_driver(self):
+        from utils.fourcasters_web import ensure_fourcasters_web_session
+
+        self._ensure_session()
+        if self._screenshot_driver is not None:
+            try:
+                _ = self._screenshot_driver.current_url
+                return self._screenshot_driver
+            except Exception:
+                self._close_screenshot_driver()
+
+        driver = ensure_fourcasters_web_session(
+            self.account_id,
+            self.password,
+            self.logger,
+            api_token=self.api.token,
+        )
+        self._screenshot_driver = driver
+        return driver
+
+    def _close_screenshot_driver(self):
+        from utils.fourcasters_web import quit_fourcasters_driver
+
+        quit_fourcasters_driver(self._screenshot_driver)
+        self._screenshot_driver = None
 
     @staticmethod
     def _format_american_str(value) -> str:
@@ -742,6 +769,8 @@ class FourCastersController:
                             stake_used,
                             wager_odds,
                             extra_lines=extra_lines or None,
+                            driver=self._ensure_screenshot_driver(),
+                            open_bets_url="https://4casters.io/my-bets/active-wagers",
                         )
                         finalize_confirmed_bet(
                             self.cache,
@@ -771,4 +800,5 @@ class FourCastersController:
         except KeyboardInterrupt:
             self.logger.info("4casters betting stopped by user")
         finally:
+            self._close_screenshot_driver()
             self.logger.info("==================== Betting (END) ====================")
