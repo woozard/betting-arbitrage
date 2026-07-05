@@ -22,6 +22,7 @@ from utils.config import (
     is_active_arb_pair,
     BETAMAPOLA_API_PLACEMENT,
 )
+from utils.betamapola_offering import parse_get_sport_offering_response
 from utils.betamapola_wager_api import (
     accept_betamapola_line_changes,
     betamapola_process_ticket_via_api,
@@ -103,6 +104,9 @@ class BetamapolaController:
         self._betamapola_ticket_submitted = False
         self._pending_check_cache = {}
         self._last_screenshot_path = None
+        self._api_offering_failures = 0
+        self._last_full_game_line_count = 0
+        self._thin_offering_recovery_attempted = False
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -380,6 +384,16 @@ class BetamapolaController:
             self.wait.until(EC.url_contains("/sports"))
             self._force_wager_relogin = False
             self.logger.info("Login Successful")
+            # Ensure Angular sports shell is loaded before offering navigation.
+            self.driver.get(self.sport_url)
+            try:
+                self.wait.until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "app-sports, #gamesAccordion, a.sportIcon")
+                    )
+                )
+            except Exception:
+                self.logger.warning("Sports shell slow after login; offering nav will retry")
             return True
 
         except Exception as e:
@@ -867,11 +881,21 @@ class BetamapolaController:
             "requestMode": None,
         }
 
+    def _dismiss_blocking_overlays(self) -> None:
+        try:
+            self.driver.execute_script("""
+                document.querySelectorAll(
+                    '.swal2-container button.swal2-close, .swal2-container button.swal2-confirm'
+                ).forEach(function(btn) { try { btn.click(); } catch (e) {} });
+            """)
+        except Exception:
+            pass
+
     def __ensure_sport_offering_loaded(self, game_num=None, team_no: int = None, fast: bool = False) -> bool:
         """Navigate the SPA to the active sport (MLB/NBA) so game lines are in the DOM."""
         if fast and self._is_on_sport_page_with_games():
             api_lines = self._fetch_game_lines_via_api()
-            if api_lines:
+            if api_lines and len(api_lines) >= self._min_expected_full_game_lines():
                 if game_num and team_no and self._wait_for_moneyline_button(game_num, team_no, timeout=8):
                     self.logger.info(
                         f"Fast path: target moneyline M{team_no}_{game_num}_0 already in DOM"
@@ -882,84 +906,112 @@ class BetamapolaController:
 
         self.logger.info(f"Ensuring {self.sport_name} offering is loaded in the SPA...")
 
-        self.driver.get(self.sport_url)
-
-        try:
-            self.wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "#gamesAccordion, .sport-lines-container, app-sports")
+        for nav_attempt in range(1, 4):
+            if nav_attempt > 1:
+                self.logger.warning(
+                    f"Retrying {self.sport_name} SPA navigation (attempt {nav_attempt}/3)"
                 )
-            )
-        except Exception:
-            self.logger.warning("Main content containers not found quickly.")
+                try:
+                    self.driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(3)
 
-        try:
-            self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "a.sportIcon, a#img_Baseball, a#img_Basketball"))
-            )
-        except Exception:
-            self.logger.warning("Sports sidebar icons did not appear quickly.")
+            self.driver.get(self.sport_url)
+            self._dismiss_blocking_overlays()
+            time.sleep(2)
 
-        if self.sport_name == "NBA":
-            sport_selectors = [
-                "a#img_Basketball",
-                "a[data-target='#sp_Basketball']",
-                "#gl_Basketball_NBA_G",
-                "label[for='gl_Basketball_NBA_G']",
-            ]
-        else:
-            sport_selectors = [
-                "a#img_Baseball",
-                "a[data-target='#sp_Baseball']",
-                "#gl_Baseball_MLB_G",
-                "label[for='gl_Baseball_MLB_G']",
-            ]
-
-        try:
-            if self.sport_name == "MLB":
-                baseball_link = self.driver.find_element(
-                    By.CSS_SELECTOR, "a#img_Baseball, a[data-target='#sp_Baseball']"
-                )
-                self.driver.execute_script("arguments[0].click();", baseball_link)
-                time.sleep(1)
-        except Exception as e:
-            self.logger.warning(f"Could not expand sport section: {e}")
-
-        selected = False
-        for selector in sport_selectors[2:]:
             try:
-                elem = self.driver.find_element(By.CSS_SELECTOR, selector)
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-                self.driver.execute_script("arguments[0].click();", elem)
-                selected = True
-                self.logger.info(f"Selected {self.sport_name} via {selector}")
-                break
+                self.wait.until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "#gamesAccordion, .sport-lines-container, app-sports")
+                    )
+                )
             except Exception:
+                self.logger.warning("Main content containers not found quickly.")
+
+            sidebar_ready = False
+            try:
+                self.wait.until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "a.sportIcon, a#img_Baseball, a#img_Basketball")
+                    )
+                )
+                sidebar_ready = True
+            except Exception:
+                self.logger.warning("Sports sidebar icons did not appear quickly.")
+
+            if not sidebar_ready:
                 continue
 
-        if not selected:
+            if self.sport_name == "NBA":
+                sport_selectors = [
+                    "a#img_Basketball",
+                    "a[data-target='#sp_Basketball']",
+                    "#gl_Basketball_NBA_G",
+                    "label[for='gl_Basketball_NBA_G']",
+                ]
+            else:
+                sport_selectors = [
+                    "a#img_Baseball",
+                    "a[data-target='#sp_Baseball']",
+                    "#gl_Baseball_MLB_G",
+                    "label[for='gl_Baseball_MLB_G']",
+                ]
+
             try:
-                result = self.driver.execute_script("""
-                    var selectors = arguments[0];
-                    for (var i = 0; i < selectors.length; i++) {
-                        var el = document.querySelector(selectors[i]);
-                        if (el) { el.click(); return selectors[i]; }
-                    }
-                    var label = document.querySelector('label[for="gl_Baseball_MLB_G"]')
-                        || document.querySelector('label[for="gl_Basketball_NBA_G"]');
-                    if (label) { label.click(); return label.getAttribute('for'); }
-                    return null;
-                """, sport_selectors[2:])
-                if result:
-                    selected = True
-                    self.logger.info(f"Selected {self.sport_name} via JS click ({result})")
+                if self.sport_name == "MLB":
+                    baseball_link = self.driver.find_element(
+                        By.CSS_SELECTOR, "a#img_Baseball, a[data-target='#sp_Baseball']"
+                    )
+                    self.driver.execute_script("arguments[0].click();", baseball_link)
+                    time.sleep(1)
             except Exception as e:
-                self.logger.warning(f"JS sport selection failed: {e}")
+                self.logger.warning(f"Could not expand sport section: {e}")
+                continue
 
-        self._trigger_angular_offering_select()
-        time.sleep(3)
+            selected = False
+            for selector in sport_selectors[2:]:
+                try:
+                    elem = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+                    self.driver.execute_script("arguments[0].click();", elem)
+                    selected = True
+                    self.logger.info(f"Selected {self.sport_name} via {selector}")
+                    break
+                except Exception:
+                    continue
 
-        api_lines = self._fetch_game_lines_via_api()
+            if not selected:
+                try:
+                    result = self.driver.execute_script("""
+                        var selectors = arguments[0];
+                        for (var i = 0; i < selectors.length; i++) {
+                            var el = document.querySelector(selectors[i]);
+                            if (el) { el.click(); return selectors[i]; }
+                        }
+                        var label = document.querySelector('label[for="gl_Baseball_MLB_G"]')
+                            || document.querySelector('label[for="gl_Basketball_NBA_G"]');
+                        if (label) { label.click(); return label.getAttribute('for'); }
+                        return null;
+                    """, sport_selectors[2:])
+                    if result:
+                        selected = True
+                        self.logger.info(f"Selected {self.sport_name} via JS click ({result})")
+                except Exception as e:
+                    self.logger.warning(f"JS sport selection failed: {e}")
+
+            if not selected:
+                continue
+
+            self._trigger_angular_offering_select()
+            time.sleep(3)
+
+            api_lines = self._fetch_game_lines_via_api()
+            if api_lines:
+                break
+
+        api_lines = api_lines if "api_lines" in locals() else []
         api_has_lines = bool(api_lines)
         if api_has_lines:
             self.logger.info(f"API confirms {len(api_lines)} {self.sport_name} lines are available")
@@ -990,9 +1042,20 @@ class BetamapolaController:
             lines_ready = True
         else:
             self.logger.warning(f"{self.sport_name} lines not visible in DOM or API after navigation")
+            raise RuntimeError(f"{self.sport_name} offering failed to load after SPA navigation retries")
 
         self._ensure_odds_mutation_observer()
         return lines_ready
+
+    def _min_expected_full_game_lines(self) -> int:
+        """Minimum full-game lines before we treat the SPA offering as degraded."""
+        if self.sport_name == "NBA":
+            return 2
+        return int(os.getenv("BETAMAPOLA_MIN_EXPECTED_MLB_LINES", "3"))
+
+    @staticmethod
+    def _parse_get_sport_offering_response(result) -> tuple[list, bool]:
+        return parse_get_sport_offering_response(result)
 
     def _fetch_game_lines_via_api(self):
         """POST to GetSportOffering for current sport Straight Bet lines (all periods)."""
@@ -1015,19 +1078,75 @@ class BetamapolaController:
 
         try:
             result = self.driver.execute_script(script, payload)
-            if not result:
-                self.logger.warning("API returned empty response")
+            lines, payload_ok = self._parse_get_sport_offering_response(result)
+            if not payload_ok:
+                self._api_offering_failures += 1
+                snippet = str(result)[:500] if result is not None else "null"
+                self.logger.warning(
+                    f"GetSportOffering invalid payload (fail #{self._api_offering_failures}): "
+                    f"{snippet}"
+                )
+                if result and isinstance(result, dict) and result.get("d") is None:
+                    self._invalidate_wager_session()
                 return []
 
-            data = result.get("d", {}).get("Data", {})
-            lines = data.get("GameLines", [])
-            limits = data.get("SportLimits", [])
+            limits = []
+            if isinstance(result, dict):
+                inner = result.get("d") or {}
+                if isinstance(inner, dict):
+                    data = inner.get("Data") or {}
+                    if isinstance(data, dict):
+                        limits = data.get("SportLimits") or []
 
-            self.logger.info(f"API success: {len(lines)} GameLines, {len(limits)} SportLimits entries")
+            self._api_offering_failures = 0
+            self.logger.info(
+                f"API success: {len(lines)} GameLines, {len(limits)} SportLimits entries"
+            )
             return lines
         except Exception as e:
+            self._api_offering_failures += 1
             self.logger.error(f"Browser-context API call failed: {e}")
             return []
+
+    def _recover_degraded_offering(self, *, parsed_games: int, force_scan: bool) -> None:
+        """Reload SPA or re-login when GetSportOffering returns too few games."""
+        min_expected = self._min_expected_full_game_lines()
+        prev = self._last_full_game_line_count
+
+        thin = parsed_games < min_expected
+        sharp_drop = prev >= min_expected and parsed_games < min_expected
+        bad_payload = self._api_offering_failures >= 2
+
+        if not force_scan and not thin and not bad_payload:
+            return
+        if not thin and not sharp_drop and not bad_payload:
+            return
+
+        reason = []
+        if bad_payload:
+            reason.append(f"api_failures={self._api_offering_failures}")
+        if thin:
+            reason.append(f"parsed={parsed_games}<{min_expected}")
+        if sharp_drop:
+            reason.append(f"drop_from={prev}")
+        self.logger.warning(
+            f"Degraded {self.sport_name} offering ({', '.join(reason)}); reloading SPA"
+        )
+
+        try:
+            self.__ensure_sport_offering_loaded()
+            self._api_offering_failures = 0
+        except Exception as e:
+            self.logger.warning(f"SPA reload failed: {e}")
+
+        if bad_payload or sharp_drop:
+            self.logger.warning("Offering still degraded after SPA reload; performing full re-login")
+            try:
+                self.__login()
+                self.__ensure_sport_offering_loaded()
+                self._api_offering_failures = 0
+            except Exception as e:
+                self.logger.error(f"Full re-login after thin offering failed: {e}")
 
     def _parse_api_game_lines(self, game_lines):
         """Convert raw GetSportOffering GameLines into the internal games format used by cache/storage."""
@@ -1176,9 +1295,27 @@ class BetamapolaController:
         if not hasattr(self, "_last_saved_ml"):
             self._last_saved_ml = {}
         games, src = self._fetch_games_for_odds(allow_dom_fallback=force_scan)
+        min_expected = self._min_expected_full_game_lines()
+        if force_scan and (not games or len(games) < min_expected):
+            should_recover = (
+                not games
+                or self._api_offering_failures >= 2
+                or self._last_full_game_line_count >= min_expected
+                or not self._thin_offering_recovery_attempted
+            )
+            if should_recover:
+                self._thin_offering_recovery_attempted = True
+                self._recover_degraded_offering(
+                    parsed_games=len(games), force_scan=force_scan
+                )
+                games, src = self._fetch_games_for_odds(allow_dom_fallback=True)
         label = f"{source}/{src}" if src != "none" else source
         if not games and force_scan:
             self.logger.warning(f"No {self.sport_name} lines from API or DOM on force scan")
+        elif games:
+            self._last_full_game_line_count = len(games)
+            if len(games) >= min_expected:
+                self._thin_offering_recovery_attempted = False
         return persist_moneyline_games(
             self.cache,
             self.storage,
@@ -1195,6 +1332,11 @@ class BetamapolaController:
         if not hasattr(self, "_last_odds_force_scan"):
             self._last_odds_force_scan = 0.0
         if not self._is_session_valid():
+            self.logger.warning("Session invalid during idle odds poll; re-establishing")
+            try:
+                self._ensure_betting_session()
+            except Exception as e:
+                self.logger.warning(f"Idle session refresh failed: {e}")
             return
         try:
             self._last_odds_force_scan, processed = self._tick_odds_on_idle(
@@ -2699,6 +2841,10 @@ class BetamapolaController:
         self.storage = Storage(self.logger)
 
         self.logger.info("==================== Betting (START) ====================")
+
+        self._api_offering_failures = 0
+        self._last_full_game_line_count = 0
+        self._thin_offering_recovery_attempted = False
 
         watchdog = BettingLoopWatchdog(self.logger, max_silent_seconds=300)
         watchdog.start()
