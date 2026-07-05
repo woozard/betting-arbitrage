@@ -66,10 +66,9 @@ def main():
     storage = Storage(logger)
 
     other_book = arb["team_1_bookmaker"]
-    other_game_id = arb["team_1_game_id"]
     print(
-        f"Other leg {other_book} {other_game_id} placed: "
-        f"{cache.is_leg_placed(other_book, 'moneyline', other_game_id)}"
+        f"Other leg {other_book} placed: "
+        f"{cache.is_arb_leg_placed(arb, other_book)}"
     )
 
     account = Accounts(account=BETWAR_ACCOUNT, password=BETWAR_PASSWORD, label=BETWAR_LABEL)

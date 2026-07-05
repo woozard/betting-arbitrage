@@ -3,6 +3,8 @@
 import json
 import time
 
+PROCESS_TICKET_PATH = "/sports/Api/Betting.asmx/ProcessTicket"
+
 
 def parse_process_ticket_response(result: dict | None) -> tuple[bool, int | None, str]:
     """Parse ProcessTicket ASMX JSON response."""
@@ -51,6 +53,71 @@ function betamapolaBetSlipScope() {
     return null;
 }
 """
+
+_BUILD_PROCESS_TICKET_BODY_JS = (
+    _BETSLIP_SCOPE_JS
+    + """
+    function betamapolaBuildProcessTicketBody() {
+        var scope = betamapolaBetSlipScope();
+        if (!scope || !scope.ticketServiceView || !scope.ticketServiceView.Ticket) return null;
+        var ticket = scope.ticketServiceView.Ticket;
+        var items = ticket.WagerItems || [];
+        if (!items.length) return null;
+        if (typeof scope.AcceptAllLineChanges === 'function') {
+            scope.AcceptAllLineChanges();
+        } else if (typeof scope.AcceptLineChanges === 'function') {
+            scope.AcceptLineChanges();
+        }
+        for (var j = 0; j < items.length; j++) {
+            items[j].AcceptChangesFlag = true;
+            items[j].LineChanged = false;
+            items[j].Changed = false;
+        }
+        if (scope.$apply) scope.$apply();
+        var wagersData = [];
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            try {
+                wagersData.push(JSON.parse(JSON.stringify(item)));
+            } catch (e) {
+                wagersData.push({
+                    AmountEntered: item.AmountEntered != null ? item.AmountEntered : item.ToWinAmount,
+                    ArAmount: item.ArAmount,
+                    ControlCode: item.ControlCode,
+                    FinalLine: item.FinalLine,
+                    FinalPrice: item.FinalPrice,
+                    GameNum: item.GameNum,
+                    PeriodNumber: item.PeriodNumber,
+                    PlayCount: item.PlayCount || 0,
+                    RifTicketNumber: item.RifTicketNumber || 0,
+                    RifWagerNumber: item.RifWagerNumber || 0,
+                    RifWinOnlyFlag: item.RifWinOnlyFlag || false,
+                    RiskAmount: item.RiskAmount,
+                    RoundRobinValue: item.RoundRobinValue || 0,
+                    RrAmount: item.RrAmount || 0,
+                    ToWinAmount: item.ToWinAmount,
+                    WagerAmt: item.RiskAmount,
+                    pitcher1ReqFlag: item.pitcher1ReqFlag || false,
+                    pitcher2ReqFlag: item.pitcher2ReqFlag || false,
+                    AcceptChangesFlag: true,
+                    LineChanged: false,
+                    Changed: false,
+                });
+            }
+        }
+        return {
+            wGBS: ticket.wGBS,
+            password: ticket.Password || '',
+            useFreePlay: !!ticket.UseFreePlay,
+            wagersData: wagersData,
+            openPlayTotalPicks: ticket.OpenPlayTotalPicks || 0,
+            teaserName: ticket.TeaserName || '',
+            arbc: !!ticket.ARBC,
+            wagerTypeId: 0,
+        };
+    }
+    """
+)
 
 
 def wait_for_angular_game_lines(driver, timeout: float = 20.0) -> bool:
@@ -217,123 +284,96 @@ def accept_betamapola_line_changes(driver) -> bool:
         return False
 
 
-def betamapola_api_fetch(driver, path: str, body=None) -> dict | None:
-    """POST JSON to a TicoSports ASMX endpoint inside the authenticated browser."""
-    script = """
-        const path = arguments[0];
-        const body = arguments[1];
-        const opts = {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json, text/plain, */*',
-            },
-            credentials: 'include',
+_PROCESS_TICKET_CAPTURE_JS = (
+    _BETSLIP_SCOPE_JS
+    + """
+    function betamapolaCaptureProcessTicket(cb) {
+        var captured = null;
+        var origFetch = window.fetch;
+        window.fetch = function(url, opts) {
+            return origFetch.apply(this, arguments).then(function(resp) {
+                var u = String(url || '').toLowerCase();
+                if (u.indexOf('processticket') >= 0) {
+                    return resp.clone().json().then(function(data) {
+                        captured = data;
+                        return resp;
+                    }).catch(function() { return resp; });
+                }
+                return resp;
+            });
         };
-        if (body !== null && body !== undefined) {
-            opts.body = JSON.stringify(body);
-        }
-        return fetch(path, opts)
-            .then(async (resp) => {
-                let data = null;
-                try { data = await resp.json(); } catch (e) {}
-                return { status: resp.status, ok: resp.ok, data };
-            })
-            .catch(err => ({ status: 0, ok: false, error: String(err) }));
-    """
-    try:
-        return driver.execute_script(script, path, body)
-    except Exception:
-        return None
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.__ptUrl = url;
+            return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function() {
+            var xhr = this;
+            xhr.addEventListener('load', function() {
+                var u = String(xhr.__ptUrl || '').toLowerCase();
+                if (u.indexOf('processticket') >= 0 && xhr.responseText) {
+                    try { captured = JSON.parse(xhr.responseText); } catch (e) {}
+                }
+            });
+            return origSend.apply(this, arguments);
+        };
 
-
-def betamapola_process_ticket_via_api(driver) -> tuple[bool, dict | None, str]:
-    """
-    Submit the current Angular ticket via ProcessTicket HTTP API.
-    Falls back to invoking Angular ProcessTicket() when direct POST fails.
-    """
-    script = (
-        _BETSLIP_SCOPE_JS
-        + """
         var scope = betamapolaBetSlipScope();
-        if (!scope || !scope.ticketServiceView || !scope.ticketServiceView.Ticket) {
-            return { mode: 'error', message: 'bet slip ticket unavailable' };
+        if (!scope) {
+            cb({ ok: false, message: 'bet slip scope unavailable' });
+            return;
         }
         if (scope.IsSafeToPostTicket && !scope.IsSafeToPostTicket()) {
-            return { mode: 'error', message: 'IsSafeToPostTicket() is false' };
+            cb({ ok: false, message: 'IsSafeToPostTicket() is false' });
+            return;
         }
-
-        var ticket = scope.ticketServiceView.Ticket;
-        var payloads = [
-            { ticket: ticket },
-            { Ticket: ticket },
-        ];
-
-        function postTicket(body) {
-            return fetch('/sports/Api/Betting.asmx/ProcessTicket', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json, text/plain, */*',
-                },
-                credentials: 'include',
-                body: JSON.stringify(body),
-            }).then(function(resp) {
-                return resp.json().then(function(data) {
-                    return { ok: resp.ok, status: resp.status, data: data };
-                });
-            });
+        if (typeof scope.AcceptAllLineChanges === 'function') scope.AcceptAllLineChanges();
+        else if (typeof scope.AcceptLineChanges === 'function') scope.AcceptLineChanges();
+        if (typeof scope.ProcessTicket === 'function') {
+            scope.ProcessTicket();
+            if (scope.$apply) scope.$apply();
+        } else {
+            cb({ ok: false, message: 'ProcessTicket() unavailable' });
+            return;
         }
+        setTimeout(function() {
+            cb({ ok: !!captured, data: captured, mode: 'process_ticket_api' });
+        }, 3500);
+    }
+    """
+)
 
-        function tryPayloads(index) {
-            if (index >= payloads.length) {
-                scope.ProcessTicket();
-                if (scope.$apply) scope.$apply();
-                return { mode: 'angular', message: 'ProcessTicket invoked' };
-            }
-            return postTicket(payloads[index]).then(function(result) {
-                var wrapper = result && result.data && result.data.d;
-                if (wrapper && wrapper.IsSuccess) {
-                    return { mode: 'fetch', payloadIndex: index, result: result };
-                }
-                if (wrapper && wrapper.Message) {
-                    return { mode: 'error', message: wrapper.Message, code: wrapper.Code };
-                }
-                return tryPayloads(index + 1);
-            }).catch(function(err) {
-                if (index + 1 >= payloads.length) {
-                    scope.ProcessTicket();
-                    if (scope.$apply) scope.$apply();
-                    return { mode: 'angular', message: String(err) };
-                }
-                return tryPayloads(index + 1);
-            });
-        }
 
-        return tryPayloads(0);
-        """
-    )
+def betamapola_process_ticket_via_api(driver, password: str = "") -> tuple[bool, dict | None, str, str]:
+    """
+    Submit exactly one ProcessTicket call (browser session HTTP to Betting.asmx).
+    Uses Angular ProcessTicket() so the site builds the correct payload; no Place Bet
+    DOM click and no second submit fallback.
+    Returns (posted, response_data, message, submit_mode).
+    """
+    del password  # session cookie auth; password is embedded in ticket when required
+    accept_betamapola_line_changes(driver)
+    script = _PROCESS_TICKET_CAPTURE_JS + """
+        var cb = arguments[arguments.length - 1];
+        betamapolaCaptureProcessTicket(cb);
+    """
     try:
-        outcome = driver.execute_script(script)
+        outcome = driver.execute_async_script(script)
     except Exception as exc:
-        return False, None, str(exc)
+        return False, None, str(exc), "error"
 
-    if not outcome:
-        return False, None, "ProcessTicket script returned nothing"
+    if not outcome or not outcome.get("ok"):
+        return False, None, (outcome or {}).get("message") or "ProcessTicket failed", "error"
 
-    mode = outcome.get("mode")
-    if mode == "error":
-        return False, None, outcome.get("message") or "ProcessTicket rejected"
+    data = outcome.get("data")
+    ok, ticket_number, msg = parse_process_ticket_response(data)
+    if ok and ticket_number:
+        return True, data, msg, "process_ticket_api"
 
-    if mode == "fetch":
-        result = outcome.get("result") or {}
-        data = result.get("data")
-        ok, ticket_number, msg = parse_process_ticket_response(data)
-        if ok:
-            return True, data, msg
-        return False, data, msg
+    wrapper = (data or {}).get("d") if isinstance(data, dict) else None
+    detail = msg or "ProcessTicket rejected"
+    if isinstance(wrapper, dict):
+        detail = (wrapper.get("Message") or detail).strip()
 
-    if mode == "angular":
-        return True, None, outcome.get("message") or "ProcessTicket invoked via Angular"
-
-    return False, None, json.dumps(outcome)[:200]
+    return False, data, detail, "process_ticket_api"

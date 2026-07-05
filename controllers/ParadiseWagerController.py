@@ -39,6 +39,7 @@ from utils.bet_placement import (
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
     should_skip_spread_arb_for_placement,
+    should_skip_arb_leg_in_betting_loop,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.betting_watchdog import (
@@ -1799,12 +1800,15 @@ class ParadiseWagerController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
-                    self.logger.info(
-                        f"Skipping — leg already confirmed on {self.bookmaker} | "
-                        f"{team_name} | {team_1} vs {team_2}"
-                    )
-                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                if should_skip_arb_leg_in_betting_loop(
+                    self.cache,
+                    self.logger,
+                    arb,
+                    self.bookmaker,
+                    team_name,
+                    team_1,
+                    team_2,
+                ):
                     continue
 
                 if should_pause_first_leg_for_exposure(

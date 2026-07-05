@@ -46,6 +46,7 @@ from utils.ticosports_wager import (
     invoke_betamapola_process_ticket,
     sync_betamapola_stake_models,
 )
+from utils.bet_screenshot import capture_betamapola_confirmation, bet_screenshot_path
 from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
@@ -53,10 +54,13 @@ from utils.bet_placement import (
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
+    _dispatch_ops_alert,
+    _screenshots_telegram_chat,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
     should_skip_spread_arb_for_placement,
+    should_skip_arb_leg_in_betting_loop,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.betting_watchdog import BettingLoopWatchdog
@@ -82,6 +86,7 @@ class BetamapolaController:
     ODDS_IDLE_POLL_SECONDS = float(os.getenv("BETAMAPOLA_ODDS_IDLE_POLL_SEC", "5"))
     ODDS_OBSERVER_SELECTORS = ["#GameLines", "#gamesAccordion", "#GameLinesCtrl"]
     API_PLACEMENT_ENABLED = BETAMAPOLA_API_PLACEMENT
+    PENDING_CHECK_CACHE_TTL = 45
 
     # ===================================================================
     # Betamapola.com - uses identical browser/scraping stack as Sports411
@@ -95,6 +100,8 @@ class BetamapolaController:
         self.label = account.label if account.label else "N/A"
         self._force_wager_relogin = False
         self._last_bet_error = None
+        self._betamapola_ticket_submitted = False
+        self._pending_check_cache = {}
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -453,7 +460,12 @@ class BetamapolaController:
         return None, None
 
     def _lookup_game_line_from_api(
-        self, game_id: str, team_name: str, team_1: str = None, team_2: str = None
+        self,
+        game_id: str,
+        team_name: str,
+        team_1: str = None,
+        team_2: str = None,
+        moneyline_odd: str | None = None,
     ):
         """Resolve a live API game line by rotation id, then team-name fallback."""
         api_lines = self._fetch_game_lines_via_api()
@@ -463,6 +475,7 @@ class BetamapolaController:
         rotations = [p.strip() for p in str(game_id).split("-") if p.strip()]
         if len(rotations) >= 2:
             rot1, rot2 = rotations[0], rotations[1]
+            matches = []
             for gl in api_lines:
                 if gl.get("PeriodNumber") != 0:
                     continue
@@ -478,7 +491,17 @@ class BetamapolaController:
                     team_no = 2
 
                 if team_no is not None:
-                    return gl, team_no
+                    matches.append((gl, team_no))
+
+            if matches:
+                if moneyline_odd:
+                    for gl, team_no in matches:
+                        live_odds = gl.get(f"MoneyLine{team_no}")
+                        if live_odds is not None and self._odds_text_matches(
+                            str(live_odds), moneyline_odd
+                        ):
+                            return gl, team_no
+                return matches[0]
 
         return self._find_game_line_by_teams(api_lines, team_name, team_1=team_1, team_2=team_2)
 
@@ -631,6 +654,9 @@ class BetamapolaController:
         """Click DOM and/or Angular until the bet slip actually contains the team."""
         self._prepare_bet_slip_for_wager()
         game_num = game_line.get("GameNum")
+
+        if not moneyline_elem and game_num and team_no:
+            moneyline_elem = self._wait_for_moneyline_button(game_num, team_no, timeout=10)
 
         if moneyline_elem:
             self.logger.info(f"Moneyline element located: {moneyline_elem.get_attribute('id')}")
@@ -1597,6 +1623,119 @@ class BetamapolaController:
             self.logger.warning(f"GetWagerPicks failed: {e}")
             return []
 
+    def _open_bets_url(self) -> str:
+        base = (self.driver.current_url or self.sport_url or self.dashboard_url or "").split("#")[0].rstrip("/")
+        if not base:
+            base = f"https://{self.website}/sports"
+        return f"{base}#/openBets"
+
+    def _load_open_bets_page_text(self) -> str:
+        """Navigate to the Open Bets SPA route and return visible page text."""
+        sport_url = self.driver.current_url
+        try:
+            self.driver.get(self._open_bets_url())
+            time.sleep(2.5)
+            try:
+                WebDriverWait(self.driver, 8).until(
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "table, .open-bets, .openBets, main, #content")
+                    )
+                )
+            except Exception:
+                pass
+            return (self.driver.find_element(By.TAG_NAME, "body").text or "").strip()
+        finally:
+            if sport_url:
+                try:
+                    self.driver.get(sport_url)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _open_bets_text_has_wager(
+        page_text: str,
+        team_name: str,
+        team_1: str,
+        team_2: str,
+        ticket_number: int | str | None = None,
+    ) -> bool:
+        page_l = (page_text or "").lower()
+        if not page_l or "open bets" not in page_l:
+            return False
+        if ticket_number is not None:
+            ticket_s = str(ticket_number).strip()
+            if ticket_s and ticket_s in page_text:
+                return True
+        team_l = (team_name or "").lower()
+        if not team_l or team_l not in page_l:
+            return False
+        t1 = (team_1 or "").lower()
+        t2 = (team_2 or "").lower()
+        matchup_ok = True
+        if t1 and t2:
+            matchup_ok = t1 in page_l or t2 in page_l
+        wager_markers = ("money line", "risk", "win", "tick#", "accepted date")
+        return matchup_ok and any(marker in page_l for marker in wager_markers)
+
+    def _verify_open_bet_on_open_bets_page(
+        self,
+        team_name: str,
+        team_1: str,
+        team_2: str,
+        ticket_number: int | str | None = None,
+        timeout: int = 20,
+    ) -> tuple[bool, str]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            page_text = self._load_open_bets_page_text()
+            if self._open_bets_text_has_wager(
+                page_text, team_name, team_1, team_2, ticket_number=ticket_number
+            ):
+                detail = f"Open bet verified on open-bets page for {team_name}"
+                if ticket_number:
+                    detail += f" (ticket {ticket_number})"
+                return True, detail
+            time.sleep(1.5)
+        return False, "Bet not found on open-bets page"
+
+    def _notify_open_bets_screenshot(
+        self,
+        team_name: str,
+        team_1: str,
+        team_2: str,
+        game_id: str,
+        ticket_number: int | str | None = None,
+    ) -> str | None:
+        path = bet_screenshot_path(self.bookmaker, game_id)
+        shot = capture_betamapola_confirmation(
+            self.driver,
+            path,
+            self.logger,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+        )
+        if not shot:
+            self.logger.warning("Open-bets screenshot capture failed")
+            return None
+        caption_parts = [
+            f"Betamapola open bet confirmed",
+            f"{team_name} | {team_1} vs {team_2}",
+        ]
+        if ticket_number:
+            caption_parts.append(f"Ticket {ticket_number}")
+        chat_id = _screenshots_telegram_chat(TELEGRAM)
+        _dispatch_ops_alert(
+            self.logger,
+            "\n".join(caption_parts),
+            chat_id,
+            label="Betamapola Open Bets Screenshot",
+            photo_path=shot,
+            photo_only=True,
+        )
+        return shot
+
     @staticmethod
     def _pick_looks_like_open_wager(pick) -> bool:
         return pick_looks_like_open_wager(pick)
@@ -1612,10 +1751,31 @@ class BetamapolaController:
         )
 
     def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str) -> bool:
-        for pick in self._fetch_open_wagers_via_api():
-            if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
-                return True
-        return False
+        cache_key = f"{team_name}:{team_1}:{team_2}".lower()
+        now = time.time()
+        cached = self._pending_check_cache.get(cache_key)
+        if cached and (now - cached["ts"]) < self.PENDING_CHECK_CACHE_TTL:
+            return cached["found"]
+
+        found = False
+        try:
+            page_text = self._load_open_bets_page_text()
+            found = self._open_bets_text_has_wager(page_text, team_name, team_1, team_2)
+            if not found:
+                for pick in self._fetch_open_wagers_via_api():
+                    if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
+                        found = True
+                        break
+        except Exception as e:
+            self.logger.warning(f"Could not check existing open bets: {e}")
+            return False
+
+        if found:
+            self.logger.info(
+                f"Open bet already on open-bets page for {team_name} ({team_1} vs {team_2})"
+            )
+        self._pending_check_cache[cache_key] = {"found": found, "ts": now}
+        return found
 
     def _message_requires_relogin(self, message: str) -> bool:
         msg_l = (message or "").lower()
@@ -1975,10 +2135,20 @@ class BetamapolaController:
         process_data: dict | None = None,
         timeout: int = 12,
     ):
-        """API-first confirmation: ProcessTicket response, then GetWagerPicks."""
+        """Confirm via ProcessTicket ticket number, then open-bets page (source of truth)."""
+        ticket_number = None
         if process_data:
             ok, ticket_number, msg = parse_process_ticket_response(process_data)
             if ok and ticket_number and int(ticket_number) > 0:
+                verified, verify_msg = self._verify_open_bet_on_open_bets_page(
+                    team_name,
+                    team_1,
+                    team_2,
+                    ticket_number=ticket_number,
+                    timeout=min(timeout + 8, 25),
+                )
+                if verified:
+                    return True, verify_msg
                 return True, msg
 
         deadline = time.time() + timeout
@@ -1989,22 +2159,27 @@ class BetamapolaController:
                     self._invalidate_wager_session()
                 return False, reject_msg
 
-            for pick in self._fetch_open_wagers_via_api():
-                if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
-                    return True, "Open wager found via GetWagerPicks"
+            page_text = self._load_open_bets_page_text()
+            if self._open_bets_text_has_wager(
+                page_text, team_name, team_1, team_2, ticket_number=ticket_number
+            ):
+                return True, "Open wager verified on open-bets page"
 
             if self._betslip_shows_wager_confirmed():
                 return True, "Bet slip shows wager confirmed"
 
-            time.sleep(0.25)
-
-        for attempt in range(1, 4):
             for pick in self._fetch_open_wagers_via_api():
                 if self._pick_matches_open_wager(pick, team_name, team_1, team_2):
-                    return True, "Open wager found via GetWagerPicks (retry)"
-            if attempt < 3:
-                time.sleep(2)
-        return False, "Bet not confirmed via API within timeout"
+                    return True, "Open wager found via GetWagerPicks"
+
+            time.sleep(0.5)
+
+        verified, verify_msg = self._verify_open_bet_on_open_bets_page(
+            team_name, team_1, team_2, ticket_number=ticket_number, timeout=12
+        )
+        if verified:
+            return True, verify_msg
+        return False, "Bet not confirmed on open-bets page"
 
     def _execute_bet_attempt_api(
         self,
@@ -2030,17 +2205,22 @@ class BetamapolaController:
         self._refresh_session_before_wager()
 
         game_line, team_no = self._lookup_game_line_from_api(
-            game_id, team_name, team_1=team_1, team_2=team_2
+            game_id, team_name, team_1=team_1, team_2=team_2, moneyline_odd=moneyline_odd
         )
         if not game_line:
             self.__ensure_sport_offering_loaded(fast=True)
             game_line, team_no = self._lookup_game_line_from_api(
-                game_id, team_name, team_1=team_1, team_2=team_2
+                game_id, team_name, team_1=team_1, team_2=team_2, moneyline_odd=moneyline_odd
             )
         if not game_line:
             raise Exception(
                 f"Game {game_id} ({team_name}) not found in live {self.sport_name} API offering"
             )
+
+        matchup_1 = str(game_line.get("Team1ID") or team_1 or "")
+        matchup_2 = str(game_line.get("Team2ID") or team_2 or "")
+        if self._has_existing_open_bet(team_name, matchup_1, matchup_2):
+            raise Exception(f"Open bet already exists for {team_name}; skipping duplicate placement")
 
         game_num = game_line.get("GameNum")
         self.logger.info(
@@ -2124,11 +2304,14 @@ class BetamapolaController:
             self._invalidate_wager_session()
             raise Exception("Rejection marker on page: please log in")
 
-        posted, process_data, post_msg = betamapola_process_ticket_via_api(self.driver)
+        posted, process_data, post_msg, submit_mode = betamapola_process_ticket_via_api(
+            self.driver, password=self.password
+        )
         if not posted:
             raise Exception(post_msg or "ProcessTicket API failed")
 
-        self.logger.info(f"ProcessTicket submitted: {post_msg}")
+        self._betamapola_ticket_submitted = True
+        self.logger.info(f"ProcessTicket submitted via {submit_mode}: {post_msg}")
         process_payload = None
         if isinstance(process_data, dict):
             process_payload = process_data
@@ -2141,10 +2324,37 @@ class BetamapolaController:
             matchup_2,
             process_data=process_payload,
         )
+        if not confirmed and self._betamapola_ticket_submitted and process_payload:
+            ok, ticket_number, msg = parse_process_ticket_response(process_payload)
+            if ok and ticket_number:
+                confirmed, message = True, msg
+
+        if not confirmed and self._betamapola_ticket_submitted:
+            recovered, recover_msg = self._verify_open_bet_on_open_bets_page(
+                team_name, matchup_1, matchup_2, timeout=15
+            )
+            if recovered:
+                confirmed, message = True, recover_msg
+
         if not confirmed:
             raise Exception(message or "Bet not accepted by bookmaker")
 
+        ticket_number = None
+        if process_payload:
+            ok, ticket_number, _ = parse_process_ticket_response(process_payload)
+            if not ok:
+                ticket_number = None
+
         self.logger.info(f"Bet accepted by bookmaker (API path): {message}")
+        self._notify_open_bets_screenshot(
+            team_name,
+            matchup_1,
+            matchup_2,
+            game_id,
+            ticket_number=ticket_number,
+        )
+        cache_key = f"{team_name}:{matchup_1}:{matchup_2}".lower()
+        self._pending_check_cache[cache_key] = {"found": True, "ts": time.time()}
         return True, stake_plan
 
     # --------------------------------------------------------
@@ -2163,6 +2373,7 @@ class BetamapolaController:
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
+        self._betamapola_ticket_submitted = False
         blocked = block_real_money_bet(
             self.logger, stake, bet_type=bet_type, bookmaker=self.bookmaker
         )
@@ -2177,17 +2388,12 @@ class BetamapolaController:
                     if attempt > 1:
                         self.logger.info(f"Retrying wager after re-login (attempt {attempt}/2)")
                     if self.API_PLACEMENT_ENABLED:
-                        try:
-                            return self._execute_bet_attempt_api(
-                                game_id, team_name, moneyline_odd, stake,
-                                team_1=team_1, team_2=team_2,
-                                bet_type=bet_type,
-                                spread_line=spread_line,
-                            )
-                        except Exception as api_exc:
-                            self.logger.warning(
-                                f"API placement failed ({api_exc}); falling back to DOM path"
-                            )
+                        return self._execute_bet_attempt_api(
+                            game_id, team_name, moneyline_odd, stake,
+                            team_1=team_1, team_2=team_2,
+                            bet_type=bet_type,
+                            spread_line=spread_line,
+                        )
                     return self._execute_bet_attempt(
                         game_id, team_name, moneyline_odd, stake,
                         team_1=team_1, team_2=team_2,
@@ -2195,7 +2401,22 @@ class BetamapolaController:
                         spread_line=spread_line,
                     )
                 except Exception as e:
-                    if attempt == 1 and self._message_requires_relogin(str(e)):
+                    err_text = str(e)
+                    if attempt == 1 and self._betamapola_ticket_submitted:
+                        matchup_1 = team_1 or ""
+                        matchup_2 = team_2 or ""
+                        recovered, recover_msg = self._verify_open_bet_on_open_bets_page(
+                            team_name, matchup_1, matchup_2, timeout=12
+                        )
+                        if recovered:
+                            self.logger.warning(
+                                f"ProcessTicket likely succeeded despite error ({err_text}); "
+                                f"{recover_msg} — not retrying"
+                            )
+                            return True, stake_plan
+                    if attempt == 1 and "open bet already exists" in err_text.lower():
+                        raise
+                    if attempt == 1 and self._message_requires_relogin(err_text):
                         self.logger.warning(
                             f"Wager blocked by expired session ({e}); forcing re-login and retry"
                         )
@@ -2629,12 +2850,15 @@ class BetamapolaController:
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
 
-                if self.cache.is_leg_placed(self.bookmaker, bet_type, game_id):
-                    self.logger.info(
-                        f"Skipping — leg already confirmed on {self.bookmaker} | "
-                        f"{team_name} | {team_1} vs {team_2}"
-                    )
-                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                if should_skip_arb_leg_in_betting_loop(
+                    self.cache,
+                    self.logger,
+                    arb,
+                    self.bookmaker,
+                    team_name,
+                    team_1,
+                    team_2,
+                ):
                     continue
 
                 if should_pause_first_leg_for_exposure(

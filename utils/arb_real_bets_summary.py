@@ -192,6 +192,29 @@ def _summary_outcome(data: dict) -> str:
     return "failed"
 
 
+def _cleanup_legs_after_summary(cache, pair_key: str, outcome: str, data: dict) -> None:
+    """Drop pair-scoped leg flags once a Real Bets summary is final."""
+    arb = data.get("arb")
+    leg1 = data.get("leg1") or {}
+    leg2 = data.get("leg2") or {}
+
+    if outcome == "complete":
+        if arb:
+            cache.clear_arb_pair_legs(arb)
+        else:
+            cache.clear_arb_legs_for_pair_key(pair_key)
+        return
+
+    if not arb:
+        cache.clear_arb_legs_for_pair_key(pair_key)
+        return
+
+    if not leg1.get("placed"):
+        cache.clear_arb_leg_placed(arb, arb.get("team_1_bookmaker"))
+    if not leg2.get("placed"):
+        cache.clear_arb_leg_placed(arb, arb.get("team_2_bookmaker"))
+
+
 def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config: dict) -> None:
     logger.info(f"Publishing Real Bets summary | pair_key={pair_key} outcome={outcome}")
 
@@ -201,6 +224,7 @@ def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config
         )
         return
 
+    summary_data = cache.redis.get(_summary_redis_key(pair_key)) or {}
     alert = _build_summary_alert(cache, pair_key, outcome)
     if not alert:
         logger.warning(f"No Real Bets summary data for pair_key={pair_key}")
@@ -211,6 +235,7 @@ def _publish_summary(cache, logger, pair_key: str, outcome: str, telegram_config
 
     def _mark_sent():
         cache.mark_real_bets_summary_sent(pair_key)
+        _cleanup_legs_after_summary(cache, pair_key, outcome, summary_data)
         cache.redis.delete(_summary_redis_key(pair_key))
         logger.info(f"Real Bets summary sent | pair_key={pair_key} outcome={outcome}")
 

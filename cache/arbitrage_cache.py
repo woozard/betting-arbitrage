@@ -221,9 +221,6 @@ class ArbitrageCache:
     def _arb_scan_locked_key(self, pair_key):
         return f"arb_scan_locked:{pair_key}"
 
-    def _leg_placed_key(self, bookmaker, bet_type, game_id):
-        return f"leg_placed:{bookmaker}:{bet_type}:{game_id}"
-
     def _arb_opportunity_alert_key(self, pair_key):
         return f"arb_opportunity_alert_sent:{pair_key}"
 
@@ -249,17 +246,149 @@ class ArbitrageCache:
         )
         self.redis.delete(self._arb_scan_locked_key(pair_key))
 
+    def _leg_placed_key(self, bookmaker, bet_type, game_id):
+        """Legacy key (book+game only). Do not use for new arb coordination."""
+        return f"leg_placed:{bookmaker}:{bet_type}:{game_id}"
+
+    def _arb_leg_placed_key(self, pair_key, bookmaker, bet_type):
+        bm = (bookmaker or "").strip().lower()
+        bt = (bet_type or "moneyline").strip().lower()
+        return f"arb_leg_placed:{pair_key}:{bm}:{bt}"
+
+    def _book_game_leg_index_key(self, bookmaker, bet_type, game_id):
+        bm = (bookmaker or "").strip().lower()
+        bt = (bet_type or "moneyline").strip().lower()
+        return f"book_game_leg:{bm}:{bt}:{game_id}"
+
+    @staticmethod
+    def game_id_for_book(arb: dict, bookmaker: str) -> str | None:
+        bm = (bookmaker or "").strip().lower()
+        if bm == (arb.get("team_1_bookmaker") or "").strip().lower():
+            return arb.get("team_1_game_id")
+        if bm == (arb.get("team_2_bookmaker") or "").strip().lower():
+            return arb.get("team_2_game_id")
+        return None
+
+    def _register_book_game_leg(self, pair_key, bookmaker, bet_type, game_id):
+        if not game_id:
+            return
+        key = self._book_game_leg_index_key(bookmaker, bet_type, game_id)
+        data = self.redis.get(key) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data[pair_key] = time.time()
+        self.redis.set(key, data, ttl=self.lock_ttl)
+
+    def _unregister_book_game_leg(self, pair_key, bookmaker, bet_type, game_id):
+        if not game_id:
+            return
+        key = self._book_game_leg_index_key(bookmaker, bet_type, game_id)
+        data = self.redis.get(key) or {}
+        if not isinstance(data, dict):
+            return
+        data.pop(pair_key, None)
+        if data:
+            self.redis.set(key, data, ttl=self.lock_ttl)
+        else:
+            self.redis.delete(key)
+
+    def mark_arb_leg_placed(self, arb: dict, bookmaker: str, game_id: str | None = None):
+        """Mark a confirmed leg scoped to this arb pair (not global book+game)."""
+        pair_key = self.arb_pair_key_from_arb(arb)
+        bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
+        bm = (bookmaker or "").strip().lower()
+        gid = game_id or self.game_id_for_book(arb, bookmaker)
+        self.redis.set(
+            self._arb_leg_placed_key(pair_key, bookmaker, bet_type),
+            {
+                "game_id": gid,
+                "placed_at": time.time(),
+                "pair_key": pair_key,
+                "bookmaker": bm,
+                "bet_type": bet_type,
+            },
+            ttl=self.lock_ttl,
+        )
+        self._register_book_game_leg(pair_key, bookmaker, bet_type, gid)
+
+    def is_arb_leg_placed(self, arb: dict, bookmaker: str) -> bool:
+        """True when this book's leg is confirmed for this specific arb pair."""
+        pair_key = self.arb_pair_key_from_arb(arb)
+        bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
+        return bool(self.redis.get(self._arb_leg_placed_key(pair_key, bookmaker, bet_type)))
+
+    def clear_arb_leg_placed(self, arb: dict, bookmaker: str) -> None:
+        pair_key = self.arb_pair_key_from_arb(arb)
+        bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
+        gid = self.game_id_for_book(arb, bookmaker)
+        self.redis.delete(self._arb_leg_placed_key(pair_key, bookmaker, bet_type))
+        self._unregister_book_game_leg(pair_key, bookmaker, bet_type, gid)
+
+    def clear_arb_pair_legs(self, arb: dict) -> None:
+        """Clear both books' pair-scoped leg flags for this arb."""
+        for book in (arb.get("team_1_bookmaker"), arb.get("team_2_bookmaker")):
+            if book:
+                self.clear_arb_leg_placed(arb, book)
+
+    def clear_arb_legs_for_pair_key(self, pair_key: str) -> None:
+        """Clear all pair-scoped leg flags matching pair_key (exposure/summary cleanup)."""
+        pattern = f"arb_leg_placed:{pair_key}:*"
+        for key in self.redis.scan(pattern):
+            payload = self.redis.get(key)
+            if isinstance(payload, dict):
+                self._unregister_book_game_leg(
+                    pair_key,
+                    payload.get("bookmaker"),
+                    payload.get("bet_type"),
+                    payload.get("game_id"),
+                )
+            self.redis.delete(key)
+
+    def has_other_pair_partial_on_book_game(self, arb: dict, bookmaker: str) -> bool:
+        """Block a new pair when another pair still has partial exposure on same book+game."""
+        bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
+        game_id = self.game_id_for_book(arb, bookmaker)
+        if not game_id:
+            return False
+        pair_key = self.arb_pair_key_from_arb(arb)
+        index = self.redis.get(self._book_game_leg_index_key(bookmaker, bet_type, game_id)) or {}
+        if not isinstance(index, dict):
+            return False
+        for other_pair in index:
+            if other_pair == pair_key:
+                continue
+            if self.has_partial_exposure_for_pair(other_pair):
+                return True
+        return False
+
+    def should_skip_arb_leg_placement(self, arb: dict, bookmaker: str) -> tuple[bool, str]:
+        """Return (skip, reason) for betting-loop leg placement."""
+        if self.is_arb_leg_placed(arb, bookmaker):
+            return True, "leg already confirmed for this pair"
+        if self.has_other_pair_partial_on_book_game(arb, bookmaker):
+            return True, "other pair has partial exposure on same book/game"
+        return False, ""
+
+    def purge_legacy_leg_placed_keys(self) -> int:
+        """Remove pre-pair-scoped leg_placed:* keys (global book+game flags)."""
+        removed = 0
+        for key in self.redis.scan("leg_placed:*"):
+            self.redis.delete(key)
+            removed += 1
+        return removed
+
+    # Legacy API — kept for scripts; prefer pair-scoped methods above.
     def clear_leg_placed(self, bookmaker, bet_type, game_id):
         self.redis.delete(self._leg_placed_key(bookmaker, bet_type, game_id))
 
     def is_leg_placed(self, bookmaker, bet_type, game_id):
-        """This bookmaker already has a confirmed leg for this game."""
         return bool(self.redis.get(self._leg_placed_key(bookmaker, bet_type, game_id)))
 
     def mark_leg_placed(self, bookmaker, bet_type, game_id):
+        """Deprecated global book+game flag. Prefer mark_arb_leg_placed(arb, bookmaker)."""
         self.redis.set(
             self._leg_placed_key(bookmaker, bet_type, game_id),
-            {"placed_at": "now"},
+            {"placed_at": time.time()},
             ttl=self.lock_ttl,
         )
 

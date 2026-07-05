@@ -277,7 +277,8 @@ def capture_betamapola_confirmation(
                 if (needles.some(n => n && tl.includes(n))) return el;
               }
             }
-            return document.querySelector('.open-bets, .openBets, main, #content')
+            return document.querySelector('table')
+                || document.querySelector('.open-bets, .openBets, main, #content')
                 || document.body;
             """,
             team_name,

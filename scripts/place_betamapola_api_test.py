@@ -104,12 +104,21 @@ def main():
                 print("Hint: retry with --force-risk-entry if limit is below computed risk")
             return 1
 
-        posted, data, msg = betamapola_process_ticket_via_api(c.driver)
-        print("ProcessTicket:", posted, msg)
+        if c._has_existing_open_bet(
+            gl.get(f"Team{team_no}ID") or args.team_name,
+            gl.get("Team1ID") or "",
+            gl.get("Team2ID") or "",
+        ):
+            print("Open bet already exists — refusing duplicate placement")
+            return 1
+
+        posted, data, msg, submit_mode = betamapola_process_ticket_via_api(
+            c.driver, password=BETAMAPOLA_PASSWORD
+        )
+        print("ProcessTicket:", submit_mode, msg)
         if data:
             ok, ticket, detail = parse_process_ticket_response(data)
             print("Parsed:", ok, ticket, detail)
-
         if not posted:
             return 1
 
@@ -120,6 +129,15 @@ def main():
             process_data=data if isinstance(data, dict) else None,
         )
         print("Confirmed:", confirmed, message)
+        if confirmed:
+            ok, ticket, _ = parse_process_ticket_response(data if isinstance(data, dict) else None)
+            c._notify_open_bets_screenshot(
+                gl.get(f"Team{team_no}ID") or args.team_name,
+                gl.get("Team1ID") or "",
+                gl.get("Team2ID") or "",
+                args.game_id,
+                ticket_number=ticket if ok else None,
+            )
         return 0 if confirmed else 1
     finally:
         c._quit_driver()

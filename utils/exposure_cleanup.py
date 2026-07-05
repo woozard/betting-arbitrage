@@ -17,6 +17,13 @@ def cleanup_stale_partial_exposure(cache, logger, max_age_seconds=None):
     today = datetime.utcnow().date()
     cleared = 0
 
+    legacy_removed = cache.purge_legacy_leg_placed_keys()
+    if legacy_removed:
+        logger.info(
+            f"Cleared {legacy_removed} legacy leg_placed flag(s) "
+            f"(migrated to pair-scoped arb_leg_placed keys)"
+        )
+
     for pair_key in cache.list_partial_exposure_pair_keys():
         parsed = cache.parse_matchup_pair_key(pair_key)
         if not parsed:
@@ -39,6 +46,7 @@ def cleanup_stale_partial_exposure(cache, logger, max_age_seconds=None):
 
         reason = "game day passed" if game_day_passed else f"exposure age {age:.0f}s"
         cache.clear_partial_exposure(pair_key)
+        cache.clear_arb_legs_for_pair_key(pair_key)
         cache.unlock_arb_scan(
             parsed["team_1"],
             parsed["team_2"],

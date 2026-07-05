@@ -98,6 +98,30 @@ def should_notify_failed_bet(last_error: str | None) -> bool:
     return not last_error.startswith("Spread real-money betting disabled")
 
 
+def should_skip_arb_leg_in_betting_loop(
+    cache,
+    logger,
+    arb: dict,
+    bookmaker: str,
+    team_name: str,
+    team_1: str,
+    team_2: str,
+) -> bool:
+    """Return True when the betting loop should not attempt this arb leg."""
+    skip, reason = cache.should_skip_arb_leg_placement(arb, bookmaker)
+    if not skip:
+        return False
+    if reason == "leg already confirmed for this pair":
+        logger.info(
+            f"Skipping — leg already confirmed on {bookmaker} | "
+            f"{team_name} | {team_1} vs {team_2}"
+        )
+        cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
+    else:
+        logger.info(f"Skipping — {reason} | {team_name} | {team_1} vs {team_2}")
+    return True
+
+
 def _format_stake_line(stake) -> str:
     if isinstance(stake, BaseAmountStake):
         return format_base_amount_stake(stake)
@@ -215,7 +239,7 @@ def _dispatch_other_api_leg_screenshot(
     other_game_id = (
         arb["team_2_game_id"] if bookmaker == arb["team_1_bookmaker"] else arb["team_1_game_id"]
     )
-    if not cache.is_leg_placed(other_book, bet_type, other_game_id):
+    if not cache.is_arb_leg_placed(arb, other_book):
         return
 
     leg = arb_leg_for_book(arb, other_book)
@@ -327,7 +351,8 @@ def _dispatch_ops_alert(
     logger.info(f"========== {label} ==========")
     logger.info(alert)
     logger.info(f"========== {label} ==========")
-    if TELEGRAM_ALERTS_ASYNC:
+    # Photo uploads must complete before the caller exits (async thread was dropping screenshots).
+    if TELEGRAM_ALERTS_ASYNC and not photo_path:
         threading.Thread(
             target=_send_ops_alert,
             args=(logger, alert, chat_id, label, photo_path, photo_only),
@@ -354,10 +379,7 @@ def odds_tolerance_for_placement(
     if not is_first_leg_bookmaker(book_1, book_2, bm):
         return SECOND_LEG_ODDS_TOLERANCE
     other_book = book_2 if bm == (book_1 or "").strip().lower() else book_1
-    other_game_id = (
-        arb["team_1_game_id"] if other_book == book_1 else arb["team_2_game_id"]
-    )
-    if cache.is_leg_placed(other_book, bet_type, other_game_id):
+    if cache.is_arb_leg_placed(arb, other_book):
         return SECOND_LEG_ODDS_TOLERANCE
     return 0
 
@@ -370,10 +392,7 @@ def should_defer_for_sequential_first_leg(
     first_leg_book = required_first_leg_book(book_1, book_2, bookmaker)
     if not first_leg_book:
         return False
-    first_leg_game_id = (
-        arb["team_1_game_id"] if book_1 == first_leg_book else arb["team_2_game_id"]
-    )
-    return not cache.is_leg_placed(first_leg_book, bet_type, first_leg_game_id)
+    return not cache.is_arb_leg_placed(arb, first_leg_book)
 
 
 def should_pause_first_leg_for_exposure(
@@ -401,10 +420,7 @@ def should_pause_first_leg_for_exposure(
     bm = (bookmaker or "").strip().lower()
     b1 = (book_1 or "").strip().lower()
     other_book = book_2 if bm == b1 else book_1
-    other_game_id = (
-        arb["team_1_game_id"] if other_book == b1 else arb["team_2_game_id"]
-    )
-    if cache.is_leg_placed(other_book, bet_type, other_game_id):
+    if cache.is_arb_leg_placed(arb, other_book):
         return False
     return True
 
@@ -522,28 +538,18 @@ def maybe_notify_partial_arb_exposure(
     telegram_config: dict,
 ):
     """Alert once when one leg is confirmed but the other book failed to place."""
-    bet_type = arb.get("bet_type", "moneyline")
     book_1 = arb.get("team_1_bookmaker")
     book_2 = arb.get("team_2_bookmaker")
-    game_date = arb.get("game_date")
-    team_1 = arb.get("team_1")
-    team_2 = arb.get("team_2")
     pair_key = cache.arb_pair_key_from_arb(arb)
 
     if cache.partial_arb_alert_already_sent(pair_key):
         return
 
     other_book = book_2 if failed_bookmaker == book_1 else book_1
-    other_game_id = (
-        arb["team_1_game_id"] if other_book == book_1 else arb["team_2_game_id"]
-    )
-    failed_game_id = (
-        arb["team_1_game_id"] if failed_bookmaker == book_1 else arb["team_2_game_id"]
-    )
 
-    if not cache.is_leg_placed(other_book, bet_type, other_game_id):
+    if not cache.is_arb_leg_placed(arb, other_book):
         return
-    if cache.is_leg_placed(failed_bookmaker, bet_type, failed_game_id):
+    if cache.is_arb_leg_placed(arb, failed_bookmaker):
         return
 
     reason_text = format_bet_failure_reason(reason, failed_book)
@@ -621,21 +627,19 @@ def finalize_confirmed_bet(
     event_date = cache.event_date_for_arb(arb)
     spread_value = arb.get("spread_value") if bet_type == "spread" else None
 
-    cache.mark_leg_placed(bookmaker, bet_type, game_id)
+    cache.mark_arb_leg_placed(arb, bookmaker, game_id)
     cache.lock_arb_scan(
         team_1, team_2, book_1, book_2, event_date,
         bet_type=bet_type, spread_value=spread_value,
     )
 
     other_book = book_2 if bookmaker == book_1 else book_1
-    other_game_id = (
-        arb["team_2_game_id"] if bookmaker == arb["team_1_bookmaker"] else arb["team_1_game_id"]
-    )
-    other_leg_placed = cache.is_leg_placed(other_book, bet_type, other_game_id)
+    other_leg_placed = cache.is_arb_leg_placed(arb, other_book)
 
     if other_leg_placed:
         cache.remove_arbitrage_pair(arb)
         cache.clear_partial_exposure(pair_key)
+        cache.clear_arb_pair_legs(arb)
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
             f"both legs confirmed; arb scan locked and cache cleared"
