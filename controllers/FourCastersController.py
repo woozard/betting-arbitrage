@@ -10,6 +10,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    finalize_confirmed_bet_with_screenshot,
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
@@ -760,19 +761,7 @@ class FourCastersController:
                             extra_lines.append(f"Risk: ${fill.get('risk')}")
                         if fill.get("win") is not None:
                             extra_lines.append(f"Win: ${fill.get('win')}")
-                        screenshot_path = capture_bet_screenshot_for_alert(
-                            self.logger,
-                            self.bookmaker,
-                            arb,
-                            team_name,
-                            game_id,
-                            stake_used,
-                            wager_odds,
-                            extra_lines=extra_lines or None,
-                            driver=self._ensure_screenshot_driver(),
-                            open_bets_url="https://4casters.io/my-bets/active-wagers",
-                        )
-                        finalize_confirmed_bet(
+                        finalize_confirmed_bet_with_screenshot(
                             self.cache,
                             self.storage,
                             self.logger,
@@ -784,7 +773,9 @@ class FourCastersController:
                             stake_used,
                             wager_odds,
                             TELEGRAM,
-                            screenshot_path=screenshot_path,
+                            extra_lines=extra_lines or None,
+                            driver=self._ensure_screenshot_driver(),
+                            open_bets_url="https://4casters.io/my-bets/active-wagers",
                         )
                     else:
                         if should_notify_failed_bet(self._last_bet_error):

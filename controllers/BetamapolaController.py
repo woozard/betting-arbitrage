@@ -52,6 +52,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    acknowledge_placed_leg,
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
@@ -2912,6 +2913,14 @@ class BetamapolaController:
                         continue
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
+                    acknowledge_placed_leg(
+                        self.cache,
+                        self.logger,
+                        arb,
+                        self.bookmaker,
+                        game_id,
+                        team_name=team_name,
+                    )
                     screenshot_path = getattr(self, "_last_screenshot_path", None)
                     if not screenshot_path or not os.path.isfile(screenshot_path):
                         screenshot_path = capture_bet_screenshot_for_alert(
@@ -2940,6 +2949,7 @@ class BetamapolaController:
                         TELEGRAM,
                         screenshot_path=screenshot_path,
                         ticket_number=getattr(self, "_last_ticket_number", None),
+                        leg_already_acknowledged=True,
                     )
                     self.logger.info("Re-establishing sport offering before next arbitrage")
                     self.__ensure_sport_offering_loaded()

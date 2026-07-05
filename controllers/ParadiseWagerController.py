@@ -32,6 +32,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    finalize_confirmed_bet_with_screenshot,
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
@@ -1882,21 +1883,7 @@ class ParadiseWagerController:
                     ticket = getattr(self, "_last_ticket_number", None)
                     if ticket:
                         extra_lines.append(f"Ticket: {ticket}")
-                    screenshot_path = capture_bet_screenshot_for_alert(
-                        self.logger,
-                        self.bookmaker,
-                        arb,
-                        team_name,
-                        game_id,
-                        stake_used,
-                        wager_odds,
-                        extra_lines=extra_lines or None,
-                        driver=self.driver,
-                        open_bets_url=f"{self.base_url}/v2/#/pendings",
-                        return_to_sport=lambda: self.driver.get(self.schedule_url),
-                        ticket_number=getattr(self, "_last_ticket_number", None),
-                    )
-                    finalize_confirmed_bet(
+                    finalize_confirmed_bet_with_screenshot(
                         self.cache,
                         self.storage,
                         self.logger,
@@ -1908,7 +1895,10 @@ class ParadiseWagerController:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
-                        screenshot_path=screenshot_path,
+                        extra_lines=extra_lines or None,
+                        driver=self.driver,
+                        open_bets_url=f"{self.base_url}/v2/#/pendings",
+                        return_to_sport=lambda: self.driver.get(self.schedule_url),
                         ticket_number=getattr(self, "_last_ticket_number", None),
                     )
                     self._refresh_schedule_cache()

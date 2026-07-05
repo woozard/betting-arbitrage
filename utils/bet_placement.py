@@ -136,6 +136,12 @@ def should_skip_arb_leg_in_betting_loop(
             f"{team_name} | {team_1} vs {team_2}"
         )
         cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
+    elif reason == "daily game/pair bet already placed on this book":
+        logger.info(
+            f"Skipping — daily game/pair bet limit on {bookmaker} | "
+            f"{team_name} | {team_1} vs {team_2}"
+        )
+        cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
     else:
         logger.info(f"Skipping — {reason} | {team_name} | {team_1} vs {team_2}")
     return True
@@ -635,6 +641,93 @@ def capture_bet_screenshot_for_alert(
     )
 
 
+def acknowledge_placed_leg(
+    cache,
+    logger,
+    arb: dict,
+    bookmaker: str,
+    game_id: str,
+    *,
+    team_name: str | None = None,
+) -> None:
+    """Mark leg + locks immediately after book acceptance, before slow screenshot work."""
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    event_date = cache.event_date_for_arb(arb)
+    spread_value = arb.get("spread_value") if bet_type == "spread" else None
+
+    cache.mark_arb_leg_placed(arb, bookmaker, game_id)
+    cache.lock_arb_scan(
+        team_1, team_2, book_1, book_2, event_date,
+        bet_type=bet_type, spread_value=spread_value,
+    )
+    cache.mark_game_pair_daily_bet(arb, bookmaker, game_id)
+    logger.info(
+        f"Leg acknowledged (pre-screenshot) | {bookmaker}/{team_name or 'team'} | "
+        f"{team_1} vs {team_2}"
+    )
+
+
+def finalize_confirmed_bet_with_screenshot(
+    cache,
+    storage,
+    logger,
+    arb: dict,
+    bookmaker: str,
+    team_no: int,
+    team_name: str,
+    game_id: str,
+    stake,
+    moneyline_odd,
+    telegram_config: dict,
+    *,
+    driver=None,
+    open_bets_url: str | None = None,
+    return_to_sport=None,
+    extra_lines: list[str] | None = None,
+    ticket_number=None,
+    placed_odds=None,
+) -> None:
+    """Acknowledge leg immediately, capture screenshot, then finish alerts/DB."""
+    acknowledge_placed_leg(
+        cache, logger, arb, bookmaker, game_id, team_name=team_name
+    )
+    screenshot_path = capture_bet_screenshot_for_alert(
+        logger,
+        bookmaker,
+        arb,
+        team_name,
+        game_id,
+        stake,
+        moneyline_odd,
+        driver=driver,
+        open_bets_url=open_bets_url,
+        return_to_sport=return_to_sport,
+        extra_lines=extra_lines,
+        ticket_number=ticket_number,
+    )
+    finalize_confirmed_bet(
+        cache,
+        storage,
+        logger,
+        arb,
+        bookmaker,
+        team_no,
+        team_name,
+        game_id,
+        stake,
+        moneyline_odd,
+        telegram_config,
+        screenshot_path=screenshot_path,
+        ticket_number=ticket_number,
+        placed_odds=placed_odds,
+        leg_already_acknowledged=True,
+    )
+
+
 def finalize_confirmed_bet(
     cache,
     storage,
@@ -651,6 +744,7 @@ def finalize_confirmed_bet(
     *,
     ticket_number=None,
     placed_odds=None,
+    leg_already_acknowledged: bool = False,
 ):
     """Run after a bookmaker has confirmed bet acceptance (not merely clicked Place Bet)."""
     sport = arb.get("sport")
@@ -666,11 +760,13 @@ def finalize_confirmed_bet(
     spread_value = arb.get("spread_value") if bet_type == "spread" else None
     odds_for_record = placed_odds if placed_odds is not None else moneyline_odd
 
-    cache.mark_arb_leg_placed(arb, bookmaker, game_id)
-    cache.lock_arb_scan(
-        team_1, team_2, book_1, book_2, event_date,
-        bet_type=bet_type, spread_value=spread_value,
-    )
+    if not leg_already_acknowledged:
+        cache.mark_arb_leg_placed(arb, bookmaker, game_id)
+        cache.lock_arb_scan(
+            team_1, team_2, book_1, book_2, event_date,
+            bet_type=bet_type, spread_value=spread_value,
+        )
+        cache.mark_game_pair_daily_bet(arb, bookmaker, game_id)
 
     other_book = book_2 if bookmaker == book_1 else book_1
     other_leg_placed = cache.is_arb_leg_placed(arb, other_book)

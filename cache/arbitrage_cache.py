@@ -363,11 +363,46 @@ class ArbitrageCache:
 
     def should_skip_arb_leg_placement(self, arb: dict, bookmaker: str) -> tuple[bool, str]:
         """Return (skip, reason) for betting-loop leg placement."""
+        if self.is_game_pair_daily_bet_placed(arb, bookmaker):
+            return True, "daily game/pair bet already placed on this book"
         if self.is_arb_leg_placed(arb, bookmaker):
             return True, "leg already confirmed for this pair"
         if self.has_other_pair_partial_on_book_game(arb, bookmaker):
             return True, "other pair has partial exposure on same book/game"
         return False, ""
+
+    def _game_pair_daily_bet_key(self, pair_key: str, bookmaker: str, bet_type: str) -> str:
+        bm = (bookmaker or "").strip().lower()
+        bt = (bet_type or "moneyline").strip().lower()
+        return f"game_pair_daily_bet:{pair_key}:{bm}:{bt}"
+
+    def is_game_pair_daily_bet_placed(self, arb: dict, bookmaker: str) -> bool:
+        """True when this book already placed on this matchup/pair today."""
+        pair_key = self.arb_pair_key_from_arb(arb)
+        bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
+        return bool(
+            self.redis.get(self._game_pair_daily_bet_key(pair_key, bookmaker, bet_type))
+        )
+
+    def mark_game_pair_daily_bet(
+        self, arb: dict, bookmaker: str, game_id: str | None = None
+    ) -> None:
+        """One bet per book per game/pair per day — survives leg-flag cleanup."""
+        pair_key = self.arb_pair_key_from_arb(arb)
+        bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
+        bm = (bookmaker or "").strip().lower()
+        gid = game_id or self.game_id_for_book(arb, bookmaker)
+        self.redis.set(
+            self._game_pair_daily_bet_key(pair_key, bookmaker, bet_type),
+            {
+                "game_id": gid,
+                "placed_at": time.time(),
+                "pair_key": pair_key,
+                "bookmaker": bm,
+                "bet_type": bet_type,
+            },
+            ttl=self.lock_ttl,
+        )
 
     def purge_legacy_leg_placed_keys(self) -> int:
         """Remove pre-pair-scoped leg_placed:* keys (global book+game flags)."""

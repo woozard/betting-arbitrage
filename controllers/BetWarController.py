@@ -41,6 +41,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    finalize_confirmed_bet_with_screenshot,
     capture_bet_screenshot_for_alert,
     format_bet_failure_reason,
     maybe_notify_partial_arb_exposure,
@@ -5045,17 +5046,7 @@ class BetWarController:
                         f"Recovering scoped My Bets wager for {team_name} | "
                         f"{team_1} vs {team_2} on {self.bookmaker}"
                     )
-                    screenshot_path = capture_bet_screenshot_for_alert(
-                        self.logger,
-                        self.bookmaker,
-                        arb,
-                        team_name,
-                        game_id,
-                        stake_plan,
-                        wager_odds,
-                        driver=self.driver,
-                    )
-                    finalize_confirmed_bet(
+                    finalize_confirmed_bet_with_screenshot(
                         self.cache,
                         self.storage,
                         self.logger,
@@ -5067,7 +5058,7 @@ class BetWarController:
                         stake_plan,
                         wager_odds,
                         TELEGRAM,
-                        screenshot_path=screenshot_path,
+                        driver=self.driver,
                     )
                     self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                     continue
@@ -5101,17 +5092,7 @@ class BetWarController:
                     )
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
-                    screenshot_path = capture_bet_screenshot_for_alert(
-                        self.logger,
-                        self.bookmaker,
-                        arb,
-                        team_name,
-                        game_id,
-                        stake_used,
-                        wager_odds,
-                        driver=self.driver,
-                    )
-                    finalize_confirmed_bet(
+                    finalize_confirmed_bet_with_screenshot(
                         self.cache,
                         self.storage,
                         self.logger,
@@ -5123,7 +5104,7 @@ class BetWarController:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
-                        screenshot_path=screenshot_path,
+                        driver=self.driver,
                     )
                     self.logger.info("Re-establishing sport offering before next arbitrage")
                     self.__ensure_sport_offering_loaded()

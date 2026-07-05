@@ -10,6 +10,7 @@ from utils.bet_placement import (
     REAL_MONEY_BETTING_PAUSED_MSG,
     block_real_money_bet,
     finalize_confirmed_bet,
+    finalize_confirmed_bet_with_screenshot,
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
@@ -993,17 +994,7 @@ class ThreeEtController:
                     status = bet_payload.get("status")
                     if status:
                         extra_lines.append(f"Status: {status}")
-                    screenshot_path = capture_bet_screenshot_for_alert(
-                        self.logger,
-                        self.bookmaker,
-                        arb,
-                        team_name,
-                        game_id,
-                        stake_used,
-                        wager_odds,
-                        extra_lines=extra_lines or None,
-                    )
-                    finalize_confirmed_bet(
+                    finalize_confirmed_bet_with_screenshot(
                         self.cache,
                         self.storage,
                         self.logger,
@@ -1015,7 +1006,7 @@ class ThreeEtController:
                         stake_used,
                         wager_odds,
                         TELEGRAM,
-                        screenshot_path=screenshot_path,
+                        extra_lines=extra_lines or None,
                     )
                 else:
                     if should_notify_failed_bet(self._last_bet_error):
