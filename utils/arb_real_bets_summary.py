@@ -46,12 +46,14 @@ def record_confirmed_leg(
     team_name: str,
     odds,
     stake,
+    *,
+    ticket_number=None,
 ) -> None:
     _store_arb_snapshot(cache, pair_key, arb)
     data = cache.redis.get(_summary_redis_key(pair_key)) or {}
     side = _leg_side(bookmaker, arb)
     stake_pair = _stake_tuple(stake)
-    data[side] = {
+    leg_entry = {
         "bookmaker": bookmaker,
         "team_no": team_no,
         "team_name": team_name,
@@ -60,6 +62,9 @@ def record_confirmed_leg(
         "risk": stake_pair[0] if stake_pair else None,
         "to_win": stake_pair[1] if stake_pair else None,
     }
+    if ticket_number not in (None, "", 0, "0"):
+        leg_entry["ticket_number"] = str(ticket_number).strip()
+    data[side] = leg_entry
     cache.redis.set(_summary_redis_key(pair_key), data, ttl=cache.lock_ttl)
 
 
@@ -79,7 +84,7 @@ def _store_arb_snapshot(cache, pair_key: str, arb: dict) -> None:
     data = cache.redis.get(_summary_redis_key(pair_key)) or {}
     if not data.get("arb"):
         snapshot = {k: arb.get(k) for k in (
-            "sport", "league", "game_date", "team_1", "team_2",
+            "sport", "league", "game_date", "game_datetime", "team_1", "team_2",
             "team_1_bookmaker", "team_2_bookmaker", "team_1_odds", "team_2_odds",
             "team_1_game_id", "team_2_game_id", "bet_type", "profit_pct",
             "spread_value", "spread_line_team_1", "spread_line_team_2",
@@ -140,6 +145,10 @@ def _build_summary_alert(cache, pair_key: str, outcome: str) -> str | None:
         leg2_stake=_leg_stake(leg2),
         leg1_failure=_leg_failure(leg1),
         leg2_failure=_leg_failure(leg2),
+        leg1_placed_odds=leg1.get("odds") if leg1.get("placed") else None,
+        leg2_placed_odds=leg2.get("odds") if leg2.get("placed") else None,
+        leg1_ticket=leg1.get("ticket_number"),
+        leg2_ticket=leg2.get("ticket_number"),
     )
     if outcome == "complete":
         header = "===== Arb Complete (Real Money) ====="

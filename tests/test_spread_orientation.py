@@ -143,10 +143,10 @@ def test_build_leg_confirmed_alert_leg_one_of_two():
     )
     assert "Leg 1 of 2" in alert
     assert "Book: betwar" in alert
-    assert "This bet: Pirates +140" in alert
+    assert "Bet: Pirates +140" in alert
+    assert "Date: 2026-07-03" in alert
     assert "Waiting for leg 2 on 3et" in alert
-    assert "Screenshot: attached below" in alert
-    assert "3et" not in alert.split("This bet:")[1].split("Real money:")[0]
+    assert "3et" not in alert.split("Bet:")[1].split("Stake:")[0]
 
 
 def test_build_leg_confirmed_alert_leg_two_of_two():
@@ -173,9 +173,9 @@ def test_build_leg_confirmed_alert_leg_two_of_two():
     )
     assert "Leg 2 of 2" in alert
     assert "Book: 3et" in alert
-    assert "This bet: Nationals -133" in alert
+    assert "Bet: Nationals -133" in alert
+    assert "Date: 2026-07-03" in alert
     assert "summary will post to Real Bets shortly" in alert
-    assert "Screenshot: attached below" in alert
 
 
 def test_format_arb_complete_alert_failed():

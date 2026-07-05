@@ -31,7 +31,7 @@ from utils.helpers import (
     parse_to_mysql_datetime,
     send_monitoring_alert,
     teams_same,
-    arb_live_odds_acceptable,
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
 )
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
@@ -450,9 +450,7 @@ class ThreeEtController:
 
     def _arb_odds_exact_match(self, live_odds: str, expected_odds: str) -> bool:
         tol = getattr(self, "_odds_tolerance", 0) or 0
-        if tol > 0:
-            return arb_live_odds_acceptable(expected_odds, live_odds, tol)
-        return str(live_odds).strip() == str(expected_odds).strip()
+        return arb_moneyline_odds_acceptable(expected_odds, live_odds, tol)
 
     def _parse_bet_api_response(self, result) -> tuple[bool, str, bool, dict]:
         """Return (accepted, message, retryable, bet_dict)."""

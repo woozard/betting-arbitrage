@@ -22,7 +22,7 @@ import undetected_chromedriver as uc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, extract_spread_line_odds_from_label, spread_values_match
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.odds_watch import persist_moneyline_games
@@ -1767,7 +1767,7 @@ class Sports411Controller:
 
     def _arb_odds_match(self, cached_odd, live_odd) -> bool:
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
-        return arb_live_odds_acceptable(cached_odd, live_odd, tolerance)
+        return arb_moneyline_odds_acceptable(cached_odd, live_odd, tolerance)
 
     def _reject_if_line_moved(self, cached_odd, live_odd, where: str):
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
@@ -3022,6 +3022,7 @@ class Sports411Controller:
                         wager_odds,
                         TELEGRAM,
                         screenshot_path=screenshot_path,
+                        ticket_number=getattr(self, "_last_ticket_number", None),
                     )
                     self.logger.info("Returning to sport page and resuming odds watch")
                     self._resume_odds_watch_on_sport_page()

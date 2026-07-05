@@ -22,7 +22,7 @@ from utils.helpers import (
     debug_filepath,
     prune_debug_files,
     teams_same,
-    arb_live_odds_acceptable,
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
     spread_values_match,
     resolve_paradise_team_spread_lines,
 )
@@ -389,7 +389,7 @@ class ParadiseWagerController:
 
     def _arb_odds_exact_match(self, displayed, expected) -> bool:
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
-        return arb_live_odds_acceptable(expected, displayed, tolerance)
+        return arb_moneyline_odds_acceptable(expected, displayed, tolerance)
 
     @staticmethod
     def _team_name_matches(candidate: str, expected: str) -> bool:
@@ -1905,6 +1905,7 @@ class ParadiseWagerController:
                         wager_odds,
                         TELEGRAM,
                         screenshot_path=screenshot_path,
+                        ticket_number=getattr(self, "_last_ticket_number", None),
                     )
                     self._refresh_schedule_cache()
 

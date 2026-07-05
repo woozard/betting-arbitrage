@@ -351,6 +351,10 @@ class ArbitrageController:
                     else:
                         a_t1, a_t2, b_t1, b_t2 = aligned
                         spread_value = None
+                        if not is_plausible_moneyline_pair(a_t1, a_t2):
+                            continue
+                        if not is_plausible_moneyline_pair(b_t1, b_t2):
+                            continue
 
                     arb_total = self.__calc_arb_total(a_t1, b_t2)
                     if arb_total:
@@ -598,6 +602,17 @@ class ArbitrageController:
                 f"{t1['bookmaker']} vs {t2['bookmaker']}"
             )
             return None
+
+        if bet_type == "moneyline":
+            t1_ml = team_1_odds if team_1_odds is not None else t1.get("moneyline_team_1")
+            t2_ml = team_2_odds if team_2_odds is not None else t2.get("moneyline_team_2")
+            if not is_plausible_moneyline_pair(t1_ml, t2_ml):
+                self.logger.info(
+                    f"Skipping arb (both legs same ML side) - "
+                    f"{o1['team_1']} vs {o1['team_2']} | "
+                    f"{t1['bookmaker']} {t1_ml} vs {t2['bookmaker']} {t2_ml}"
+                )
+                return None
 
         arb_data = self.__build_arb_data(
             o1,

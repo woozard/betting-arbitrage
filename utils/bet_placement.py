@@ -15,6 +15,10 @@ from utils.config import (
     required_first_leg_book,
 )
 from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS, arb_leg_for_book
+from utils.moneyline_arb import (
+    validate_cross_leg_moneyline_signs,
+    validate_moneyline_arb_payload,
+)
 from utils.arb_real_bets_summary import (
     record_confirmed_leg,
     schedule_complete_summary,
@@ -26,6 +30,8 @@ from utils.helpers import (
     format_utc_timestamp,
     format_arb_complete_alert,
     format_american_alert_odds,
+    format_arb_game_schedule,
+    format_alert_ticket_line,
     normalize_spread_value,
     american_odds_to_int,
     BOOK_ALERT_LABELS,
@@ -108,6 +114,19 @@ def should_skip_arb_leg_in_betting_loop(
     team_2: str,
 ) -> bool:
     """Return True when the betting loop should not attempt this arb leg."""
+    ml_reason = validate_moneyline_arb_payload(arb)
+    if ml_reason:
+        logger.info(f"Skipping — {ml_reason} | {team_name} | {team_1} vs {team_2}")
+        cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
+        return True
+
+    leg = arb_leg_for_book(arb, bookmaker)
+    cross_reason = validate_cross_leg_moneyline_signs(cache, arb, bookmaker, leg)
+    if cross_reason:
+        logger.info(f"Skipping — {cross_reason} | {team_name} | {team_1} vs {team_2}")
+        cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
+        return True
+
     skip, reason = cache.should_skip_arb_leg_placement(arb, bookmaker)
     if not skip:
         return False
@@ -434,11 +453,12 @@ def _build_leg_confirmed_alert(
     moneyline_odd,
     other_book: str,
     other_leg_placed: bool,
+    *,
+    ticket_number=None,
 ) -> str:
     identified_at = arb.get("identified_at")
     sport = arb.get("sport")
     league = arb.get("league")
-    game_date = arb.get("game_date")
     team_1 = arb.get("team_1")
     team_2 = arb.get("team_2")
     bet_type = arb.get("bet_type", "moneyline")
@@ -448,6 +468,8 @@ def _build_leg_confirmed_alert(
     other_label = _book_alert_label(other_book)
     pair = f"{_book_alert_label(book_1)} × {_book_alert_label(book_2)}"
     bet_line = _format_placed_bet_line(arb, team_name, team_no, moneyline_odd)
+    game_schedule = format_arb_game_schedule(arb)
+    ticket_line = format_alert_ticket_line(ticket_number)
 
     if other_leg_placed:
         leg_no = 2
@@ -462,20 +484,26 @@ def _build_leg_confirmed_alert(
     if bet_type == "spread":
         market = f"spread ({arb.get('spread_value')})"
 
-    return (
-        f"{header}\n\n"
-        f"Book: {book_label}\n"
-        f"Leg: {leg_no} of 2 in {pair}\n"
-        f"Identified At: {format_utc_timestamp(identified_at)}\n"
-        f"Sport: {sport} · {league}\n"
-        f"Date: {game_date}\n"
-        f"Match: {team_1} vs {team_2}\n"
-        f"Market: {market}\n\n"
-        f"This bet: {bet_line}\n"
-        f"Real money: {_format_real_money_stake(stake)}\n\n"
-        f"Screenshot: attached below\n"
-        f"Status: {status}\n"
-    )
+    lines = [
+        header,
+        "",
+        f"{team_1} vs {team_2}",
+        f"Date: {game_schedule}",
+        "",
+        f"Book: {book_label} · leg {leg_no}/2 · {pair}",
+        f"Market: {market}",
+        f"Bet: {bet_line}",
+        f"Stake: {_format_real_money_stake(stake)}",
+    ]
+    if ticket_line:
+        lines.append(ticket_line)
+    lines.extend([
+        "",
+        f"Arb spotted: {format_utc_timestamp(identified_at)}",
+        f"Status: {status}",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 def _build_arb_complete_alert(arb: dict, stake) -> str:
@@ -613,6 +641,9 @@ def finalize_confirmed_bet(
     moneyline_odd,
     telegram_config: dict,
     screenshot_path: str | None = None,
+    *,
+    ticket_number=None,
+    placed_odds=None,
 ):
     """Run after a bookmaker has confirmed bet acceptance (not merely clicked Place Bet)."""
     sport = arb.get("sport")
@@ -626,6 +657,7 @@ def finalize_confirmed_bet(
     pair_key = cache.arb_pair_key_from_arb(arb)
     event_date = cache.event_date_for_arb(arb)
     spread_value = arb.get("spread_value") if bet_type == "spread" else None
+    odds_for_record = placed_odds if placed_odds is not None else moneyline_odd
 
     cache.mark_arb_leg_placed(arb, bookmaker, game_id)
     cache.lock_arb_scan(
@@ -662,7 +694,7 @@ def finalize_confirmed_bet(
         "bet_type": bet_type,
         "team_no": team_no,
         "team_name": team_name,
-        "odds": moneyline_odd,
+        "odds": odds_for_record,
         "stake": _stake_risk_amount(stake),
     }
     if isinstance(stake, BaseAmountStake):
@@ -677,7 +709,15 @@ def finalize_confirmed_bet(
     screenshots_chat = _screenshots_telegram_chat(telegram_config)
 
     record_confirmed_leg(
-        cache, pair_key, arb, bookmaker, team_no, team_name, moneyline_odd, stake
+        cache,
+        pair_key,
+        arb,
+        bookmaker,
+        team_no,
+        team_name,
+        odds_for_record,
+        stake,
+        ticket_number=ticket_number,
     )
 
     if not cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
@@ -687,9 +727,10 @@ def finalize_confirmed_bet(
             team_no,
             team_name,
             stake,
-            moneyline_odd,
+            odds_for_record,
             other_book,
             other_leg_placed,
+            ticket_number=ticket_number,
         )
         if _dispatch_ops_alert(
             logger,

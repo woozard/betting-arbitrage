@@ -23,6 +23,7 @@ from utils.helpers import (
     align_cross_book_spreads,
     format_arb_opportunity_alert,
     is_game_pregame,
+    is_plausible_moneyline_pair,
     parse_game_datetime,
     spread_lines_from_row,
     spread_market_label,
@@ -152,6 +153,12 @@ def _send_opportunity_alert(cache, logger, arb_data: dict):
         bet_type=bet_type,
         spread_value=spread_value,
     ):
+        logger.info(
+            f"Skipping duplicate KC Arb Alerts telegram (already sent today) — "
+            f"{arb_data['team_1']} vs {arb_data['team_2']} | "
+            f"{arb_data['team_1_bookmaker']} vs {arb_data['team_2_bookmaker']} | "
+            f"profit {arb_data.get('profit_pct')}%"
+        )
         return
 
     alert = format_arb_opportunity_alert(arb_data, spread_value=spread_value)
@@ -205,6 +212,10 @@ def _try_insert_pair(cache, logger, o1, o2, t1_from, t2_from, bet_type) -> int:
             return 0
         a_t1, a_t2, b_t1, b_t2 = aligned
         spread_value = None
+        if not is_plausible_moneyline_pair(a_t1, a_t2):
+            return 0
+        if not is_plausible_moneyline_pair(b_t1, b_t2):
+            return 0
 
     if cache.is_arb_scan_locked(
         o1["team_1"],
@@ -234,6 +245,10 @@ def _try_insert_pair(cache, logger, o1, o2, t1_from, t2_from, bet_type) -> int:
 
         team_1_odds = leg_a if tf_a == t1_from else leg_b
         team_2_odds = leg_b if tf_b == t2_from else leg_a
+        if bet_type == "moneyline" and not is_plausible_moneyline_pair(
+            team_1_odds, team_2_odds
+        ):
+            continue
         arb_data = build_arb_data(
             o1,
             o2,

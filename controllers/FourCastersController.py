@@ -31,7 +31,7 @@ from utils.helpers import (
     parse_to_mysql_datetime,
     send_monitoring_alert,
     teams_same,
-    arb_live_odds_acceptable,
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
     american_odds_to_int,
 )
 from utils.logger import Logger
@@ -282,9 +282,7 @@ class FourCastersController:
 
     def _arb_odds_exact_match(self, live_odds: str, expected_odds: str) -> bool:
         tol = getattr(self, "_odds_tolerance", 0) or 0
-        if tol > 0:
-            return arb_live_odds_acceptable(expected_odds, live_odds, tol)
-        return str(live_odds).strip() == str(expected_odds).strip()
+        return arb_moneyline_odds_acceptable(expected_odds, live_odds, tol)
 
     def _place_bet_via_api(
         self,

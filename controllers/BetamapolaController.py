@@ -33,7 +33,8 @@ from utils.betamapola_wager_api import (
 )
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, arb_live_odds_acceptable, resolve_ticosports_spread_lines, spread_values_match
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, resolve_ticosports_spread_lines, spread_values_match
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.ticosports_wager import (
@@ -423,7 +424,7 @@ class BetamapolaController:
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
-        if tolerance > 0 and arb_live_odds_acceptable(expected, displayed, tolerance):
+        if tolerance > 0 and arb_moneyline_odds_acceptable(expected, displayed, tolerance):
             return True
         disp = self._normalize_us_odds((displayed or "").strip())
         exp = self._normalize_us_odds(expected)
@@ -2346,6 +2347,7 @@ class BetamapolaController:
                 ticket_number = None
 
         self.logger.info(f"Bet accepted by bookmaker (API path): {message}")
+        self._last_ticket_number = ticket_number
         self._notify_open_bets_screenshot(
             team_name,
             matchup_1,
@@ -2947,6 +2949,7 @@ class BetamapolaController:
                         wager_odds,
                         TELEGRAM,
                         screenshot_path=screenshot_path,
+                        ticket_number=getattr(self, "_last_ticket_number", None),
                     )
                     self.logger.info("Re-establishing sport offering before next arbitrage")
                     self.__ensure_sport_offering_loaded()

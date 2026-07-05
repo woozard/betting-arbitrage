@@ -27,10 +27,11 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 30
 
-  - name: betwar_betting
-    script: betwar_betting.py
-    interval_seconds: 30
-    start_offset_seconds: 35
+  # BetWar disabled — placement bugs under investigation (My Bets recovery, rotation fallback, etc.)
+  # - name: betwar_betting
+  #   script: betwar_betting.py
+  #   interval_seconds: 30
+  #   start_offset_seconds: 35
 
   # LowVig: Browser API connects + login form loads; password entry blocked until Bright Data KYC approval.
   # - name: lowvig_betting

@@ -21,7 +21,14 @@ import sqlalchemy.exc
 from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
 from utils.logger import Logger
 from utils.storage import Storage
-from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, teams_same, resolve_ticosports_spread_lines, spread_values_match
+from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, american_odds_to_int, teams_same, resolve_ticosports_spread_lines, spread_values_match
+from utils.betwar_odds import (
+    moneyline_int_odds_acceptable as betwar_moneyline_int_ok,
+    moneyline_odds_acceptable as betwar_moneyline_ok,
+    normalize_us_odds as betwar_normalize_us_odds,
+    parse_betslip_moneyline_odds as betwar_parse_betslip_ml_odds,
+    parse_displayed_american_odds as betwar_parse_displayed_odds,
+)
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.ticosports_wager import click_line_via_angular
@@ -632,13 +639,43 @@ class BetWarController:
     # ===================================================================
     @staticmethod
     def _normalize_us_odds(odds) -> str:
-        """Normalize -101.0 / '-101' / +100.0 to comparable integer strings."""
-        try:
-            val = int(float(odds))
-            return f"+{val}" if val > 0 else str(val)
-        except (TypeError, ValueError):
-            text = str(odds).strip()
-            return text if text.startswith(("+", "-")) else f"+{text}"
+        return betwar_normalize_us_odds(odds)
+
+    @classmethod
+    def _parse_displayed_american_odds(cls, display_text, expected_odd=None) -> int | None:
+        return betwar_parse_displayed_odds(display_text, expected_odd)
+
+    def _moneyline_odds_acceptable(
+        self, display_text: str, expected_odd, tolerance: int | None = None
+    ) -> bool:
+        tol = tolerance if tolerance is not None else (getattr(self, "_odds_tolerance", 0) or 0)
+        if self._odds_text_matches(display_text, expected_odd):
+            return True
+        return betwar_moneyline_ok(display_text, expected_odd, tol)
+
+    def _moneyline_int_odds_acceptable(
+        self, live_odds: int, expected_odd, tolerance: int | None = None
+    ) -> bool:
+        tol = tolerance if tolerance is not None else (getattr(self, "_odds_tolerance", 0) or 0)
+        return betwar_moneyline_int_ok(live_odds, expected_odd, tol)
+
+    def _parse_betslip_moneyline_odds(self, slip_text: str, expected_odd=None) -> int | None:
+        return betwar_parse_betslip_ml_odds(slip_text, expected_odd)
+
+    def _assert_betslip_moneyline_odds(self, team_name: str, moneyline_odd) -> None:
+        slip = self._betslip_text()
+        live = self._parse_betslip_moneyline_odds(slip, moneyline_odd)
+        if live is None:
+            raise Exception(
+                f"Could not parse moneyline odds from bet slip for {team_name}: {slip[:250]}"
+            )
+        if not self._moneyline_int_odds_acceptable(live, moneyline_odd):
+            tol = getattr(self, "_odds_tolerance", 0) or 0
+            raise Exception(
+                f"Bet slip shows wrong ML side/odds for {team_name}: "
+                f"slip={live:+d}, expected={self._normalize_us_odds(moneyline_odd)} "
+                f"(tolerance ±{tol})"
+            )
 
     def _standardize_team_name(self, raw: str) -> str:
         return standard_team_name(raw, sport=self.sport_name, league=self.league)
@@ -989,15 +1026,17 @@ class BetWarController:
                 target = self._pick_moneyline_click_target(ml_card)
                 if target and self._odds_text_matches(txt, moneyline_odd):
                     return target
-                if fallback is None and target and (linekey or ml_card.get_attribute("onclick")):
+                if (
+                    fallback is None
+                    and target
+                    and self._moneyline_odds_acceptable(txt, moneyline_odd)
+                ):
                     fallback = target
 
-            if fallback is not None and (
-                getattr(self, "_odds_tolerance", 0) or not moneyline_odd
-            ):
+            if fallback is not None:
                 self.logger.info(
                     f"Using rotation-row moneyline for {label_text} @ {rot_text} "
-                    f"(expected {moneyline_odd}, tolerance active)"
+                    f"(expected {moneyline_odd}, within tolerance)"
                 )
                 return fallback
 
@@ -1332,8 +1371,7 @@ class BetWarController:
             if not keyed:
                 return None
             txt = (keyed.text or "").strip()
-            tol = getattr(self, "_odds_tolerance", 0) or 0
-            if self._odds_text_matches(txt, moneyline_odd) or tol > 0:
+            if self._moneyline_odds_acceptable(txt, moneyline_odd):
                 self.logger.info(
                     f"Full-game ML via linekey {self._extract_data_linekey(keyed)} "
                     f"for {team_name} @ {moneyline_odd}"
@@ -4372,6 +4410,28 @@ class BetWarController:
                     f"GetLines team label for {team_name}: {display_name} (team_no={team_no})"
                 )
 
+            if bet_type == "moneyline" and live_odds is not None:
+                if not self._moneyline_odds_acceptable(str(live_odds), moneyline_odd):
+                    live_parsed = self._parse_displayed_american_odds(
+                        str(live_odds), moneyline_odd
+                    )
+                    try:
+                        exp_parsed = american_odds_to_int(moneyline_odd)
+                    except (TypeError, ValueError):
+                        exp_parsed = None
+                    if (
+                        live_parsed is not None
+                        and exp_parsed is not None
+                        and (live_parsed > 0) != (exp_parsed > 0)
+                    ):
+                        raise Exception(
+                            f"Wrong side on GetLines for {team_name}: live {live_parsed:+d} "
+                            f"vs arb {self._normalize_us_odds(moneyline_odd)}"
+                        )
+                    raise Exception(
+                        f"Line moved: GetLines live {live_odds} differs from arb {moneyline_odd}"
+                    )
+
             if not self._ensure_bet_board_ready(game_id):
                 raise Exception(f"{self.sport_name} lines not loaded before bet placement")
 
@@ -4596,6 +4656,9 @@ class BetWarController:
                 self.driver, stake_plan, self.logger, scope_css="#divBetSlip, #pills-betslip"
             ):
                 raise Exception("Could not locate bet slip stake input for base amount")
+
+            if bet_type != "spread":
+                self._assert_betslip_moneyline_odds(slip_team, moneyline_odd)
 
             self._accept_line_changes()
             if not self._fill_wager_password_if_required():
