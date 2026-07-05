@@ -81,9 +81,16 @@ def main():
         text = controller._my_bets_tab_text(timeout=15)
         logger.info(f"My Bets preview ({len(text)} chars):\n{text[:400]}")
 
-        if not controller._my_bets_has_wager(team_name, stake_plan):
+        if not controller._my_bets_has_wager_for_arb(
+            team_name,
+            stake_plan,
+            arb["team_1"],
+            arb["team_2"],
+            wager_odds,
+            game_id=game_id,
+        ):
             print(
-                f"No matching My Bets wager for {team_name} "
+                f"No scoped My Bets wager for {team_name} | {arb['team_1']} vs {arb['team_2']} "
                 f"(base ${args.stake:.2f}, to-win ${stake_plan.to_win:.2f})"
             )
             sys.exit(1)

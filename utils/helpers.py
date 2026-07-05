@@ -1061,25 +1061,8 @@ def format_american_alert_odds(odds) -> str:
     return str(val)
 
 
-def format_arb_opportunity_alert(arb, spread_value=None) -> str:
-    """Compact KC Arb Alerts format with market type and spread context.
-
-    Spread example:
-        Spread — run_line (+1.5) · +1.07%
-        Cincinnati Reds vs Milwaukee Brewers
-
-        Reds +1.5 -135 3et
-
-        Brewers -1.5 +130 s411
-
-    Moneyline example:
-        ML · +1.06%
-        St. Louis Cardinals vs Atlanta Braves
-
-        Cardinals +120 4casters
-
-        Braves -115 betwar
-    """
+def _format_arb_opportunity_lines(arb, spread_value=None) -> list[str]:
+    """Lines describing what the arb scanner found (both legs at cached odds)."""
     def _attr(name, default=None):
         if isinstance(arb, dict):
             return arb.get(name, default)
@@ -1118,6 +1101,9 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
         header_lines.append(f"ML{profit_suffix}")
 
     header_lines.append(f"{team_1} vs {team_2}")
+    schedule = format_arb_game_schedule(arb)
+    if schedule:
+        header_lines.append(schedule)
     header_lines.append("")
 
     if bet_type == "spread":
@@ -1137,7 +1123,18 @@ def format_arb_opportunity_alert(arb, spread_value=None) -> str:
         leg1 = f"{short_1} {odds1} {book1}"
         leg2 = f"{short_2} {odds2} {book2}"
 
-    return "\n".join(header_lines + [leg1, "", leg2])
+    return header_lines + [leg1, "", leg2]
+
+
+def format_arb_opportunity_alert(arb, spread_value=None) -> str:
+    """KC Arb Alerts — what the engine found (→ arbitrage Telegram channel)."""
+    body = "\n".join(_format_arb_opportunity_lines(arb, spread_value=spread_value))
+    return f"===== Arb Opportunity =====\n\n{body}"
+
+
+def format_arb_opportunity_body(arb, spread_value=None) -> str:
+    """Body only (no header) for embedding in real-money summaries."""
+    return "\n".join(_format_arb_opportunity_lines(arb, spread_value=spread_value))
 
 
 def format_arb_complete_alert(
@@ -1217,29 +1214,7 @@ def format_arb_complete_alert(
             stake_part = f" · ${plan.risk:.2f}→${plan.to_win:.2f}"
         return stake_part + _ticket_suffix(ticket)
 
-    profit_suffix = ""
-    if profit_pct is not None:
-        try:
-            pct = float(profit_pct)
-            sign = "+" if pct >= 0 else ""
-            profit_suffix = f" · {sign}{pct:.2f}%"
-        except (TypeError, ValueError):
-            profit_suffix = ""
-
     status_mark = "✓" if outcome == "complete" else "✗"
-
-    header_lines = []
-    if bet_type == "spread":
-        market = spread_market_label(spread_value, sport)
-        header_lines.append(f"Spread — {market}{profit_suffix} {status_mark}")
-    else:
-        header_lines.append(f"ML{profit_suffix} {status_mark}")
-
-    header_lines.append(f"{team_1} vs {team_2}")
-    schedule = format_arb_game_schedule(arb)
-    if schedule:
-        header_lines.append(schedule)
-    header_lines.append("")
 
     if bet_type == "spread":
         line1 = normalize_spread_value(_attr("spread_line_team_1"))
@@ -1276,7 +1251,18 @@ def format_arb_complete_alert(
             f"{_stake_suffix(odds2_raw, leg2_stake, leg2_failure, leg2_ticket)}"
         )
 
-    return "\n".join(header_lines + [leg1, "", leg2])
+    placed_block = "\n".join([leg1, "", leg2])
+    engine_block = format_arb_opportunity_body(arb, spread_value=spread_value)
+    status_line = "Complete" if outcome == "complete" else "Failed / partial"
+    return "\n".join([
+        f"Status: {status_mark} {status_line}",
+        "",
+        "ENGINE FOUND:",
+        engine_block,
+        "",
+        "PLACED:",
+        placed_block,
+    ])
 
 
 def extract_spread_line_odds_from_label(label) -> tuple[float | None, str | None]:

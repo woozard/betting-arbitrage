@@ -55,8 +55,6 @@ from utils.bet_placement import (
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
-    _dispatch_ops_alert,
-    _screenshots_telegram_chat,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
@@ -103,6 +101,7 @@ class BetamapolaController:
         self._last_bet_error = None
         self._betamapola_ticket_submitted = False
         self._pending_check_cache = {}
+        self._last_screenshot_path = None
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -1708,6 +1707,7 @@ class BetamapolaController:
         game_id: str,
         ticket_number: int | str | None = None,
     ) -> str | None:
+        """Capture open-bets confirmation for the screenshots channel (sent by finalize_confirmed_bet)."""
         path = bet_screenshot_path(self.bookmaker, game_id)
         shot = capture_betamapola_confirmation(
             self.driver,
@@ -1720,21 +1720,7 @@ class BetamapolaController:
         if not shot:
             self.logger.warning("Open-bets screenshot capture failed")
             return None
-        caption_parts = [
-            f"Betamapola open bet confirmed",
-            f"{team_name} | {team_1} vs {team_2}",
-        ]
-        if ticket_number:
-            caption_parts.append(f"Ticket {ticket_number}")
-        chat_id = _screenshots_telegram_chat(TELEGRAM)
-        _dispatch_ops_alert(
-            self.logger,
-            "\n".join(caption_parts),
-            chat_id,
-            label="Betamapola Open Bets Screenshot",
-            photo_path=shot,
-            photo_only=True,
-        )
+        self._last_screenshot_path = shot
         return shot
 
     @staticmethod
@@ -2926,16 +2912,20 @@ class BetamapolaController:
                         continue
                 if bet_placed:
                     self.logger.info("Bet Placement Completed")
-                    screenshot_path = capture_bet_screenshot_for_alert(
-                        self.logger,
-                        self.bookmaker,
-                        arb,
-                        team_name,
-                        game_id,
-                        stake_used,
-                        wager_odds,
-                        driver=self.driver,
-                    )
+                    screenshot_path = getattr(self, "_last_screenshot_path", None)
+                    if not screenshot_path or not os.path.isfile(screenshot_path):
+                        screenshot_path = capture_bet_screenshot_for_alert(
+                            self.logger,
+                            self.bookmaker,
+                            arb,
+                            team_name,
+                            game_id,
+                            stake_used,
+                            wager_odds,
+                            driver=self.driver,
+                            ticket_number=getattr(self, "_last_ticket_number", None),
+                        )
+                    self._last_screenshot_path = None
                     finalize_confirmed_bet(
                         self.cache,
                         self.storage,

@@ -22,10 +22,10 @@ from utils.helpers import (
     debug_filepath,
     prune_debug_files,
     teams_same,
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
     spread_values_match,
     resolve_paradise_team_spread_lines,
 )
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.bet_placement import (

@@ -246,6 +246,7 @@ def _dispatch_other_api_leg_screenshot(
 ) -> None:
     """When the second leg completes, send the other API book's receipt if it was placed earlier."""
     from utils.bet_screenshot import bet_screenshot_path, render_bet_receipt
+    from utils.helpers import format_arb_game_schedule
 
     bet_type = arb.get("bet_type", "moneyline")
     book_1 = arb.get("team_1_bookmaker")
@@ -298,6 +299,8 @@ def _dispatch_other_api_leg_screenshot(
         stake=stake,
         bet_type=bet_type,
         spread_line=spread_line,
+        game_date=format_arb_game_schedule(arb),
+        ticket_number=leg_data.get("ticket_number"),
         logger=logger,
     )
     if not shot:
@@ -320,8 +323,8 @@ def _real_bets_telegram_chat(telegram_config: dict):
 
 
 def _screenshots_telegram_chat(telegram_config: dict):
-    """Per-leg bet confirmations and screenshots."""
-    return telegram_config.get("screenshots") or telegram_config.get("real_bets")
+    """Per-leg bet confirmation screenshots (photo only, no captions)."""
+    return telegram_config.get("screenshots")
 
 
 def _send_ops_alert(
@@ -333,7 +336,7 @@ def _send_ops_alert(
     photo_only: bool = False,
 ) -> bool:
     if not chat_id:
-        logger.warning("Telegram screenshots chat not set — skipping leg alert")
+        logger.warning(f"Telegram chat not set — skipping {label}")
         return False
     logger.info(f"========== {label} ==========")
     logger.info(alert)
@@ -365,7 +368,7 @@ def _dispatch_ops_alert(
     photo_only: bool = False,
 ) -> bool:
     if not chat_id:
-        logger.warning("Telegram screenshots chat not set — skipping leg alert")
+        logger.warning(f"Telegram chat not set — skipping {label}")
         return False
     logger.info(f"========== {label} ==========")
     logger.info(alert)
@@ -605,8 +608,10 @@ def capture_bet_screenshot_for_alert(
     open_bets_url: str | None = None,
     return_to_sport=None,
     extra_lines: list[str] | None = None,
+    ticket_number=None,
 ) -> str | None:
     from utils.bet_screenshot import capture_confirmed_bet_screenshot
+    from utils.helpers import format_arb_game_schedule
 
     bet_type = arb.get("bet_type", "moneyline")
     spread_line = arb.get("spread_value") if bet_type == "spread" else None
@@ -620,6 +625,8 @@ def capture_bet_screenshot_for_alert(
         stake=stake,
         bet_type=bet_type,
         spread_line=spread_line,
+        game_date=format_arb_game_schedule(arb),
+        ticket_number=ticket_number,
         driver=driver,
         open_bets_url=open_bets_url,
         return_to_sport=return_to_sport,
@@ -732,19 +739,27 @@ def finalize_confirmed_bet(
             other_leg_placed,
             ticket_number=ticket_number,
         )
-        if _dispatch_ops_alert(
+        if real_bets_chat and _dispatch_ops_alert(
             logger,
             leg_alert,
-            screenshots_chat,
+            real_bets_chat,
             label="Leg Confirmed Alert",
-            photo_path=screenshot_path,
-            photo_only=bool(screenshot_path),
         ):
             cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
     else:
         logger.info(
             f"Skipping duplicate leg-confirmed Telegram alert - {bookmaker}/{team_name} | "
             f"{team_1} vs {team_2} | game_id={game_id}"
+        )
+
+    if screenshot_path and os.path.isfile(screenshot_path) and screenshots_chat:
+        _dispatch_ops_alert(
+            logger,
+            "",
+            screenshots_chat,
+            label="Leg Screenshot",
+            photo_path=screenshot_path,
+            photo_only=True,
         )
 
     if other_leg_placed:

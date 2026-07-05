@@ -37,7 +37,7 @@ REDIS = {
 # Telegram — channel routing:
 #   TELEGRAM_CHAT_HEALTH       → KC Arb Health Status (ops agent, scanner errors, system alerts)
 #   TELEGRAM_CHAT_REAL_BETS    → KC Arb Real Bets (one compact summary per arb: complete or failed)
-#   TELEGRAM_CHAT_SCREENSHOTS  → KC Arb Screenshots (per-leg bet text + confirmation screenshots)
+#   TELEGRAM_CHAT_SCREENSHOTS  → KC Arb Screenshots (per-leg bet photos only — no captions)
 #   TELEGRAM_CHAT_ARBITRAGE    → arb opportunity alerts (/scan bot)
 _TELEGRAM_HEALTH = os.getenv('TELEGRAM_CHAT_HEALTH')
 
@@ -102,6 +102,10 @@ TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',
 )
 SECOND_LEG_ODDS_TOLERANCE = int(os.getenv('SECOND_LEG_ODDS_TOLERANCE', '2'))
+# BetWar: reuse My Bets rows only when explicitly enabled (scoped match; default off).
+BETWAR_MY_BETS_RECOVERY = os.getenv('BETWAR_MY_BETS_RECOVERY', 'false').lower() in (
+    '1', 'true', 'yes',
+)
 
 
 def profit_pct_to_max_total_prob(profit_pct: float) -> float:
@@ -109,7 +113,7 @@ def profit_pct_to_max_total_prob(profit_pct: float) -> float:
     return 1.0 - (profit_pct / 100.0)
 
 
-MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '1.01'))
+MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '-1.01'))
 if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
     ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))
 elif MIN_ARB_PROFIT_PCT != 0:
@@ -118,7 +122,7 @@ else:
     ARB_MAX_TOTAL_PROB = 1.0
 
 # Spread/run-line alert threshold (same min edge as ML by default).
-MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '1.01'))
+MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '-1.01'))
 SPREAD_REAL_MONEY_BETTING_ENABLED = os.getenv(
     'SPREAD_REAL_MONEY_BETTING_ENABLED', 'true'
 ).lower() in ('1', 'true', 'yes')

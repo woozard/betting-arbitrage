@@ -97,6 +97,7 @@ def test_spread_alert_shows_per_team_lines():
         "spread_line_team_2": 1.5,
     }
     alert = format_arb_opportunity_alert(arb)
+    assert alert.startswith("===== Arb Opportunity =====")
     assert "Tigers -1.5 -189 3et" in alert
     assert "Rangers +1.5 +203 amapola" in alert
 
@@ -113,7 +114,9 @@ def test_format_arb_complete_alert_per_leg_stakes():
         "profit_pct": 1.25,
     }
     alert = format_arb_complete_alert(arb, base_amount=20)
-    assert alert.startswith("ML · +1.25% ✓")
+    assert "Status: ✓ Complete" in alert
+    assert "ENGINE FOUND:" in alert
+    assert "PLACED:" in alert
     assert "Pirates +140 betwar · $20.00→$28.00" in alert
     assert "Nationals -133 3et · $26.60→$20.00" in alert
     assert "Identified At:" not in alert
@@ -196,7 +199,9 @@ def test_format_arb_complete_alert_failed():
         leg2_stake=(20.0, 23.20),
         leg1_failure="line moved",
     )
-    assert "ML · +7.41% ✗" in alert
+    assert "Status: ✗ Failed / partial" in alert
+    assert "ENGINE FOUND:" in alert
+    assert "PLACED:" in alert
     assert "Jays +116 paradise · NOT PLACED (line moved)" in alert
     assert "Mariners +116 betwar · $20.00→$23.20" in alert
 
@@ -221,7 +226,8 @@ def test_format_spread_complete_user_example():
         leg1_stake=(20.0, 21.60),
         leg2_stake=(22.40, 20.0),
     )
-    assert alert.startswith("Spread — run_line (+1.5) · -0.91% ✓")
+    assert "Status: ✓ Complete" in alert
+    assert "Spread — run_line (+1.5) · -0.91%" in alert
     assert "Padres +1.5 +108 amapola · $20.00→$21.60" in alert
     assert "Dodgers -1.5 -112 4casters · $22.40→$20.00" in alert
 
@@ -239,7 +245,8 @@ def test_build_arb_complete_alert_includes_header():
     }
     alert = _build_arb_complete_alert(arb, 20.0)
     assert alert.startswith("===== Arb Complete (Real Money) =====")
-    assert "ML · +1.25% ✓" in alert
+    assert "ENGINE FOUND:" in alert
+    assert "ML · +1.25%" in alert
     assert "Pirates +140 betwar · $20.00→$28.00" in alert
 
 

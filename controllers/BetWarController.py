@@ -18,16 +18,20 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, BETWAR_MY_BETS_RECOVERY
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, american_odds_to_int, teams_same, resolve_ticosports_spread_lines, spread_values_match
 from utils.betwar_odds import (
     moneyline_int_odds_acceptable as betwar_moneyline_int_ok,
     moneyline_odds_acceptable as betwar_moneyline_ok,
+    my_bets_description_matches_matchup,
+    my_bets_row_odds_matches_expected,
     normalize_us_odds as betwar_normalize_us_odds,
+    odds_text_matches as betwar_odds_text_matches,
     parse_betslip_moneyline_odds as betwar_parse_betslip_ml_odds,
     parse_displayed_american_odds as betwar_parse_displayed_odds,
+    resolve_betwar_ml_side,
 )
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
@@ -105,6 +109,7 @@ class BetWarController:
         self.label = account.label if account.label else "N/A"
         self._force_wager_relogin = False
         self._last_bet_error = None
+        self._getlines_authoritative_odds = None
         self._last_getlines_success_at = 0.0
         self._last_getlines_success_count = 0
 
@@ -642,16 +647,23 @@ class BetWarController:
         return betwar_normalize_us_odds(odds)
 
     @classmethod
-    def _parse_displayed_american_odds(cls, display_text, expected_odd=None) -> int | None:
-        return betwar_parse_displayed_odds(display_text, expected_odd)
+    def _parse_displayed_american_odds(
+        cls, display_text, *, authoritative_odd=None
+    ) -> int | None:
+        return betwar_parse_displayed_odds(
+            display_text, authoritative_odd=authoritative_odd
+        )
 
     def _moneyline_odds_acceptable(
         self, display_text: str, expected_odd, tolerance: int | None = None
     ) -> bool:
         tol = tolerance if tolerance is not None else (getattr(self, "_odds_tolerance", 0) or 0)
+        auth = getattr(self, "_getlines_authoritative_odds", None)
         if self._odds_text_matches(display_text, expected_odd):
             return True
-        return betwar_moneyline_ok(display_text, expected_odd, tol)
+        return betwar_moneyline_ok(
+            display_text, expected_odd, tol, authoritative_odd=auth
+        )
 
     def _moneyline_int_odds_acceptable(
         self, live_odds: int, expected_odd, tolerance: int | None = None
@@ -682,26 +694,13 @@ class BetWarController:
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
-        if tolerance > 0 and arb_live_odds_acceptable(expected, displayed, tolerance):
-            return True
-        disp = self._normalize_us_odds((displayed or "").strip())
-        exp = self._normalize_us_odds(expected)
-        if disp == exp:
-            return True
-        raw = (displayed or "").strip()
-        if exp in raw or raw == str(expected).strip():
-            return True
-        # BetWar Player portal often shows favorites as bare "105" without a minus sign.
-        try:
-            exp_val = int(float(str(expected)))
-            num_match = re.search(r"[-+]?\d+", raw.replace("\u2212", "-"))
-            if num_match and exp_val < 0:
-                disp_val = int(num_match.group(0).lstrip("+"))
-                if disp_val == abs(exp_val):
-                    return True
-        except (TypeError, ValueError):
-            pass
-        return False
+        auth = getattr(self, "_getlines_authoritative_odds", None)
+        return betwar_odds_text_matches(
+            displayed,
+            expected,
+            tolerance,
+            authoritative_odd=auth,
+        )
 
     def _game_rotations(self, game_id: str) -> list[str]:
         return [p.strip() for p in str(game_id).split("-") if p.strip()]
@@ -976,13 +975,15 @@ class BetWarController:
         moneyline_odd,
         team_no: int | None = None,
     ):
-        """Find moneyline by rotation + team row; prefer odds match but accept team row ML when tolerance applies."""
+        """Find moneyline by rotation + team row; exact sign-aware odds match only."""
+        if team_no not in (1, 2):
+            return None
+
         rotations = set(self._game_rotations(game_id))
         if not rotations:
             return None
 
         target_rot = self._target_rotation(game_id, team_name, team_no)
-        fallback = None
 
         for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
             rot_text = (rot_span.text or "").strip()
@@ -1000,12 +1001,8 @@ class BetWarController:
             except Exception:
                 continue
 
-            if (
-                target_rot
-                and rot_text == target_rot
-                and team_no in (1, 2)
-            ):
-                pass  # rotation + team_no is enough (e.g. TOR Blue Jays vs Toronto Blue Jays)
+            if target_rot and rot_text == target_rot and team_no in (1, 2):
+                pass
             elif not self._team_name_matches(label_text, team_name):
                 continue
 
@@ -1018,27 +1015,13 @@ class BetWarController:
                 linekey = (ml_card.get_attribute("data-linekey") or "").strip()
                 if linekey and not self._linekey_is_full_game_moneyline(linekey):
                     continue
-                if team_no in (1, 2):
-                    seg = self._linekey_team_segment(linekey)
-                    if seg is not None and seg != team_no:
-                        continue
+                seg = self._linekey_team_segment(linekey)
+                if seg is not None and seg != team_no:
+                    continue
                 txt = (ml_card.text or "").strip()
                 target = self._pick_moneyline_click_target(ml_card)
-                if target and self._odds_text_matches(txt, moneyline_odd):
+                if target and self._moneyline_odds_acceptable(txt, moneyline_odd):
                     return target
-                if (
-                    fallback is None
-                    and target
-                    and self._moneyline_odds_acceptable(txt, moneyline_odd)
-                ):
-                    fallback = target
-
-            if fallback is not None:
-                self.logger.info(
-                    f"Using rotation-row moneyline for {label_text} @ {rot_text} "
-                    f"(expected {moneyline_odd}, within tolerance)"
-                )
-                return fallback
 
         return None
 
@@ -1056,7 +1039,8 @@ class BetWarController:
             return None
 
         target_rot = self._target_rotation(game_id, team_name, team_no)
-        fallback = None
+        if team_no not in (1, 2):
+            return None
 
         for rot_span in self.driver.find_elements(By.CSS_SELECTOR, "span.lblRotation"):
             rot_text = (rot_span.text or "").strip()
@@ -1106,17 +1090,6 @@ class BetWarController:
                             f"Using spread line {spread} @ {odds} (arb odds {wager_odds})"
                         )
                         return ps_card
-                if fallback is None and (linekey or ps_card.get_attribute("onclick")):
-                    fallback = ps_card
-
-            if fallback is not None and (
-                getattr(self, "_odds_tolerance", 0) or spread_line is not None
-            ):
-                self.logger.info(
-                    f"Using rotation-row spread for {label_text or team_name} @ {rot_text} "
-                    f"(expected {wager_odds}, tolerance active)"
-                )
-                return fallback
 
         return None
 
@@ -1771,12 +1744,48 @@ class BetWarController:
         return bool(last_word and last_word in desc.lower())
 
     def _my_bets_has_wager(self, team_name: str, stake) -> bool:
+        """Legacy team+stake check — prefer _my_bets_has_wager_for_arb for recovery."""
         text = self._my_bets_tab_text(timeout=12)
         for row in self._parse_my_bets_rows(text):
             if not self._my_bets_row_matches_team(row.get("description", ""), team_name):
                 continue
             if self._my_bets_row_matches_stake(row, stake):
                 return True
+        return False
+
+    def _my_bets_has_wager_for_arb(
+        self,
+        team_name: str,
+        stake,
+        team_1: str,
+        team_2: str,
+        expected_odd,
+        *,
+        game_id: str | None = None,
+    ) -> bool:
+        """Scoped My Bets recovery: same matchup, team, stake, and ML sign/odds."""
+        text = self._my_bets_tab_text(timeout=12)
+        for row in self._parse_my_bets_rows(text):
+            desc = row.get("description", "")
+            if not self._my_bets_row_matches_team(desc, team_name):
+                continue
+            if not my_bets_description_matches_matchup(desc, team_1, team_2):
+                continue
+            if self._text_indicates_non_full_game_ml(desc):
+                continue
+            if not self._my_bets_row_matches_stake(row, stake):
+                continue
+            if expected_odd is not None and not my_bets_row_odds_matches_expected(
+                desc, expected_odd
+            ):
+                continue
+            if game_id:
+                rots = self._game_rotations(game_id)
+                if rots and not any(rot in desc for rot in rots):
+                    self.logger.debug(
+                        f"My Bets row matches teams/stake but not rotation {game_id}: {desc[:80]}"
+                    )
+            return True
         return False
 
     def _my_bets_has_team_wager(self, team_name: str) -> bool:
@@ -3944,10 +3953,14 @@ class BetWarController:
             and team_2.lower() in text
         )
 
-    def _has_existing_open_bet(self, team_name: str, team_1: str, team_2: str, stake=None) -> bool:
+    def _has_existing_open_bet(
+        self, team_name: str, team_1: str, team_2: str, stake=None, expected_odd=None
+    ) -> bool:
         if stake is None:
             return False
-        return self._my_bets_has_wager(team_name, stake)
+        return self._my_bets_has_wager_for_arb(
+            team_name, stake, team_1, team_2, expected_odd
+        )
 
     def _message_requires_relogin(self, message: str) -> bool:
         msg_l = (message or "").lower()
@@ -4398,11 +4411,34 @@ class BetWarController:
 
             self._refresh_session_before_wager()
             self._prepare_bet_slip_for_wager()
+            self._getlines_authoritative_odds = None
 
             team_no, display_name, live_odds = self._lookup_side_from_getlines(
                 game_id, team_name
             )
-            if team_no is None:
+            if bet_type == "moneyline":
+                if team_no is None or live_odds is None:
+                    raise Exception(
+                        f"GetLines required for {team_name} on {game_id} — "
+                        f"team_no={team_no} live_odds={live_odds}"
+                    )
+                try:
+                    side_ctx = resolve_betwar_ml_side(
+                        team_no=team_no,
+                        getlines_live_odds=live_odds,
+                        expected_odd=moneyline_odd,
+                    )
+                except ValueError as exc:
+                    raise Exception(f"GetLines ML side validation failed: {exc}") from exc
+                team_no = side_ctx["team_no"]
+                self._getlines_authoritative_odds = side_ctx["getlines_live_odds"]
+                self.logger.info(
+                    f"GetLines ML side locked | team_no={team_no} "
+                    f"live={side_ctx['getlines_live_odds']:+d} "
+                    f"expected={side_ctx['expected_odd']:+d} "
+                    f"({side_ctx['required_sign']})"
+                )
+            elif team_no is None:
                 team_no = self._infer_team_no(team_name, team_1, team_2)
             lookup_name = display_name or team_name
             if display_name and display_name != team_name:
@@ -4413,7 +4449,8 @@ class BetWarController:
             if bet_type == "moneyline" and live_odds is not None:
                 if not self._moneyline_odds_acceptable(str(live_odds), moneyline_odd):
                     live_parsed = self._parse_displayed_american_odds(
-                        str(live_odds), moneyline_odd
+                        str(live_odds),
+                        authoritative_odd=self._getlines_authoritative_odds,
                     )
                     try:
                         exp_parsed = american_odds_to_int(moneyline_odd)
@@ -4996,10 +5033,17 @@ class BetWarController:
                     )
 
                 stake_plan = base_amount_stake_from_odds(wager_odds, stake)
-                if self._my_bets_has_wager(team_name, stake_plan):
+                if BETWAR_MY_BETS_RECOVERY and self._my_bets_has_wager_for_arb(
+                    team_name,
+                    stake_plan,
+                    team_1,
+                    team_2,
+                    wager_odds,
+                    game_id=game_id,
+                ):
                     self.logger.info(
-                        f"Recovering existing My Bets wager for {team_name} on {self.bookmaker} "
-                        f"(matches intended base stake)"
+                        f"Recovering scoped My Bets wager for {team_name} | "
+                        f"{team_1} vs {team_2} on {self.bookmaker}"
                     )
                     screenshot_path = capture_bet_screenshot_for_alert(
                         self.logger,

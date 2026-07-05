@@ -82,9 +82,12 @@ def test_arb_complete_uses_placed_odds_and_ticket():
         leg2_placed_odds=-125,
         leg1_ticket=135844851,
     )
+    assert "Status: ✓ Complete" in alert
+    assert "ENGINE FOUND:" in alert
+    assert "PLACED:" in alert
     assert "Minnesota Twins vs New York Yankees" in alert
     assert "2026-07-05" in alert
     assert "Twins +120 amapola" in alert
     assert "Yankees -125 betwar" in alert
     assert "#135844851" in alert
-    assert "-115" not in alert
+    assert "-115" in alert  # engine odds for leg 2

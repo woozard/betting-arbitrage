@@ -469,6 +469,8 @@ def render_bet_receipt(
     stake,
     bet_type: str = "moneyline",
     spread_line=None,
+    game_date: str | None = None,
+    ticket_number=None,
     extra_lines: list[str] | None = None,
     logger=None,
 ) -> str | None:
@@ -479,7 +481,7 @@ def render_bet_receipt(
             logger.warning("Pillow not installed — skipping API bet receipt screenshot")
         return None
 
-    width, height = 720, 420
+    width, height = 720, 480
     img = Image.new("RGB", (width, height), color=(18, 24, 38))
     draw = ImageDraw.Draw(img)
 
@@ -500,11 +502,19 @@ def render_bet_receipt(
 
     lines = [
         f"Match: {team_1} vs {team_2}",
+    ]
+    if game_date:
+        lines.append(f"Game date: {game_date}")
+    lines.extend([
         f"Selection: {team_name}",
         f"Market: {_bet_type_label(bet_type, spread_line)}",
         f"Odds: {odds}",
         f"Stake: {_stake_display(stake)}",
-    ]
+    ])
+    if ticket_number not in (None, "", 0, "0"):
+        ticket_text = str(ticket_number).strip()
+        if ticket_text:
+            lines.append(f"Ticket: #{ticket_text}")
     if extra_lines:
         lines.extend(extra_lines)
 
@@ -541,6 +551,8 @@ def capture_confirmed_bet_screenshot(
     stake,
     bet_type: str = "moneyline",
     spread_line=None,
+    game_date: str | None = None,
+    ticket_number=None,
     driver=None,
     open_bets_url: str | None = None,
     return_to_sport: Callable[[], None] | None = None,
@@ -599,6 +611,8 @@ def capture_confirmed_bet_screenshot(
         stake=stake,
         bet_type=bet_type,
         spread_line=spread_line,
+        game_date=game_date,
+        ticket_number=ticket_number,
         extra_lines=extra_lines,
         logger=logger,
     )

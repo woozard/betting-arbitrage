@@ -31,8 +31,8 @@ from utils.helpers import (
     parse_to_mysql_datetime,
     send_monitoring_alert,
     teams_same,
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
 )
+from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
 from utils.storage import Storage
