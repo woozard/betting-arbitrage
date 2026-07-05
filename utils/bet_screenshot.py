@@ -621,6 +621,28 @@ def capture_confirmed_bet_screenshot(
             "falling back to rendered receipt"
         )
 
+    if bm in ("paradisewager", "paradise") and driver is not None:
+        from utils.paradise_web import capture_paradise_pending_wager
+
+        shot = capture_paradise_pending_wager(
+            driver,
+            path,
+            logger,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+            stake=stake,
+            open_bets_url=open_bets_url,
+            return_to_sport=return_to_sport,
+        )
+        if shot:
+            return shot
+        logger.warning(
+            f"Paradise pending wager screenshot unavailable for {team_name}; "
+            "falling back to rendered receipt"
+        )
+
     return render_bet_receipt(
         path,
         bookmaker,

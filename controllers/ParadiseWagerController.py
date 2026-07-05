@@ -1891,6 +1891,10 @@ class ParadiseWagerController:
                         stake_used,
                         wager_odds,
                         extra_lines=extra_lines or None,
+                        driver=self.driver,
+                        open_bets_url=f"{self.base_url}/v2/#/pendings",
+                        return_to_sport=lambda: self.driver.get(self.schedule_url),
+                        ticket_number=getattr(self, "_last_ticket_number", None),
                     )
                     finalize_confirmed_bet(
                         self.cache,
