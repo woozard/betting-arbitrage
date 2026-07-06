@@ -1,5 +1,6 @@
 from utils.fourcasters_web import (
     _fourcasters_nav_or_homepage_text,
+    _fourcasters_odds_matches,
     _fourcasters_wager_detail_valid,
     _wager_text_matches,
 )
@@ -34,8 +35,8 @@ def test_wager_detail_rejects_homepage_nav():
 
 def test_wager_detail_accepts_active_wager_row():
     text = (
-        "01:30 AM 06 JUL KANSAS CITY ROYALS +185 "
-        "PHILADELPHIA PHILLIES @ KANSAS CITY ROYALS $20 $37 TAKEN"
+        "06:10 PM 06 JUL\nKC ROYALS +182\n"
+        "911 PHI PHILLIES @ 912 KC ROYALS\n$20.15\n$36.72\nTAKEN\n04:21 PM 06 JUL"
     )
     assert _fourcasters_wager_detail_valid(
         text,
@@ -44,3 +45,9 @@ def test_wager_detail_accepts_active_wager_row():
         team_2="Kansas City Royals",
         odds=185,
     )
+
+
+def test_odds_tolerance_accepts_line_move():
+    text = "KC ROYALS +182 @ PHI $20 TAKEN"
+    assert _fourcasters_odds_matches(text, 185)
+    assert not _fourcasters_odds_matches(text, 150)

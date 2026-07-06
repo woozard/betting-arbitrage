@@ -254,6 +254,24 @@ def _fourcasters_odds_needles(odds) -> list[str]:
     return out
 
 
+def _fourcasters_odds_matches(text: str, odds, *, tolerance: int = 20) -> bool:
+    import re
+
+    if odds is None or odds == "":
+        return True
+    try:
+        target = int(round(float(odds)))
+    except (TypeError, ValueError):
+        return str(odds).lower() in (text or "").lower()
+    for raw in re.findall(r"[+-]\d{2,4}", text or ""):
+        try:
+            if abs(int(raw) - target) <= tolerance:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _fourcasters_nav_or_homepage_text(text: str) -> bool:
     tl = (text or "").lower()
     markers = (
@@ -263,8 +281,13 @@ def _fourcasters_nav_or_homepage_text(text: str) -> bool:
         "wallet balance",
         "view >",
         "match betting",
+        "pending bets",
+        "graded positions",
+        "open orders",
+        "my positions",
     )
-    return any(m in tl for m in markers)
+    hits = sum(1 for m in markers if m in tl)
+    return hits >= 2 or "create new market" in tl or "wallet balance" in tl
 
 
 def _fourcasters_wager_detail_valid(
@@ -291,11 +314,8 @@ def _fourcasters_wager_detail_valid(
         or "@" in text
     ):
         return False
-    odds_needles = _fourcasters_odds_needles(odds)
-    if odds_needles:
-        compact = re.sub(r"\s+", "", text.lower())
-        if not any(n.lower().replace(" ", "") in compact for n in odds_needles):
-            return False
+    if not _fourcasters_odds_matches(text, odds):
+        return False
     if stake is not None and not _stake_in_wager_text(text, stake):
         pass  # stake mismatch alone does not invalidate — odds/team are primary
     return True
@@ -307,19 +327,22 @@ def _fourcasters_on_active_wagers_page(driver) -> bool:
         if "active-wagers" not in url and "my-bets" not in url:
             return False
         body = (driver.find_element("tag name", "body").text or "").upper()
-        return "ACTIVE WAGERS" in body or "TAKEN" in body
+        return (
+            "ACTIVE WAGERS" in body
+            or "TAKEN" in body
+            or "MY POSITIONS" in body
+            or "PENDING BETS" in body
+        )
     except Exception:
         return False
 
 
 def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
-    odds_needles = _fourcasters_odds_needles(odds)
     return driver.execute_script(
         """
         const teamName = (arguments[0] || '').toLowerCase();
         const team1 = (arguments[1] || '').toLowerCase();
         const team2 = (arguments[2] || '').toLowerCase();
-        const oddsNeedles = (arguments[3] || []).map(s => String(s).toLowerCase());
         const needles = [teamName, team1, team2]
           .flatMap(v => v ? [v, v.split(' ').pop()] : [])
           .filter(Boolean);
@@ -329,34 +352,36 @@ def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
           return needles.some(n => n && tl.includes(n));
         }
 
+        function isTabChrome(text) {
+          const tl = (text || '').toLowerCase();
+          const markers = ['pending bets', 'graded positions', 'open orders', 'my positions'];
+          return markers.filter(m => tl.includes(m)).length >= 2;
+        }
+
         function isNavOrHome(text) {
           const tl = (text || '').toLowerCase();
           return tl.includes('create new market')
             || tl.includes('secure your withdrawals')
-            || tl.includes('wallet balance')
-            || (tl.includes('mlb') && tl.includes('wallet') && tl.includes('custom'));
+            || tl.includes('wallet balance');
         }
 
         function isWagerRow(el) {
           const t = (el.innerText || '').trim();
-          if (t.length < 20 || t.length > 450) return false;
-          if (isNavOrHome(t)) return false;
+          if (t.length < 25 || t.length > 350) return false;
+          if (isNavOrHome(t) || isTabChrome(t)) return false;
           if (!matchesTeam(t)) return false;
           if (!/[+-]\\d{2,4}/.test(t)) return false;
-          if (!/\\$\\s*\\d/.test(t) && !/taken/i.test(t) && !t.includes('@')) return false;
-          if (oddsNeedles.length) {
-            const compact = t.toLowerCase().replace(/\\s/g, '');
-            if (!oddsNeedles.some(n => compact.includes(n.replace(/\\s/g, '')))) return false;
-          }
+          if (!/\\$\\s*\\d/.test(t) || !/taken/i.test(t)) return false;
+          if (!t.includes('@')) return false;
           const rect = el.getBoundingClientRect();
           if (rect.width < 80 || rect.height < 24) return false;
           if (rect.width > window.innerWidth * 0.92) return false;
-          if (rect.height > window.innerHeight * 0.55) return false;
+          if (rect.height > 160) return false;
           return true;
         }
 
         const candidates = [];
-        for (const el of document.querySelectorAll('tr, li, div, article, a, button')) {
+        for (const el of document.querySelectorAll('tr, li, div, article')) {
           if (!isWagerRow(el)) continue;
           let dominated = false;
           for (const other of candidates) {
@@ -368,18 +393,18 @@ def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
 
         if (!candidates.length) return null;
 
-        // Prefer smallest matching element (most specific wager row).
         candidates.sort((a, b) => {
           const ra = a.getBoundingClientRect();
           const rb = b.getBoundingClientRect();
-          return (ra.width * ra.height) - (rb.width * rb.height);
+          const scoreA = ra.height * 10 + ra.width;
+          const scoreB = rb.height * 10 + rb.width;
+          return scoreA - scoreB;
         });
         return candidates[0];
         """,
         team_name,
         team_1,
         team_2,
-        odds_needles,
     )
 
 
@@ -446,27 +471,11 @@ def capture_fourcasters_active_wager(
             )
 
         driver.execute_script(
-            """
-            const row = arguments[0];
-            const clickTarget = row.querySelector(
-              'svg, button, [class*="expand"], [class*="plus"], [aria-expanded], .icon'
-            );
-            if (clickTarget) {
-              clickTarget.scrollIntoView({block: 'center'});
-              if (typeof clickTarget.click === 'function') {
-                clickTarget.click();
-              } else {
-                clickTarget.dispatchEvent(
-                  new MouseEvent('click', {bubbles: true, cancelable: true})
-                );
-              }
-            }
-            """,
+            "arguments[0].scrollIntoView({block: 'center'});",
             matched_row,
         )
-        time.sleep(1.0)
+        time.sleep(0.3)
 
-        # Re-find after expand — smallest valid wager row.
         detail_el = _find_fourcasters_wager_element(
             driver, team_name, team_1, team_2, odds
         ) or matched_row
