@@ -234,6 +234,155 @@ def _stake_in_wager_text(text: str, stake) -> bool:
     return False
 
 
+def _fourcasters_odds_needles(odds) -> list[str]:
+    if odds is None or odds == "":
+        return []
+    needles: list[str] = []
+    try:
+        val = float(odds)
+        n = int(round(val))
+        needles.extend([f"{n:+d}", f"{n:d}"])
+        if n > 0:
+            needles.append(f"+{n}")
+    except (TypeError, ValueError):
+        needles.append(str(odds).strip())
+    out: list[str] = []
+    for needle in needles:
+        needle = needle.strip()
+        if needle and needle not in out:
+            out.append(needle)
+    return out
+
+
+def _fourcasters_nav_or_homepage_text(text: str) -> bool:
+    tl = (text or "").lower()
+    markers = (
+        "create new market",
+        "secure your withdrawals",
+        "about our story",
+        "wallet balance",
+        "view >",
+        "match betting",
+    )
+    return any(m in tl for m in markers)
+
+
+def _fourcasters_wager_detail_valid(
+    text: str,
+    *,
+    team_name: str,
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
+) -> bool:
+    import re
+
+    if not text or len(text) < 20 or _fourcasters_nav_or_homepage_text(text):
+        return False
+    if not _wager_text_matches(text, team_name, team_1, team_2):
+        return False
+    if not re.search(r"[+-]\d{2,4}", text):
+        return False
+    tl = text.lower()
+    if not (
+        re.search(r"\$\s*\d", text)
+        or "taken" in tl
+        or "@" in text
+    ):
+        return False
+    odds_needles = _fourcasters_odds_needles(odds)
+    if odds_needles:
+        compact = re.sub(r"\s+", "", text.lower())
+        if not any(n.lower().replace(" ", "") in compact for n in odds_needles):
+            return False
+    if stake is not None and not _stake_in_wager_text(text, stake):
+        pass  # stake mismatch alone does not invalidate — odds/team are primary
+    return True
+
+
+def _fourcasters_on_active_wagers_page(driver) -> bool:
+    try:
+        url = (driver.current_url or "").lower()
+        if "active-wagers" not in url and "my-bets" not in url:
+            return False
+        body = (driver.find_element("tag name", "body").text or "").upper()
+        return "ACTIVE WAGERS" in body or "TAKEN" in body
+    except Exception:
+        return False
+
+
+def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
+    odds_needles = _fourcasters_odds_needles(odds)
+    return driver.execute_script(
+        """
+        const teamName = (arguments[0] || '').toLowerCase();
+        const team1 = (arguments[1] || '').toLowerCase();
+        const team2 = (arguments[2] || '').toLowerCase();
+        const oddsNeedles = (arguments[3] || []).map(s => String(s).toLowerCase());
+        const needles = [teamName, team1, team2]
+          .flatMap(v => v ? [v, v.split(' ').pop()] : [])
+          .filter(Boolean);
+
+        function matchesTeam(text) {
+          const tl = (text || '').toLowerCase();
+          return needles.some(n => n && tl.includes(n));
+        }
+
+        function isNavOrHome(text) {
+          const tl = (text || '').toLowerCase();
+          return tl.includes('create new market')
+            || tl.includes('secure your withdrawals')
+            || tl.includes('wallet balance')
+            || (tl.includes('mlb') && tl.includes('wallet') && tl.includes('custom'));
+        }
+
+        function isWagerRow(el) {
+          const t = (el.innerText || '').trim();
+          if (t.length < 20 || t.length > 450) return false;
+          if (isNavOrHome(t)) return false;
+          if (!matchesTeam(t)) return false;
+          if (!/[+-]\\d{2,4}/.test(t)) return false;
+          if (!/\\$\\s*\\d/.test(t) && !/taken/i.test(t) && !t.includes('@')) return false;
+          if (oddsNeedles.length) {
+            const compact = t.toLowerCase().replace(/\\s/g, '');
+            if (!oddsNeedles.some(n => compact.includes(n.replace(/\\s/g, '')))) return false;
+          }
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 80 || rect.height < 24) return false;
+          if (rect.width > window.innerWidth * 0.92) return false;
+          if (rect.height > window.innerHeight * 0.55) return false;
+          return true;
+        }
+
+        const candidates = [];
+        for (const el of document.querySelectorAll('tr, li, div, article, a, button')) {
+          if (!isWagerRow(el)) continue;
+          let dominated = false;
+          for (const other of candidates) {
+            if (other !== el && other.contains(el)) { dominated = true; break; }
+          }
+          if (dominated) continue;
+          candidates.push(el);
+        }
+
+        if (!candidates.length) return null;
+
+        // Prefer smallest matching element (most specific wager row).
+        candidates.sort((a, b) => {
+          const ra = a.getBoundingClientRect();
+          const rb = b.getBoundingClientRect();
+          return (ra.width * ra.height) - (rb.width * rb.height);
+        });
+        return candidates[0];
+        """,
+        team_name,
+        team_1,
+        team_2,
+        odds_needles,
+    )
+
+
 def capture_fourcasters_active_wager(
     driver,
     path: str,
@@ -243,6 +392,7 @@ def capture_fourcasters_active_wager(
     team_1: str = "",
     team_2: str = "",
     stake=None,
+    odds=None,
     open_bets_url: str | None = None,
     return_to_url: str | None = None,
 ) -> str | None:
@@ -257,58 +407,42 @@ def capture_fourcasters_active_wager(
         driver.get(url)
         time.sleep(2.5)
 
-        matched_row = driver.execute_script(
-            """
-            const teamName = (arguments[0] || '').toLowerCase();
-            const team1 = (arguments[1] || '').toLowerCase();
-            const team2 = (arguments[2] || '').toLowerCase();
-            const needles = [teamName, team1, team2]
-              .flatMap(v => v ? [v, v.split(' ').pop()] : [])
-              .filter(Boolean);
+        if not _fourcasters_on_active_wagers_page(driver):
+            logger.warning(
+                f"4casters screenshot: not on Active Wagers page (url={driver.current_url})"
+            )
+            return None
 
-            function matches(text) {
-              const tl = (text || '').toLowerCase();
-              return needles.some(n => n && tl.includes(n));
-            }
-
-            function isRowLike(el) {
-              const t = (el.innerText || '').trim();
-              if (t.length < 12 || t.length > 600) return false;
-              if (!matches(t)) return false;
-              if (!/[+-]\\d{2,4}/.test(t)) return false;
-              return true;
-            }
-
-            const candidates = [];
-            for (const el of document.querySelectorAll('tr, li, div, a, button')) {
-              if (!isRowLike(el)) continue;
-              let dominated = false;
-              for (const other of candidates) {
-                if (other !== el && other.contains(el)) { dominated = true; break; }
-              }
-              if (dominated) continue;
-              candidates.push(el);
-            }
-
-            if (!candidates.length) return null;
-            return candidates[candidates.length - 1];
-            """,
-            team_name,
-            team_1,
-            team_2,
-        )
+        matched_row = None
+        for _ in range(24):
+            matched_row = _find_fourcasters_wager_element(
+                driver, team_name, team_1, team_2, odds
+            )
+            if matched_row:
+                row_text = (matched_row.text or "").strip()
+                if _fourcasters_wager_detail_valid(
+                    row_text,
+                    team_name=team_name,
+                    team_1=team_1,
+                    team_2=team_2,
+                    odds=odds,
+                    stake=stake,
+                ):
+                    break
+            matched_row = None
+            time.sleep(0.5)
 
         if not matched_row:
             logger.warning(
-                f"4casters Active Wagers: no row matched {team_name!r} "
-                f"({team_1} vs {team_2})"
+                f"4casters Active Wagers: no wager row for {team_name!r} "
+                f"({team_1} vs {team_2}, odds={odds})"
             )
             return None
 
         row_text = (matched_row.text or "").strip()
         if stake is not None and not _stake_in_wager_text(row_text, stake):
             logger.info(
-                f"4casters Active Wagers: row matched team but stake differs — using row anyway"
+                "4casters Active Wagers: row matched team/odds but stake differs — using row anyway"
             )
 
         driver.execute_script(
@@ -316,57 +450,43 @@ def capture_fourcasters_active_wager(
             const row = arguments[0];
             const clickTarget = row.querySelector(
               'svg, button, [class*="expand"], [class*="plus"], [aria-expanded], .icon'
-            ) || row;
-            clickTarget.scrollIntoView({block: 'center'});
-            if (typeof clickTarget.click === 'function') {
-              clickTarget.click();
-            } else {
-              clickTarget.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-            }
-            """,
-            matched_row,
-        )
-        time.sleep(1.5)
-
-        detail_el = driver.execute_script(
-            """
-            const row = arguments[0];
-            const root =
-              row.closest('[class*="wager"], [class*="bet"], [class*="game"], section, tbody, table')
-              || document.body;
-
-            const items = [];
-            for (const el of root.querySelectorAll('tr, li, div, article')) {
-              const t = (el.innerText || '').trim();
-              if (t.length < 10 || t.length > 500) continue;
-              if (!/[+-]\\d{2,4}/.test(t)) continue;
-              if (!(t.includes('TAKEN') || t.includes('ACTIVE') || /\\$\\d/.test(t))) continue;
-              let dominated = false;
-              for (const other of items) {
-                if (other !== el && other.contains(el)) { dominated = true; break; }
-              }
-              if (!dominated) items.push(el);
-            }
-
-            if (items.length) {
-              for (const el of items) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width >= 80 && rect.height >= 60) return el;
-              }
-              return items[0];
-            }
-
-            const panel = document.querySelector(
-              '[class*="expanded"], [class*="detail"], [class*="summary"], [class*="modal"], [role="dialog"]'
             );
-            return panel || row;
+            if (clickTarget) {
+              clickTarget.scrollIntoView({block: 'center'});
+              if (typeof clickTarget.click === 'function') {
+                clickTarget.click();
+              } else {
+                clickTarget.dispatchEvent(
+                  new MouseEvent('click', {bubbles: true, cancelable: true})
+                );
+              }
+            }
             """,
             matched_row,
         )
+        time.sleep(1.0)
 
-        target = detail_el or matched_row
+        # Re-find after expand — smallest valid wager row.
+        detail_el = _find_fourcasters_wager_element(
+            driver, team_name, team_1, team_2, odds
+        ) or matched_row
+
+        detail_text = (detail_el.text or "").strip() if detail_el else row_text
+        if not _fourcasters_wager_detail_valid(
+            detail_text,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+            stake=stake,
+        ):
+            logger.warning(
+                f"4casters Active Wagers: capture target lacks wager detail for {team_name!r}"
+            )
+            return None
+
         png = None
-        for candidate in (target, matched_row):
+        for candidate in (detail_el, matched_row):
             if candidate is None:
                 continue
             try:
@@ -375,13 +495,11 @@ def capture_fourcasters_active_wager(
                     break
             except Exception:
                 continue
-        if not png:
-            logger.warning("4casters Active Wagers: element screenshot empty; using viewport crop")
-            png = driver.get_screenshot_as_png()
         if png:
-            preview = " ".join((row_text or "").split())[:72]
+            preview = " ".join(detail_text.split())[:72]
             logger.info(f"4casters Active Wagers screenshot | {team_name} | {preview}")
             return _write_png(path, png, logger)
+        logger.warning("4casters Active Wagers: element screenshot empty")
     except Exception as exc:
         logger.warning(f"4casters Active Wagers screenshot failed: {exc}")
     finally:

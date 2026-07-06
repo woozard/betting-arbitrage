@@ -742,6 +742,7 @@ def capture_confirmed_bet_screenshot(
                 team_1=team_1,
                 team_2=team_2,
                 stake=stake,
+                odds=odds,
                 open_bets_url=open_bets_url,
             )
             if shot:
