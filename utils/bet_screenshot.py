@@ -29,6 +29,7 @@ def bet_screenshot_path(bookmaker: str, game_id: str) -> str:
 
 def _write_png(path: str, png_bytes: bytes, logger) -> str | None:
     try:
+        png_bytes = _normalize_png_for_telegram(png_bytes, logger)
         with open(path, "wb") as fh:
             fh.write(png_bytes)
         logger.info(f"Bet screenshot saved: {path}")
@@ -36,6 +37,29 @@ def _write_png(path: str, png_bytes: bytes, logger) -> str | None:
     except OSError as exc:
         logger.warning(f"Could not write bet screenshot {path}: {exc}")
         return None
+
+
+def _normalize_png_for_telegram(png_bytes: bytes, logger) -> bytes:
+    """Pad tiny element screenshots so Telegram accepts them (min ~200px height)."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        im = Image.open(BytesIO(png_bytes))
+        width, height = im.size
+        min_h = 200
+        if height >= min_h:
+            return png_bytes
+        canvas = Image.new("RGB", (max(width, 400), max(height, min_h)), (255, 255, 255))
+        canvas.paste(im, (0, 0))
+        out = BytesIO()
+        canvas.save(out, format="PNG")
+        logger.info(f"Padded bet screenshot from {width}x{height} to {canvas.size[0]}x{canvas.size[1]}")
+        return out.getvalue()
+    except Exception as exc:
+        logger.warning(f"Could not normalize screenshot dimensions: {exc}")
+        return png_bytes
 
 
 def capture_element_screenshot(driver, selectors: list[str], path: str, logger) -> str | None:
@@ -601,25 +625,27 @@ def capture_confirmed_bet_screenshot(
         if shot:
             return shot
 
-    if bm == "4casters" and driver is not None:
-        from utils.fourcasters_web import capture_fourcasters_active_wager
+    if bm == "4casters":
+        if driver is not None:
+            from utils.fourcasters_web import capture_fourcasters_active_wager
 
-        shot = capture_fourcasters_active_wager(
-            driver,
-            path,
-            logger,
-            team_name=team_name,
-            team_1=team_1,
-            team_2=team_2,
-            stake=stake,
-            open_bets_url=open_bets_url,
-        )
-        if shot:
-            return shot
+            shot = capture_fourcasters_active_wager(
+                driver,
+                path,
+                logger,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                stake=stake,
+                open_bets_url=open_bets_url,
+            )
+            if shot:
+                return shot
         logger.warning(
             f"4casters Active Wagers screenshot unavailable for {team_name}; "
-            "falling back to rendered receipt"
+            "skipping auto-generated receipt"
         )
+        return None
 
     if bm in ("paradisewager", "paradise") and driver is not None:
         from utils.paradise_web import capture_paradise_pending_wager

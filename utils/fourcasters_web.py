@@ -1,4 +1,4 @@
-"""Selenium helpers for 4casters.io Active Wagers screenshots (API books use web UI for receipts)."""
+"""Selenium helpers for 4casters.io Active Wagers screenshots."""
 
 from __future__ import annotations
 
@@ -16,12 +16,15 @@ FOURCASTERS_LOGIN_URL = "https://4casters.io/log-in"
 def _page_requires_login(driver) -> bool:
     try:
         url = (driver.current_url or "").lower()
+        if "active-wagers" in url or "my-bets" in url:
+            body = (driver.find_element("tag name", "body").text or "").upper()
+            if "ACTIVE WAGERS" in body or "TAKEN" in body or "PENDING" in body:
+                return False
         if "log-in" in url or "login" in url or "sign-up" in url:
             return True
-        body = (driver.find_element("tag name", "body").text or "").upper()
-        if "LOG IN" in body and "ACTIVE WAGERS" not in body:
-            # Login landing page — not the wagers list.
-            if driver.find_elements("css selector", 'input[type="password"]'):
+        if driver.find_elements("css selector", 'input[type="password"]'):
+            body = (driver.find_element("tag name", "body").text or "").upper()
+            if "ACTIVE WAGERS" not in body and "WALLET" not in body:
                 return True
     except Exception:
         return True
@@ -131,25 +134,22 @@ def login_fourcasters_web(
         pass_el.clear()
         pass_el.send_keys(password)
 
-        clicked = driver.execute_script(
+        # Vue form validation needs input events; Enter on password submits reliably.
+        driver.execute_script(
             """
-            const labels = ['log in', 'login', 'sign in'];
-            for (const el of document.querySelectorAll('button, a, input[type="submit"]')) {
-              const t = (el.innerText || el.value || '').trim().toLowerCase();
-              if (labels.some(l => t === l || t.includes(l))) {
-                el.click();
-                return true;
-              }
-            }
-            return false;
-            """
+            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+            arguments[1].dispatchEvent(new Event('input', {bubbles: true}));
+            """,
+            user_el,
+            pass_el,
         )
-        if not clicked:
-            pass_el.submit()
+        from selenium.webdriver.common.keys import Keys
 
-        time.sleep(3.0)
+        pass_el.send_keys(Keys.RETURN)
+
+        time.sleep(4.0)
         driver.get(FOURCASTERS_ACTIVE_WAGERS_URL)
-        time.sleep(2.0)
+        time.sleep(2.5)
         if _page_requires_login(driver):
             logger.warning("4casters web login did not reach Active Wagers")
             return False
@@ -318,7 +318,11 @@ def capture_fourcasters_active_wager(
               'svg, button, [class*="expand"], [class*="plus"], [aria-expanded], .icon'
             ) || row;
             clickTarget.scrollIntoView({block: 'center'});
-            clickTarget.click();
+            if (typeof clickTarget.click === 'function') {
+              clickTarget.click();
+            } else {
+              clickTarget.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            }
             """,
             matched_row,
         )
@@ -344,7 +348,13 @@ def capture_fourcasters_active_wager(
               if (!dominated) items.push(el);
             }
 
-            if (items.length) return items[0];
+            if (items.length) {
+              for (const el of items) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width >= 80 && rect.height >= 60) return el;
+              }
+              return items[0];
+            }
 
             const panel = document.querySelector(
               '[class*="expanded"], [class*="detail"], [class*="summary"], [class*="modal"], [role="dialog"]'
@@ -355,7 +365,19 @@ def capture_fourcasters_active_wager(
         )
 
         target = detail_el or matched_row
-        png = target.screenshot_as_png
+        png = None
+        for candidate in (target, matched_row):
+            if candidate is None:
+                continue
+            try:
+                png = candidate.screenshot_as_png
+                if png:
+                    break
+            except Exception:
+                continue
+        if not png:
+            logger.warning("4casters Active Wagers: element screenshot empty; using viewport crop")
+            png = driver.get_screenshot_as_png()
         if png:
             preview = " ".join((row_text or "").split())[:72]
             logger.info(f"4casters Active Wagers screenshot | {team_name} | {preview}")

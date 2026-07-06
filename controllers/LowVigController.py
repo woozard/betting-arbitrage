@@ -1,15 +1,18 @@
 import os
+import tempfile
 import time
 
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver import Remote
 from selenium.webdriver.chromium.remote_connection import ChromiumRemoteConnection
+from selenium.webdriver.support.ui import WebDriverWait
 
 from controllers.BetamapolaController import BetamapolaController
-from utils.config import brightdata_selenium_endpoint
+from utils.config import brightdata_selenium_endpoint, lowvig_proxy_settings
 from utils.helpers import debug_filepath
 
 
@@ -51,8 +54,10 @@ class LowVigController(BetamapolaController):
     )
 
     def __init__(self, account, site, sport="baseball"):
+        self._proxy = lowvig_proxy_settings()
         self._use_scraping_browser = bool(
-            os.getenv("LOWVIG_USE_SCRAPING_BROWSER", "1") == "1"
+            not self._proxy
+            and os.getenv("LOWVIG_USE_SCRAPING_BROWSER", "1") == "1"
             and brightdata_selenium_endpoint()
         )
         super().__init__(account, site, sport=sport)
@@ -60,8 +65,76 @@ class LowVigController(BetamapolaController):
         self.dashboard_url = f"https://{self.SPORTS_HOST}/sportsbook"
         self.sport_url = self.dashboard_url
 
+    def _create_driver_with_proxy(self, proxy: dict):
+        """Local Chrome + authenticated HTTP proxy (IPRoyal residential/ISP)."""
+        self.proxy_extension_dir = self._create_proxy_extension(
+            proxy["host"],
+            proxy["port"],
+            proxy["username"],
+            proxy["password"],
+        )
+
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--disable-setuid-sandbox")
+        options.add_argument("--disable-accelerated-2d-canvas")
+        options.add_argument(f"--load-extension={self.proxy_extension_dir}")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-extensions-except=" + self.proxy_extension_dir)
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        )
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+        options.add_argument(f"--user-data-dir={self.user_data_dir}")
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.driver = webdriver.Chrome(options=options)
+                try:
+                    _ = self.driver.current_url
+                except Exception as ve:
+                    self.logger.warning(
+                        f"Chrome created on attempt {attempt + 1} but session is dead: {ve}"
+                    )
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(5)
+                    continue
+                break
+            except Exception as e:
+                self.logger.warning(
+                    f"Chrome driver start attempt {attempt + 1}/{max_retries} failed: {e}"
+                )
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(5)
+
+        self.wait = WebDriverWait(self.driver, 30)
+        time.sleep(2)
+
     def _create_driver(self):
-        """Use Bright Data Browser API when configured (Cloudflare / CAPTCHA bypass)."""
+        """IPRoyal/local proxy, else Bright Data Browser API, else default Bright Data proxy."""
+        if self._proxy:
+            self.logger.info(
+                f"LowVig using HTTP proxy {self._proxy['host']}:{self._proxy['port']} "
+                f"(user={self._proxy['username']})"
+            )
+            self._create_driver_with_proxy(self._proxy)
+            return
+
         endpoint = brightdata_selenium_endpoint()
         if self._use_scraping_browser and endpoint:
             self.logger.info(f"LowVig using Bright Data Browser API ({endpoint.split('@')[-1]})")
@@ -69,7 +142,6 @@ class LowVigController(BetamapolaController):
             options.add_argument("--ignore-certificate-errors")
             connection = ChromiumRemoteConnection(endpoint, "goog", "chrome")
             self.driver = Remote(connection, options=options)
-            from selenium.webdriver.support.ui import WebDriverWait
             self.wait = WebDriverWait(self.driver, 30)
             time.sleep(2)
             return

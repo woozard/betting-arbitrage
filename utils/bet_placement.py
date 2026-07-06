@@ -240,7 +240,7 @@ def _alerts_telegram_chat(telegram_config: dict):
     return telegram_config.get("arbitrage")
 
 
-_API_RECEIPT_SCREENSHOT_BOOKS = frozenset({"4casters", "3et", "paradisewager"})
+_API_RECEIPT_SCREENSHOT_BOOKS = frozenset({"3et", "paradisewager"})
 
 
 def _dispatch_other_api_leg_screenshot(

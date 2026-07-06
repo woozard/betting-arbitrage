@@ -113,7 +113,7 @@ def profit_pct_to_max_total_prob(profit_pct: float) -> float:
     return 1.0 - (profit_pct / 100.0)
 
 
-MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '1.01'))
+MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '-1.01'))
 if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
     ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))
 elif MIN_ARB_PROFIT_PCT != 0:
@@ -122,7 +122,7 @@ else:
     ARB_MAX_TOTAL_PROB = 1.0
 
 # Spread/run-line alert threshold (same min edge as ML by default).
-MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '1.01'))
+MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '-1.01'))
 SPREAD_REAL_MONEY_BETTING_ENABLED = os.getenv(
     'SPREAD_REAL_MONEY_BETTING_ENABLED', 'true'
 ).lower() in ('1', 'true', 'yes')
@@ -285,6 +285,32 @@ def brightdata_cdp_endpoint(zone: str = None) -> str | None:
         return None
     auth = f"brd-customer-{BRIGHTDATA_CUSTOMER}-zone-{z}:{BRIGHTDATA_ZONE_PASSWORD}"
     return f"wss://{auth}@brd.superproxy.io:9222"
+
+
+def lowvig_proxy_settings() -> dict | None:
+    """HTTP proxy for LowVig (IPRoyal residential/ISP with optional sticky US session)."""
+    username = os.getenv("LOWVIG_PROXY_USERNAME") or os.getenv("IPROYAL_PROXY_USERNAME")
+    password = os.getenv("LOWVIG_PROXY_PASSWORD") or os.getenv("IPROYAL_PROXY_PASSWORD")
+    if not username or not password:
+        return None
+    host = os.getenv("LOWVIG_PROXY_HOST") or os.getenv("IPROYAL_PROXY_HOST") or "geo.iproyal.com"
+    port_raw = os.getenv("LOWVIG_PROXY_PORT") or os.getenv("IPROYAL_PROXY_PORT") or "12321"
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        return None
+    if "_country-" not in password:
+        country = os.getenv("LOWVIG_PROXY_COUNTRY", "us")
+        session = os.getenv("LOWVIG_PROXY_SESSION", "lowvig01")
+        lifetime = os.getenv("LOWVIG_PROXY_SESSION_LIFETIME", "30m")
+        session = "".join(c for c in session if c.isalnum())[:8].ljust(8, "0")
+        password = f"{password}_country-{country}_session-{session}_lifetime-{lifetime}"
+    return {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+    }
 
 
 PROXY1 = {

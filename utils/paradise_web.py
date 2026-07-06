@@ -198,11 +198,17 @@ def capture_paradise_pending_wager(
             const searchRoots = [near, near ? near.parentElement : null, document.body].filter(Boolean);
 
             for (const root of searchRoots) {
+              let best = null;
+              let bestArea = 0;
               for (const el of root.querySelectorAll('tr, li, div, section, table, tbody')) {
                 const t = (el.innerText || '').trim();
                 if (t.length < 40 || t.length > 2500) continue;
                 if (!detailMatches(t)) continue;
                 if (row.contains(el)) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.height < 80) continue;
+                const area = rect.width * rect.height;
+                if (area <= bestArea) continue;
                 let dominated = false;
                 for (const other of root.querySelectorAll('tr, li, div, section, table, tbody')) {
                   if (other !== el && other.contains(el) && detailMatches(other.innerText || '')) {
@@ -210,8 +216,12 @@ def capture_paradise_pending_wager(
                     break;
                   }
                 }
-                if (!dominated) return el;
+                if (!dominated) {
+                  bestArea = area;
+                  best = el;
+                }
               }
+              if (best) return best;
             }
 
             // Expanded content may live inside the same row container.
