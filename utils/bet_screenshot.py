@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Callable
 
@@ -227,6 +228,91 @@ def _betamapola_odds_needles(odds) -> list[str]:
     return out
 
 
+def _betamapola_team_needles(team_name: str = "", team_1: str = "", team_2: str = "") -> list[str]:
+    needles: list[str] = []
+    for name in (team_name, team_1, team_2):
+        if not name:
+            continue
+        low = name.strip().lower()
+        if low and low not in needles:
+            needles.append(low)
+        last = name.strip().split()[-1].lower()
+        if last and last not in needles:
+            needles.append(last)
+    return needles
+
+
+def _betamapola_open_bets_is_header_block(text: str) -> bool:
+    """True when element text is the full open-bets table chrome, not a single wager row."""
+    tl = (text or "").lower()
+    header_markers = ("tik#", "accepted date", "export to pdf", "export to excel")
+    return sum(1 for m in header_markers if m in tl) >= 2
+
+
+def _betamapola_open_bets_row_valid(
+    text: str,
+    *,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    ticket_number: int | str | None = None,
+) -> bool:
+    if _betamapola_open_bets_is_header_block(text):
+        return False
+    if not text or len(text) < 40 or len(text) > 900:
+        return False
+    tl = text.lower()
+    needles = _betamapola_team_needles(team_name, team_1, team_2)
+    if needles and not any(n in tl for n in needles):
+        return False
+    if ticket_number is not None and str(ticket_number).strip() not in text:
+        return False
+    odds_needles = [n.lower() for n in _betamapola_odds_needles(odds)]
+    if odds_needles and not any(n in tl.replace(" ", "") for n in odds_needles):
+        return False
+    has_amounts = "$" in text and ("risk" in tl or "win" in tl)
+    has_wager = (
+        "money line" in tl
+        or "spread" in tl
+        or "total" in tl
+        or "for game" in tl
+        or bool(re.search(r"[+-]\d{2,4}", text))
+    )
+    return has_amounts and has_wager
+
+
+def _betamapola_open_bets_ticket_valid(
+    text: str,
+    *,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    ticket_number: int | str | None = None,
+) -> bool:
+    if not text or len(text) < 40:
+        return False
+    tl = text.lower()
+    needles = _betamapola_team_needles(team_name, team_1, team_2)
+    if needles and not any(n in tl for n in needles):
+        return False
+    if ticket_number is not None and str(ticket_number).strip() not in text:
+        return False
+    odds_needles = [n.lower() for n in _betamapola_odds_needles(odds)]
+    if odds_needles and not any(n in tl.replace(" ", "") for n in odds_needles):
+        return False
+    has_amounts = "$" in text and ("risk" in tl or "win" in tl)
+    has_wager = (
+        "money line" in tl
+        or "spread" in tl
+        or "total" in tl
+        or "for game" in tl
+        or bool(re.search(r"[+-]\d{2,4}", text))
+    )
+    return has_amounts and has_wager
+
+
 def _betamapola_text_has_wager_detail(
     text: str,
     *,
@@ -238,13 +324,103 @@ def _betamapola_text_has_wager_detail(
     if not text or len(text) < 30:
         return False
     tl = text.lower()
-    if team_name and team_name.lower() not in tl:
+    needles = _betamapola_team_needles(team_name, team_1, team_2)
+    if needles and not any(n in tl for n in needles):
         return False
-    has_matchup = any(t and t.lower() in tl for t in (team_1, team_2))
     odds_needles = [n.lower() for n in _betamapola_odds_needles(odds)]
     has_odds = not odds_needles or any(n in tl.replace(" ", "") for n in odds_needles)
     has_amounts = "$" in text or "risk" in tl or "to win" in tl or "win" in tl
-    return has_matchup and has_odds and (has_amounts or bool(odds_needles))
+    return has_odds and has_amounts
+
+
+def _find_betamapola_open_bets_ticket(
+    driver,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    ticket_number: int | str | None = None,
+):
+    team_needles = _betamapola_team_needles(team_name, team_1, team_2)
+    odds_needles = _betamapola_odds_needles(odds)
+    ticket_s = str(ticket_number).strip() if ticket_number is not None else ""
+    return driver.execute_script(
+        """
+        const teamNeedles = arguments[0] || [];
+        const oddsNeedles = (arguments[1] || []).map(s => String(s).toLowerCase());
+        const ticket = String(arguments[2] || '');
+
+        function rowMatches(el) {
+          const t = (el.innerText || '').trim();
+          const tl = t.toLowerCase();
+          if (t.length < 40 || t.length > 900) return false;
+          const headerHits = ['tik#', 'accepted date', 'export to pdf'].filter(m => tl.includes(m)).length;
+          if (headerHits >= 2) return false;
+          if (ticket && !t.includes(ticket)) return false;
+          if (teamNeedles.length && !teamNeedles.some(n => n && tl.includes(n))) return false;
+          if (oddsNeedles.length) {
+            const compact = tl.replace(/\\s/g, '');
+            if (!oddsNeedles.some(n => compact.includes(String(n).replace(/\\s/g, '')))) return false;
+          }
+          const hasAmounts = /\\$\\s*\\d/.test(t) && (/risk/i.test(tl) || /win/i.test(tl));
+          const hasWager = /money line|spread|total|for game/i.test(tl) || /[+-]\\d{2,4}/.test(t);
+          return hasAmounts && hasWager;
+        }
+
+        function score(el) {
+          let s = 0;
+          const cls = (el.className || '').toLowerCase();
+          const r = el.getBoundingClientRect();
+          const t = (el.innerText || '').trim();
+          const tl = t.toLowerCase();
+          if (cls.includes('graded-data')) s += 200;
+          if (cls.includes('ticket')) s -= 80;
+          if (cls.includes('report-detail')) s -= 40;
+          if (/baseball|for game|pitcher/i.test(t)) s += 30;
+          if (/money line|spread|total/i.test(tl)) s += 20;
+          if (r.height >= 40 && r.height <= 120) s += 80;
+          else if (r.height > 120 && r.height <= 180) s += 20;
+          else if (r.height > 180) s -= 60;
+          if (r.width >= 800 && r.width <= 1700) s += 30;
+          if (t.length >= 80 && t.length <= 450) s += 40;
+          else if (t.length > 600) s -= 50;
+          const hasChildRow = [...el.querySelectorAll('.row.graded-data, [class*="graded-data"]')]
+            .some(child => child !== el && rowMatches(child));
+          if (hasChildRow) s -= 100;
+          return s;
+        }
+
+        const selectors = [
+          '.row.graded-data',
+          '[class*="graded-data"]',
+          '.ticket.mb-5',
+          '.ticket',
+          '.report-detail-open-bets',
+          'table tbody tr',
+          '.wager-item', '.bet-item', '.open-bet-row',
+          '[ng-repeat*="wager"]', '[ng-repeat*="pick"]',
+          '.card', '.open-bets .row', '.openBets .row',
+        ];
+        let best = null;
+        let bestScore = -1;
+        for (const sel of selectors) {
+          for (const el of document.querySelectorAll(sel)) {
+            if (!rowMatches(el)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 80 || r.height < 24) continue;
+            const s = score(el);
+            if (s > bestScore) {
+              best = el;
+              bestScore = s;
+            }
+          }
+        }
+        return best;
+        """,
+        team_needles,
+        odds_needles,
+        ticket_s,
+    )
 
 
 def _capture_betamapola_open_bets_row(
@@ -256,68 +432,82 @@ def _capture_betamapola_open_bets_row(
     team_1: str = "",
     team_2: str = "",
     odds=None,
+    ticket_number: int | str | None = None,
 ) -> str | None:
+    import re
     import time
+
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
 
     base_url = (driver.current_url or "").split("#")[0].rstrip("/")
     if not base_url:
         base_url = "https://betamapola.com/sports"
     open_bets_url = f"{base_url}#/openBets"
     sport_url = driver.current_url
-    odds_needles = _betamapola_odds_needles(odds)
 
     try:
         driver.get(open_bets_url)
         time.sleep(2.5)
-        element = driver.execute_script(
-            """
-            const teamNeedles = [arguments[0], arguments[1], arguments[2]]
-              .filter(Boolean)
-              .map(s => String(s).toLowerCase());
-            const oddsNeedles = (arguments[3] || []).map(s => String(s).toLowerCase());
-            function rowMatches(el) {
-              const t = (el.innerText || '').trim();
-              if (t.length < 25) return false;
-              const tl = t.toLowerCase();
-              if (!teamNeedles.some(n => n && tl.includes(n))) return false;
-              if (oddsNeedles.length) {
-                const compact = tl.replace(/\\s/g, '');
-                if (!oddsNeedles.some(n => compact.includes(n.replace(/\\s/g, '')))) return false;
-              }
-              return tl.includes('$') || /[+-]\\d{2,4}/.test(tl) || tl.includes('risk') || tl.includes('win');
-            }
-            const selectors = [
-              'table tbody tr',
-              '.wager-item', '.bet-item', '.open-bet-row',
-              '[ng-repeat*="wager"]', '[ng-repeat*="pick"]',
-              '.card', '.open-bets .row', '.openBets .row',
-            ];
-            let best = null;
-            let bestH = 0;
-            for (const sel of selectors) {
-              for (const el of document.querySelectorAll(sel)) {
-                if (!rowMatches(el)) continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.height > bestH) {
-                  best = el;
-                  bestH = rect.height;
-                }
-              }
-            }
-            if (best) return best;
-            const table = document.querySelector('table');
-            if (table) return table;
-            return document.querySelector('.open-bets, .openBets, main, #content');
-            """,
-            team_name,
-            team_1,
-            team_2,
-            odds_needles,
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, ".ticket, [class*='graded-data'], .report-detail-open-bets")
+                )
+            )
+        except Exception:
+            pass
+
+        element = None
+        for _ in range(12):
+            element = _find_betamapola_open_bets_ticket(
+                driver,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                odds=odds,
+                ticket_number=ticket_number,
+            )
+            if element:
+                ticket_text = (element.text or "").strip()
+                if _betamapola_open_bets_row_valid(
+                    ticket_text,
+                    team_name=team_name,
+                    team_1=team_1,
+                    team_2=team_2,
+                    odds=odds,
+                    ticket_number=ticket_number,
+                ):
+                    break
+            element = None
+            time.sleep(0.5)
+
+        if not element:
+            logger.warning(
+                f"Betamapola open-bets: no ticket card for {team_name!r} "
+                f"({team_1} vs {team_2}, odds={odds}, ticket={ticket_number})"
+            )
+            return None
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            element,
         )
-        if element:
+        time.sleep(0.4)
+
+        png = None
+        try:
             png = element.screenshot_as_png
-            if png:
-                return _write_png(path, png, logger)
+        except Exception:
+            pass
+        if not png:
+            logger.warning("Betamapola open-bets: element screenshot empty")
+            return None
+
+        preview = re.sub(r"\s+", " ", (element.text or ""))[:72]
+        logger.info(f"Betamapola open-bets screenshot | {team_name} | {preview}")
+        return _write_png(path, png, logger)
     except Exception as exc:
         logger.warning(f"Betamapola open-bets screenshot failed: {exc}")
     finally:
@@ -343,6 +533,7 @@ def capture_betamapola_confirmation(
     team_1: str = "",
     team_2: str = "",
     odds=None,
+    ticket_number: int | str | None = None,
 ) -> str | None:
     import time
 
@@ -359,6 +550,7 @@ def capture_betamapola_confirmation(
             team_1=team_1,
             team_2=team_2,
             odds=odds,
+            ticket_number=ticket_number,
         )
         if shot:
             return shot
@@ -714,6 +906,7 @@ def capture_confirmed_bet_screenshot(
             team_1=team_1,
             team_2=team_2,
             odds=odds,
+            ticket_number=ticket_number,
         )
         if shot:
             return shot

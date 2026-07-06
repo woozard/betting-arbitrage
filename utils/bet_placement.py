@@ -702,7 +702,7 @@ def finalize_confirmed_bet_with_screenshot(
         team_name,
         game_id,
         stake,
-        moneyline_odd,
+        placed_odds if placed_odds is not None else moneyline_odd,
         driver=driver,
         open_bets_url=open_bets_url,
         return_to_sport=return_to_sport,

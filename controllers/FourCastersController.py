@@ -38,7 +38,12 @@ from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
 from utils.storage import Storage
-from utils.stake_sizing import base_amount_stake_from_odds, format_base_amount_stake
+from utils.stake_sizing import (
+    BaseAmountStake,
+    base_amount_stake_from_odds,
+    format_base_amount_stake,
+    stake_from_fourcasters_fill,
+)
 from utils.timing import time_it
 
 MLB_RUN_LINE = 1.5
@@ -625,8 +630,15 @@ class FourCastersController:
         )
         if not confirmed:
             raise FourCastersApiError(message or "Bet not accepted by bookmaker")
+        fill = getattr(self, "_last_fill", None) or {}
+        actual_stake = stake_from_fourcasters_fill(fill, stake_plan)
+        if actual_stake.american_odds != stake_plan.american_odds:
+            self.logger.info(
+                f"4casters fill odds after commission: {actual_stake.american_odds:+d} "
+                f"(board {moneyline_odd}, risk=${actual_stake.risk:.2f} win=${actual_stake.to_win:.2f})"
+            )
         self.logger.info(f"Bet accepted by bookmaker: {message}")
-        return True, stake_plan
+        return True, actual_stake
 
     def betting(self, stake: float = 1.0):
         self.logger = Logger.get_logger(f"{self.bookmaker}-betting")
@@ -761,6 +773,11 @@ class FourCastersController:
                             extra_lines.append(f"Risk: ${fill.get('risk')}")
                         if fill.get("win") is not None:
                             extra_lines.append(f"Win: ${fill.get('win')}")
+                        placed_odds = (
+                            stake_used.american_odds
+                            if isinstance(stake_used, BaseAmountStake)
+                            else None
+                        )
                         finalize_confirmed_bet_with_screenshot(
                             self.cache,
                             self.storage,
@@ -776,6 +793,7 @@ class FourCastersController:
                             extra_lines=extra_lines or None,
                             driver=self._ensure_screenshot_driver(),
                             open_bets_url="https://4casters.io/my-bets/active-wagers",
+                            placed_odds=placed_odds,
                         )
                     else:
                         if should_notify_failed_bet(self._last_bet_error):

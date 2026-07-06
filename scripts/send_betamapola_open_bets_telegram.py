@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Capture Betamapola Open Bets page and send screenshot to KC Arb Screenshots Telegram."""
 import argparse
-import asyncio
 import sys
 
 from controllers.BetamapolaController import BetamapolaController
+from database.config import __get_db1_session__
 from database.models.Accounts import Accounts
+from database.models.ArbitrageBets import ArbitrageBets
+from utils.bet_placement import _send_ops_alert
 from utils.config import BETAMAPOLA, BETAMAPOLA_ACCOUNT, BETAMAPOLA_PASSWORD, BETAMAPOLA_LABEL, TELEGRAM
 from utils.helpers import format_utc_timestamp
 from utils.logger import Logger
@@ -60,6 +62,27 @@ def main():
         team_name = args.team_name.strip()
         team_1 = ""
         team_2 = ""
+        odds = None
+        ticket_number = None
+        game_id = "open_bets"
+
+        session = __get_db1_session__()
+        try:
+            bet = (
+                session.query(ArbitrageBets)
+                .filter(ArbitrageBets.bookmaker == "betamapola")
+                .order_by(ArbitrageBets.created_at.desc())
+                .first()
+            )
+            if bet:
+                team_name = team_name or bet.team_name or ""
+                team_1 = bet.team_1 or team_1
+                team_2 = bet.team_2 or team_2
+                odds = bet.odds
+                game_id = bet.game_id or game_id
+        finally:
+            session.close()
+
         if team_name:
             for line in lines:
                 if team_name.lower() in line.lower() and " vs " in line.lower():
@@ -71,7 +94,9 @@ def main():
             team_name or "Open Bets",
             team_1,
             team_2,
-            "open_bets",
+            game_id,
+            ticket_number=ticket_number,
+            odds=odds,
         )
         if not shot:
             print("Screenshot capture failed")
@@ -79,6 +104,20 @@ def main():
         print(f"Screenshot: {shot}")
         if args.dry_run:
             return 0
+
+        header = (
+            f"===== Betamapola Open Bets screenshot test =====\n"
+            f"As of: {format_utc_timestamp()}\n"
+            f"{team_name} | odds={odds}"
+        )
+        _send_ops_alert(
+            logger,
+            header,
+            chat_id,
+            label="betamapola bet screenshot",
+            photo_path=shot,
+            photo_only=True,
+        )
         print("Sent to TELEGRAM_CHAT_SCREENSHOTS")
         return 0
     finally:

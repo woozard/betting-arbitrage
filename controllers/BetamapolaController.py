@@ -1861,6 +1861,7 @@ class BetamapolaController:
             team_1=team_1,
             team_2=team_2,
             odds=odds,
+            ticket_number=ticket_number,
         )
         if not shot:
             self.logger.warning("Open-bets screenshot capture failed")

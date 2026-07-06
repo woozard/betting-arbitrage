@@ -47,6 +47,39 @@ def american_to_risk_from_win(to_win: float, american_odds) -> float:
     return round(float(to_win) * abs(odds) / 100.0, 2)
 
 
+def american_odds_from_risk_win(risk: float, to_win: float) -> int:
+    """Infer displayed American odds from actual risk/win (includes exchange commission)."""
+    risk_f = float(risk)
+    win_f = float(to_win)
+    if risk_f <= 0 or win_f <= 0:
+        raise ValueError(f"Invalid risk/win for odds inference: {risk!r}/{to_win!r}")
+    if win_f >= risk_f:
+        return int(round(win_f / risk_f * 100.0))
+    return -int(round(risk_f / win_f * 100.0))
+
+
+def stake_from_fourcasters_fill(fill: dict, fallback: BaseAmountStake) -> BaseAmountStake:
+    """Build stake + display odds from a 4casters matched fill payload."""
+    risk = fill.get("risk")
+    win = fill.get("win")
+    if risk is None or win is None:
+        return fallback
+    try:
+        risk_f = round(float(risk), 2)
+        win_f = round(float(win), 2)
+        placed_odds = american_odds_from_risk_win(risk_f, win_f)
+    except (TypeError, ValueError):
+        return fallback
+    return BaseAmountStake(
+        base_amount=fallback.base_amount,
+        american_odds=placed_odds,
+        entry_field=fallback.entry_field,
+        entry_amount=fallback.entry_amount,
+        risk=risk_f,
+        to_win=win_f,
+    )
+
+
 def base_amount_stake_from_odds(
     american_odds,
     base_amount: float | None = None,

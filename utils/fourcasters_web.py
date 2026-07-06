@@ -342,6 +342,116 @@ def _fourcasters_on_active_wagers_page(driver) -> bool:
         return False
 
 
+def _fourcasters_expanded_panel_valid(
+    text: str,
+    *,
+    team_name: str,
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+) -> bool:
+    if not text or len(text) < 40:
+        return False
+    tl = text.lower()
+    if _fourcasters_nav_or_homepage_text(text):
+        return False
+    required = ("game:", "league:", "side:", "risk:")
+    if not all(marker in tl for marker in required):
+        return False
+    if not _wager_text_matches(text, team_name, team_1, team_2):
+        return False
+    if not _fourcasters_odds_matches(text, odds):
+        return False
+    return True
+
+
+def _click_fourcasters_wager_expand(driver, row) -> bool:
+    """Click the INFO-column expand control on a wager row."""
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                const row = arguments[0];
+                if (!row) return false;
+                const rowRect = row.getBoundingClientRect();
+                const candidates = [...document.querySelectorAll('svg, button, a, span, div')]
+                  .filter(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8 || r.width > 80) return false;
+                    const dy = Math.abs((r.top + r.bottom) / 2 - (rowRect.top + rowRect.bottom) / 2);
+                    return dy <= 40 && r.left >= rowRect.right - 140;
+                  });
+                candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+                const target = candidates[0];
+                if (!target) return false;
+                target.scrollIntoView({block: 'center'});
+                const clickEl = (typeof target.click === 'function')
+                  ? target
+                  : (target.closest('button,a,div') || target.parentElement || target);
+                if (typeof clickEl.click === 'function') {
+                  clickEl.click();
+                } else {
+                  clickEl.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                }
+                return true;
+                """,
+                row,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _find_fourcasters_expanded_panel(driver, team_name, team_1, team_2, odds):
+    return driver.execute_script(
+        """
+        const teamName = (arguments[0] || '').toLowerCase();
+        const team1 = (arguments[1] || '').toLowerCase();
+        const team2 = (arguments[2] || '').toLowerCase();
+        const needles = [teamName, team1, team2]
+          .flatMap(v => v ? [v, v.split(' ').pop()] : [])
+          .filter(Boolean);
+
+        function matchesTeam(text) {
+          const tl = (text || '').toLowerCase();
+          return needles.some(n => n && tl.includes(n));
+        }
+
+        function isExpandedPanel(el) {
+          const t = (el.innerText || '').trim();
+          const tl = t.toLowerCase();
+          if (t.length < 40 || t.length > 900) return false;
+          if (!['game:', 'league:', 'side:', 'risk:'].every(m => tl.includes(m))) return false;
+          if (!matchesTeam(t)) return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 200 || rect.height < 120) return false;
+          if (rect.width > window.innerWidth * 0.75) return false;
+          const hasChild = [...el.querySelectorAll('div, section, article, aside')].some(child => {
+            const ct = (child.innerText || '').trim().toLowerCase();
+            return ct.length > 40
+              && ['game:', 'league:', 'side:', 'risk:'].every(m => ct.includes(m));
+          });
+          return !hasChild;
+        }
+
+        let best = null;
+        let bestScore = -1;
+        for (const el of document.querySelectorAll('div, section, article, aside')) {
+          if (!isExpandedPanel(el)) continue;
+          const score = (el.innerText || '').trim().length;
+          if (score > bestScore) {
+            bestScore = score;
+            best = el;
+          }
+        }
+        return best;
+        """,
+        team_name,
+        team_1,
+        team_2,
+    )
+
+
 def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
     return driver.execute_script(
         """
@@ -488,23 +598,44 @@ def capture_fourcasters_active_wager(
         )
         time.sleep(0.3)
 
-        detail_el = _find_fourcasters_wager_element(
-            driver, team_name, team_1, team_2, odds
-        ) or matched_row
+        detail_el = None
+        detail_text = row_text
+        if _click_fourcasters_wager_expand(driver, matched_row):
+            for _ in range(8):
+                time.sleep(0.25)
+                panel = _find_fourcasters_expanded_panel(
+                    driver, team_name, team_1, team_2, odds
+                )
+                if panel:
+                    panel_text = (panel.text or "").strip()
+                    if _fourcasters_expanded_panel_valid(
+                        panel_text,
+                        team_name=team_name,
+                        team_1=team_1,
+                        team_2=team_2,
+                        odds=odds,
+                    ):
+                        detail_el = panel
+                        detail_text = panel_text
+                        break
+        else:
+            logger.info("4casters Active Wagers: expand control not found — using row")
 
-        detail_text = (detail_el.text or "").strip() if detail_el else row_text
-        if not _fourcasters_wager_detail_valid(
-            detail_text,
-            team_name=team_name,
-            team_1=team_1,
-            team_2=team_2,
-            odds=odds,
-            stake=stake,
-        ):
-            logger.warning(
-                f"4casters Active Wagers: capture target lacks wager detail for {team_name!r}"
-            )
-            return None
+        if detail_el is None:
+            detail_el = matched_row
+            detail_text = row_text
+            if not _fourcasters_wager_detail_valid(
+                detail_text,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                odds=odds,
+                stake=stake,
+            ):
+                logger.warning(
+                    f"4casters Active Wagers: capture target lacks wager detail for {team_name!r}"
+                )
+                return None
 
         png = None
         for candidate in (detail_el, matched_row):
