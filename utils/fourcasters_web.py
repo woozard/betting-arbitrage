@@ -301,7 +301,12 @@ def _fourcasters_wager_detail_valid(
 ) -> bool:
     import re
 
-    if not text or len(text) < 20 or _fourcasters_nav_or_homepage_text(text):
+    if not text or len(text) < 20:
+        return False
+    tl = text.lower()
+    if _fourcasters_nav_or_homepage_text(text):
+        return False
+    if re.search(r"MON\s*\n\s*0", text, re.I) or "this week" in tl:
         return False
     if not _wager_text_matches(text, team_name, team_1, team_2):
         return False
@@ -367,8 +372,9 @@ def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
 
         function isWagerRow(el) {
           const t = (el.innerText || '').trim();
-          if (t.length < 25 || t.length > 350) return false;
+          if (t.length < 25 || t.length > 280) return false;
           if (isNavOrHome(t) || isTabChrome(t)) return false;
+          if (/MON\\s*\\n\\s*0/i.test(t) || /THIS WEEK/i.test(t)) return false;
           if (!matchesTeam(t)) return false;
           if (!/[+-]\\d{2,4}/.test(t)) return false;
           if (!/\\$\\s*\\d/.test(t) || !/taken/i.test(t)) return false;
@@ -376,7 +382,7 @@ def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
           const rect = el.getBoundingClientRect();
           if (rect.width < 80 || rect.height < 24) return false;
           if (rect.width > window.innerWidth * 0.92) return false;
-          if (rect.height > 160) return false;
+          if (rect.height > 100) return false;
           return true;
         }
 
