@@ -206,6 +206,130 @@ def capture_betwar_open_wager(
     return None
 
 
+def _betamapola_odds_needles(odds) -> list[str]:
+    if odds is None or odds == "":
+        return []
+    needles: list[str] = []
+    try:
+        val = float(odds)
+        if val == int(val):
+            n = int(val)
+            needles.extend([f"{n:+d}", f"{n:d}", f"+{n}" if n > 0 else str(n)])
+        else:
+            needles.append(f"{val:g}")
+    except (TypeError, ValueError):
+        needles.append(str(odds).strip())
+    out: list[str] = []
+    for needle in needles:
+        needle = needle.strip()
+        if needle and needle not in out:
+            out.append(needle)
+    return out
+
+
+def _betamapola_text_has_wager_detail(
+    text: str,
+    *,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+) -> bool:
+    if not text or len(text) < 30:
+        return False
+    tl = text.lower()
+    if team_name and team_name.lower() not in tl:
+        return False
+    has_matchup = any(t and t.lower() in tl for t in (team_1, team_2))
+    odds_needles = [n.lower() for n in _betamapola_odds_needles(odds)]
+    has_odds = not odds_needles or any(n in tl.replace(" ", "") for n in odds_needles)
+    has_amounts = "$" in text or "risk" in tl or "to win" in tl or "win" in tl
+    return has_matchup and has_odds and (has_amounts or bool(odds_needles))
+
+
+def _capture_betamapola_open_bets_row(
+    driver,
+    path: str,
+    logger,
+    *,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+) -> str | None:
+    import time
+
+    base_url = (driver.current_url or "").split("#")[0].rstrip("/")
+    if not base_url:
+        base_url = "https://betamapola.com/sports"
+    open_bets_url = f"{base_url}#/openBets"
+    sport_url = driver.current_url
+    odds_needles = _betamapola_odds_needles(odds)
+
+    try:
+        driver.get(open_bets_url)
+        time.sleep(2.5)
+        element = driver.execute_script(
+            """
+            const teamNeedles = [arguments[0], arguments[1], arguments[2]]
+              .filter(Boolean)
+              .map(s => String(s).toLowerCase());
+            const oddsNeedles = (arguments[3] || []).map(s => String(s).toLowerCase());
+            function rowMatches(el) {
+              const t = (el.innerText || '').trim();
+              if (t.length < 25) return false;
+              const tl = t.toLowerCase();
+              if (!teamNeedles.some(n => n && tl.includes(n))) return false;
+              if (oddsNeedles.length) {
+                const compact = tl.replace(/\\s/g, '');
+                if (!oddsNeedles.some(n => compact.includes(n.replace(/\\s/g, '')))) return false;
+              }
+              return tl.includes('$') || /[+-]\\d{2,4}/.test(tl) || tl.includes('risk') || tl.includes('win');
+            }
+            const selectors = [
+              'table tbody tr',
+              '.wager-item', '.bet-item', '.open-bet-row',
+              '[ng-repeat*="wager"]', '[ng-repeat*="pick"]',
+              '.card', '.open-bets .row', '.openBets .row',
+            ];
+            let best = null;
+            let bestH = 0;
+            for (const sel of selectors) {
+              for (const el of document.querySelectorAll(sel)) {
+                if (!rowMatches(el)) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.height > bestH) {
+                  best = el;
+                  bestH = rect.height;
+                }
+              }
+            }
+            if (best) return best;
+            const table = document.querySelector('table');
+            if (table) return table;
+            return document.querySelector('.open-bets, .openBets, main, #content');
+            """,
+            team_name,
+            team_1,
+            team_2,
+            odds_needles,
+        )
+        if element:
+            png = element.screenshot_as_png
+            if png:
+                return _write_png(path, png, logger)
+    except Exception as exc:
+        logger.warning(f"Betamapola open-bets screenshot failed: {exc}")
+    finally:
+        if sport_url:
+            try:
+                driver.get(sport_url)
+                time.sleep(1.0)
+            except Exception:
+                pass
+    return None
+
+
 def capture_betamapola_betslip(driver, path: str, logger) -> str | None:
     """Capture Betamapola post-acceptance UI (not the pre-submit Place Bet slip)."""
     return capture_betamapola_confirmation(driver, path, logger)
@@ -218,12 +342,26 @@ def capture_betamapola_confirmation(
     team_name: str = "",
     team_1: str = "",
     team_2: str = "",
+    odds=None,
 ) -> str | None:
     import time
 
     from selenium.webdriver.common.by import By
 
     from utils.ticosports_wager import betslip_text_confirms_wager
+
+    if team_name or team_1 or team_2:
+        shot = _capture_betamapola_open_bets_row(
+            driver,
+            path,
+            logger,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+        )
+        if shot:
+            return shot
 
     def _slip_text() -> str:
         try:
@@ -244,28 +382,28 @@ def capture_betamapola_confirmation(
             pass
         return False
 
-    deadline = time.time() + 8.0
+    deadline = time.time() + 6.0
     while time.time() < deadline:
-        try:
-            alert = driver.find_element(By.CSS_SELECTOR, "#alertSuccess")
-            if alert.is_displayed():
-                png = alert.screenshot_as_png
-                if png:
-                    return _write_png(path, png, logger)
-        except Exception:
-            pass
-
         slip = _slip_text()
-        if _slip_confirmed(slip) and not _place_bet_visible():
+        if (
+            _slip_confirmed(slip)
+            and not _place_bet_visible()
+            and _betamapola_text_has_wager_detail(
+                slip,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                odds=odds,
+            )
+        ):
             shot = capture_element_screenshot(
                 driver,
-                ["#alertSuccess", "#betSlipDiv .alert-success", "#betSlipDiv"],
+                ["#betSlipDiv"],
                 path,
                 logger,
             )
             if shot:
                 return shot
-
         time.sleep(0.4)
 
     if _place_bet_visible() and not _slip_confirmed(_slip_text()):
@@ -274,55 +412,21 @@ def capture_betamapola_confirmation(
         )
         return None
 
-    base_url = (driver.current_url or "").split("#")[0].rstrip("/")
-    if not base_url:
-        base_url = "https://betamapola.com/sports"
-    open_bets_url = f"{base_url}#/openBets"
-    sport_url = driver.current_url
+    shot = _capture_betamapola_open_bets_row(
+        driver,
+        path,
+        logger,
+        team_name=team_name,
+        team_1=team_1,
+        team_2=team_2,
+        odds=odds,
+    )
+    if shot:
+        return shot
 
-    try:
-        driver.get(open_bets_url)
-        time.sleep(2.5)
-        element = driver.execute_script(
-            """
-            const needles = [arguments[0], arguments[1], arguments[2]]
-              .filter(Boolean)
-              .map(s => String(s).toLowerCase());
-            const selectors = [
-              '.open-bets', '.openBets', '.wager-item', '.bet-item',
-              'table tbody tr', '.card', '[ng-repeat*="wager"]', '[ng-repeat*="pick"]',
-              'main', '#content', '.content-wrapper'
-            ];
-            for (const sel of selectors) {
-              for (const el of document.querySelectorAll(sel)) {
-                const t = (el.innerText || '').trim();
-                if (t.length < 20) continue;
-                const tl = t.toLowerCase();
-                if (needles.some(n => n && tl.includes(n))) return el;
-              }
-            }
-            return document.querySelector('table')
-                || document.querySelector('.open-bets, .openBets, main, #content')
-                || document.body;
-            """,
-            team_name,
-            team_1,
-            team_2,
-        )
-        if element:
-            png = element.screenshot_as_png
-            if png:
-                return _write_png(path, png, logger)
-    except Exception as exc:
-        logger.warning(f"Betamapola open-bets screenshot failed: {exc}")
-    finally:
-        if sport_url:
-            try:
-                driver.get(sport_url)
-                time.sleep(1.0)
-            except Exception:
-                pass
-
+    logger.warning(
+        f"Betamapola screenshot has no open-bets row with teams/odds for {team_name or team_1}"
+    )
     return None
 
 
@@ -609,6 +713,7 @@ def capture_confirmed_bet_screenshot(
             team_name=team_name,
             team_1=team_1,
             team_2=team_2,
+            odds=odds,
         )
         if shot:
             return shot

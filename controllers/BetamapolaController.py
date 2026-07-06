@@ -1849,6 +1849,7 @@ class BetamapolaController:
         team_2: str,
         game_id: str,
         ticket_number: int | str | None = None,
+        odds=None,
     ) -> str | None:
         """Capture open-bets confirmation for the screenshots channel (sent by finalize_confirmed_bet)."""
         path = bet_screenshot_path(self.bookmaker, game_id)
@@ -1859,6 +1860,7 @@ class BetamapolaController:
             team_name=team_name,
             team_1=team_1,
             team_2=team_2,
+            odds=odds,
         )
         if not shot:
             self.logger.warning("Open-bets screenshot capture failed")
@@ -2483,6 +2485,7 @@ class BetamapolaController:
             matchup_2,
             game_id,
             ticket_number=ticket_number,
+            odds=moneyline_odd,
         )
         cache_key = f"{team_name}:{matchup_1}:{matchup_2}".lower()
         self._pending_check_cache[cache_key] = {"found": True, "ts": time.time()}
