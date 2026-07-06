@@ -306,7 +306,7 @@ def _fourcasters_wager_detail_valid(
     tl = text.lower()
     if _fourcasters_nav_or_homepage_text(text):
         return False
-    if re.search(r"MON\s*\n\s*0", text, re.I) or "this week" in tl:
+    if "start your side - game info" in tl and "risk" in tl and "win" in tl:
         return False
     if not _wager_text_matches(text, team_name, team_1, team_2):
         return False
@@ -375,6 +375,7 @@ def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
           if (t.length < 25 || t.length > 280) return false;
           if (isNavOrHome(t) || isTabChrome(t)) return false;
           if (/MON\\s*\\n\\s*0/i.test(t) || /THIS WEEK/i.test(t)) return false;
+          if (/START\\s*\\n\\s*YOUR SIDE - GAME INFO/i.test(t)) return false;
           if (!matchesTeam(t)) return false;
           if (!/[+-]\\d{2,4}/.test(t)) return false;
           if (!/\\$\\s*\\d/.test(t) || !/taken/i.test(t)) return false;
@@ -399,14 +400,19 @@ def _find_fourcasters_wager_element(driver, team_name, team_1, team_2, odds):
 
         if (!candidates.length) return null;
 
-        candidates.sort((a, b) => {
+        const minimal = candidates.filter(el =>
+          !candidates.some(other => other !== el && el.contains(other))
+        );
+        const pool = minimal.length ? minimal : candidates;
+
+        pool.sort((a, b) => {
           const ra = a.getBoundingClientRect();
           const rb = b.getBoundingClientRect();
           const scoreA = ra.height * 10 + ra.width;
           const scoreB = rb.height * 10 + rb.width;
           return scoreA - scoreB;
         });
-        return candidates[0];
+        return pool[0];
         """,
         team_name,
         team_1,
