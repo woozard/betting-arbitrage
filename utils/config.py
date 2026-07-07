@@ -102,6 +102,10 @@ TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',
 )
 SECOND_LEG_ODDS_TOLERANCE = int(os.getenv('SECOND_LEG_ODDS_TOLERANCE', '2'))
+# Wider juice tolerance when completing spread hedges (leg 1 already on book).
+SPREAD_SECOND_LEG_ODDS_TOLERANCE = int(
+    os.getenv('SPREAD_SECOND_LEG_ODDS_TOLERANCE', '5')
+)
 # BetWar: reuse My Bets rows only when explicitly enabled (scoped match; default off).
 BETWAR_MY_BETS_RECOVERY = os.getenv('BETWAR_MY_BETS_RECOVERY', 'false').lower() in (
     '1', 'true', 'yes',

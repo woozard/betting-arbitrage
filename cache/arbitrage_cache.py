@@ -207,16 +207,21 @@ class ArbitrageCache:
 
     @staticmethod
     def parse_matchup_pair_key(pair_key):
-        parts = str(pair_key or "").split(":", 4)
-        if len(parts) != 5:
+        parts = str(pair_key or "").split(":")
+        if len(parts) < 5:
             return None
-        return {
+        result = {
             "game_date": parts[0],
             "team_1": parts[1],
             "team_2": parts[2],
             "book_1": parts[3],
             "book_2": parts[4],
         }
+        if len(parts) >= 6:
+            result["bet_type"] = parts[5]
+        if len(parts) >= 7:
+            result["spread_value"] = parts[6]
+        return result
 
     def _arb_scan_locked_key(self, pair_key):
         return f"arb_scan_locked:{pair_key}"
@@ -497,10 +502,13 @@ class ArbitrageCache:
     def _partial_exposure_key(self, pair_key):
         return f"partial_exposure:{pair_key}"
 
-    def mark_partial_exposure(self, pair_key):
+    def mark_partial_exposure(self, pair_key, game_datetime=None):
+        meta = {"marked_at": time.time()}
+        if game_datetime:
+            meta["game_datetime"] = game_datetime
         self.redis.set(
             self._partial_exposure_key(pair_key),
-            {"marked_at": time.time()},
+            meta,
             ttl=self.lock_ttl,
         )
 

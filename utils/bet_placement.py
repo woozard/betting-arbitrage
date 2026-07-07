@@ -10,6 +10,7 @@ from utils.config import (
     SEQUENTIAL_ARB_BETTING,
     TELEGRAM_ALERTS_ASYNC,
     SECOND_LEG_ODDS_TOLERANCE,
+    SPREAD_SECOND_LEG_ODDS_TOLERANCE,
     BET_STAKE,
     arb_pair_legs,
     required_first_leg_book,
@@ -400,15 +401,24 @@ def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
 def odds_tolerance_for_placement(
     cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
 ) -> int:
-    """±tolerance on configured second-leg books, or when the other leg is already confirmed."""
-    if SECOND_LEG_ODDS_TOLERANCE <= 0:
+    """±tolerance on second-leg books and when completing a hedge (other leg / partial exposure)."""
+    bt = (bet_type or "moneyline").strip().lower()
+    tolerance = (
+        SPREAD_SECOND_LEG_ODDS_TOLERANCE
+        if bt == "spread"
+        else SECOND_LEG_ODDS_TOLERANCE
+    )
+    if tolerance <= 0:
         return 0
     bm = (bookmaker or "").strip().lower()
     if not is_first_leg_bookmaker(book_1, book_2, bm):
-        return SECOND_LEG_ODDS_TOLERANCE
+        return tolerance
+    pair_key = cache.arb_pair_key_from_arb(arb)
     other_book = book_2 if bm == (book_1 or "").strip().lower() else book_1
     if cache.is_arb_leg_placed(arb, other_book):
-        return SECOND_LEG_ODDS_TOLERANCE
+        return tolerance
+    if cache.has_partial_exposure_for_pair(pair_key):
+        return tolerance
     return 0
 
 
@@ -780,7 +790,9 @@ def finalize_confirmed_bet(
             f"both legs confirmed; arb scan locked and cache cleared"
         )
     else:
-        cache.mark_partial_exposure(pair_key)
+        cache.mark_partial_exposure(
+            pair_key, game_datetime=arb.get("game_datetime") or game_date
+        )
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
             f"waiting for {other_book} leg before arb is complete"
