@@ -1,6 +1,10 @@
 """Pytest fixtures and stubs (no real Redis required in unit tests)."""
+import os
 import sys
 import types
+
+# Pair-scoped leg tests expect multi-pair behavior unless a test opts in.
+os.environ.setdefault("SINGLE_PAIR_PER_GAME", "false")
 
 
 class _FakeRedisClient:

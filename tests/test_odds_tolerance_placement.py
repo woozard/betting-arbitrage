@@ -67,7 +67,7 @@ def test_spread_second_leg_book_always_gets_tolerance():
     arb = _rockies_spread_arb()
 
     tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "4casters", "spread"
+        cache, arb, "betamapola", "4casters", "betamapola", "spread"
     )
     assert tol == 5
 
@@ -80,7 +80,7 @@ def test_spread_first_leg_gets_tolerance_when_partial_exposure():
     cache.mark_partial_exposure(pair_key)
 
     tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "betamapola", "spread"
+        cache, arb, "betamapola", "4casters", "4casters", "spread"
     )
     assert tol == 5
 
@@ -89,10 +89,10 @@ def test_spread_first_leg_gets_tolerance_when_other_leg_placed():
     cache = ArbitrageCache()
     cache.redis = MemRedis()
     arb = _rockies_spread_arb()
-    cache.mark_arb_leg_placed(arb, "4casters")
+    cache.mark_arb_leg_placed(arb, "betamapola")
 
     tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "betamapola", "spread"
+        cache, arb, "betamapola", "4casters", "4casters", "spread"
     )
     assert tol == 5
 
@@ -105,7 +105,7 @@ def test_moneyline_first_leg_no_tolerance_without_hedge():
     arb.pop("spread_value", None)
 
     tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "betamapola", "moneyline"
+        cache, arb, "betamapola", "4casters", "4casters", "moneyline"
     )
     assert tol == 0
 
@@ -116,9 +116,9 @@ def test_moneyline_first_leg_gets_tolerance_when_other_leg_placed():
     arb = _rockies_spread_arb()
     arb["bet_type"] = "moneyline"
     arb.pop("spread_value", None)
-    cache.mark_arb_leg_placed(arb, "4casters")
+    cache.mark_arb_leg_placed(arb, "betamapola")
 
     tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "betamapola", "moneyline"
+        cache, arb, "betamapola", "4casters", "4casters", "moneyline"
     )
     assert tol == 2

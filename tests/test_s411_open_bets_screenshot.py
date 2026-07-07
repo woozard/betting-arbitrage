@@ -1,0 +1,60 @@
+from utils.bet_screenshot import (
+    _s411_odds_needles,
+    _s411_open_bets_row_valid,
+)
+
+
+def test_s411_odds_needles_includes_ml_prefix():
+    needles = _s411_odds_needles(-117)
+    assert "-117" in needles
+    assert "ML-117" in needles
+
+
+def test_open_bets_row_valid_accepts_single_wager():
+    text = (
+        "Tampa Bay Rays ML-117 ( ACTION )\n"
+        "New York Yankees vs Tampa Bay Rays\n"
+        "Risk: $23.40 | Win: $20.00"
+    )
+    assert _s411_open_bets_row_valid(
+        text,
+        team_name="Tampa Bay Rays",
+        team_1="New York Yankees",
+        team_2="Tampa Bay Rays",
+        odds=-117,
+        stake=23.40,
+    )
+
+
+def test_open_bets_row_rejects_full_pending_list():
+    text = (
+        "Tampa Bay Rays ML-117 ( ACTION )\n"
+        "New York Yankees vs Tampa Bay Rays\n"
+        "Risk: $23.40 | Win: $20.00\n"
+        "Pittsburgh Pirates ML-153 ( ACTION )\n"
+        "Risk: $30.60 | Win: $20.00\n"
+        "Baltimore Orioles ML+102 ( ACTION )\n"
+        "Risk: $20.00 | Win: $20.40"
+    )
+    assert not _s411_open_bets_row_valid(
+        text,
+        team_name="Tampa Bay Rays",
+        team_1="New York Yankees",
+        team_2="Tampa Bay Rays",
+        odds=-117,
+        stake=23.40,
+    )
+
+
+def test_open_bets_row_rejects_wrong_odds():
+    text = (
+        "Tampa Bay Rays ML-117 ( ACTION )\n"
+        "New York Yankees vs Tampa Bay Rays\n"
+        "Risk: $23.40 | Win: $20.00"
+    )
+    assert not _s411_open_bets_row_valid(
+        text,
+        team_name="Tampa Bay Rays",
+        odds=-150,
+        stake=23.40,
+    )

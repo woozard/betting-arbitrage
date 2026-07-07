@@ -48,7 +48,7 @@ def american_to_risk_from_win(to_win: float, american_odds) -> float:
 
 
 def american_odds_from_risk_win(risk: float, to_win: float) -> int:
-    """Infer displayed American odds from actual risk/win (includes exchange commission)."""
+    """Infer displayed American odds from actual risk/win (effective fill price)."""
     risk_f = float(risk)
     win_f = float(to_win)
     if risk_f <= 0 or win_f <= 0:

@@ -14,6 +14,7 @@ from utils.bet_placement import (
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
+    resolve_arb_leg_stake,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
@@ -27,6 +28,11 @@ from utils.betting_watchdog import (
 from utils.config import TELEGRAM, is_active_arb_pair, FOURCASTERS_MLB_LEAGUE
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.fourcasters_client import FourCastersApiError, FourCastersClient
+from utils.fourcasters_odds import (
+    fourcasters_format_net_odds,
+    fourcasters_gross_to_net_taker_odds,
+    fourcasters_taker_odds_acceptable,
+)
 from utils.helpers import (
     is_game_pregame,
     parse_to_mysql_datetime,
@@ -140,13 +146,25 @@ class FourCastersController:
         return {}, {}
 
     @staticmethod
-    def _best_order_odds(orders: list | None) -> int | None:
+    def _best_order_odds_gross(orders: list | None) -> int | None:
         if not orders:
             return None
         try:
             return int(orders[0].get("odds"))
         except (TypeError, ValueError, IndexError):
             return None
+
+    @classmethod
+    def _best_order_odds_net(cls, orders: list | None) -> int | None:
+        gross = cls._best_order_odds_gross(orders)
+        if gross is None:
+            return None
+        return fourcasters_gross_to_net_taker_odds(gross)
+
+    @staticmethod
+    def _best_order_odds(orders: list | None) -> int | None:
+        """Net taker odds for scanner persistence (legacy name)."""
+        return FourCastersController._best_order_odds_net(orders)
 
     @classmethod
     def _pick_run_line(cls, away_spreads: list, home_spreads: list, away_id: str, home_id: str):
@@ -172,8 +190,8 @@ class FourCastersController:
                 except (TypeError, ValueError):
                     continue
                 if abs(home_sp - target_home) < 0.05 or abs(home_sp + away_sp) < 0.05:
-                    t1_odds = cls._format_american_str(away_order.get("odds"))
-                    t2_odds = cls._format_american_str(order.get("odds"))
+                    t1_odds = fourcasters_format_net_odds(away_order.get("odds"))
+                    t2_odds = fourcasters_format_net_odds(order.get("odds"))
                     return away_sp, home_sp, t1_odds, t2_odds
         return None, None, None, None
 
@@ -303,15 +321,25 @@ class FourCastersController:
                 return game, 2
         return None, None
 
-    def _live_moneyline_for_team(self, game_id: str, team_no: int) -> str | None:
+    def _live_moneyline_gross_for_team(self, game_id: str, team_no: int) -> str | None:
         rows = self.api.get_orderbook(game_id=game_id)
         if not rows:
             return None
         game = rows[0]
-        odds = self._best_order_odds(
+        odds = self._best_order_odds_gross(
             game.get("awayMoneylines") if team_no == 1 else game.get("homeMoneylines")
         )
         return self._format_american_str(odds) if odds is not None else None
+
+    def _live_moneyline_for_team(self, game_id: str, team_no: int) -> str | None:
+        gross = self._live_moneyline_gross_for_team(game_id, team_no)
+        if gross is None:
+            return None
+        try:
+            net = fourcasters_gross_to_net_taker_odds(gross)
+        except (TypeError, ValueError):
+            return gross
+        return self._format_american_str(net)
 
     def _arb_odds_exact_match(self, live_odds: str, expected_odds: str) -> bool:
         tol = getattr(self, "_odds_tolerance", 0) or 0
@@ -591,19 +619,31 @@ class FourCastersController:
             raise FourCastersApiError(f"No participant id for {team_name} on game {game_id}")
 
         spread_market = game_row.get("spread") or {}
+        live_gross = None
         if bet_type == "spread":
             live_odds = spread_market.get(f"team_{team_no}_odds")
             spread_number = spread_line
             if spread_number is None:
                 spread_number = spread_market.get(f"team_{team_no}_spread")
         else:
-            live_odds = self._live_moneyline_for_team(game_id, team_no)
+            live_odds = None
+            live_gross = self._live_moneyline_gross_for_team(game_id, team_no)
             spread_number = None
 
-        if live_odds is not None and not self._arb_odds_exact_match(live_odds, moneyline_odd):
-            tol = getattr(self, "_odds_tolerance", 0) or 0
+        tol = getattr(self, "_odds_tolerance", 0) or 0
+        if bet_type == "spread":
+            if live_odds is not None and not self._arb_odds_exact_match(live_odds, moneyline_odd):
+                raise FourCastersApiError(
+                    f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
+                    + (f" (tolerance ±{tol})" if tol > 0 else "")
+                )
+        elif live_gross is not None and not fourcasters_taker_odds_acceptable(
+            moneyline_odd, live_gross, tol
+        ):
+            net_live = fourcasters_gross_to_net_taker_odds(live_gross)
             raise FourCastersApiError(
-                f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
+                f"Line moved: live gross {live_gross} (net {net_live:+d}) "
+                f"differ from arb net odds {moneyline_odd}"
                 + (f" (tolerance ±{tol})" if tol > 0 else "")
             )
 
@@ -613,9 +653,14 @@ class FourCastersController:
             raise FourCastersApiError(f"Invalid American odds: {moneyline_odd}") from e
 
         use_odds = american_odds
-        if live_odds is not None:
+        if bet_type == "spread" and live_odds is not None:
             try:
                 use_odds = american_odds_to_int(live_odds)
+            except (TypeError, ValueError):
+                use_odds = american_odds
+        elif live_gross is not None:
+            try:
+                use_odds = american_odds_to_int(live_gross)
             except (TypeError, ValueError):
                 use_odds = american_odds
 
@@ -634,8 +679,8 @@ class FourCastersController:
         actual_stake = stake_from_fourcasters_fill(fill, stake_plan)
         if actual_stake.american_odds != stake_plan.american_odds:
             self.logger.info(
-                f"4casters fill odds after commission: {actual_stake.american_odds:+d} "
-                f"(board {moneyline_odd}, risk=${actual_stake.risk:.2f} win=${actual_stake.to_win:.2f})"
+                f"4casters effective fill odds: {actual_stake.american_odds:+d} "
+                f"(arb net {moneyline_odd}, risk=${actual_stake.risk:.2f} win=${actual_stake.to_win:.2f})"
             )
         self.logger.info(f"Bet accepted by bookmaker: {message}")
         return True, actual_stake
@@ -751,6 +796,17 @@ class FourCastersController:
 
                     self._odds_tolerance = odds_tolerance_for_placement(
                         self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                    )
+
+                    stake = resolve_arb_leg_stake(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        wager_odds,
+                        stake,
+                        logger=self.logger,
                     )
 
                     bet_placed, stake_used = self.__execute_bet(

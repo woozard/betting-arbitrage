@@ -622,6 +622,107 @@ def capture_betamapola_confirmation(
     return None
 
 
+def _s411_odds_needles(odds) -> list[str]:
+    needles = _betamapola_odds_needles(odds)
+    out: list[str] = []
+    for needle in needles:
+        for variant in (needle, f"ML{needle}", f"ML {needle}"):
+            v = variant.strip()
+            if v and v not in out:
+                out.append(v)
+    compact = (str(odds) if odds is not None else "").strip().replace(" ", "")
+    if compact and compact not in out:
+        out.append(compact)
+    return out
+
+
+def _s411_open_bets_row_valid(
+    text: str,
+    *,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
+) -> bool:
+    """True for a single S411 open-bet row, not the full My Open Bets page."""
+    text = (text or "").strip()
+    if len(text) < 20 or len(text) > 500:
+        return False
+    if re.search(r"my\s+open\s+bets", text, re.I) and len(text) > 250:
+        return False
+    action_hits = len(re.findall(r"\(\s*ACTION\s*\)", text, re.I))
+    if action_hits != 1:
+        return False
+    if len(re.findall(r"Risk\s*:", text, re.I)) != 1:
+        return False
+
+    text_l = text.lower()
+    team_needles = _betamapola_team_needles(team_name, team_1, team_2)
+    if not any(needle in text_l for needle in team_needles):
+        return False
+
+    if odds is not None and str(odds).strip() != "":
+        compact = re.sub(r"\s+", "", text)
+        if not any(
+            re.sub(r"\s+", "", needle) in compact
+            for needle in _s411_odds_needles(odds)
+        ):
+            return False
+
+    if stake is not None and not _betwar_row_matches_stake(text, stake):
+        return False
+
+    return True
+
+
+def _find_s411_open_bets_row(
+    driver,
+    *,
+    team_name: str,
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
+):
+    from selenium.webdriver.common.by import By
+
+    rows = []
+    for selector in (
+        '[class*="wager"]',
+        '[class*="Wager"]',
+        '[class*="open-bet"]',
+        '[class*="OpenBet"]',
+        '[class*="bet-item"]',
+        "main li",
+        "main article",
+        "main div",
+    ):
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            continue
+        for element in elements:
+            text = (element.text or "").strip()
+            if not _s411_open_bets_row_valid(
+                text,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                odds=odds,
+                stake=stake,
+            ):
+                continue
+            rows.append((len(text), element, text))
+
+    if not rows:
+        return None, None
+
+    rows.sort(key=lambda item: item[0])
+    _, element, text = rows[0]
+    return element, text
+
+
 def capture_s411_open_bet(
     driver,
     open_bets_url: str,
@@ -629,40 +730,48 @@ def capture_s411_open_bet(
     path: str,
     logger,
     return_to_sport: Callable[[], None] | None = None,
+    *,
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
 ) -> str | None:
+    """Screenshot one open-bet row on S411 (not the full pending list)."""
     try:
         driver.get(open_bets_url)
         time.sleep(2.5)
-        element = driver.execute_script(
-            """
-            const needle = (arguments[0] || '').toLowerCase();
-            const selectors = [
-              '.bet-item', '.wager-item', '.open-bet', '.pending-bet',
-              'tr', '.card', '[class*="Wager"]', '[class*="wager"]',
-              'main section', '.content', '.open-bets-list'
-            ];
-            for (const sel of selectors) {
-              for (const el of document.querySelectorAll(sel)) {
-                const t = (el.innerText || '').trim();
-                if (t.length > 20 && t.toLowerCase().includes(needle)) return el;
-              }
-            }
-            return document.querySelector('main, .open-bets, #content, .content-wrapper')
-                || document.body;
-            """,
-            team_name,
-        )
-        if element:
-            png = element.screenshot_as_png
-            if png:
-                return _write_png(path, png, logger)
 
-        return capture_element_screenshot(
+        element, row_text = _find_s411_open_bets_row(
             driver,
-            ["main", ".open-bets", "#content", "body"],
-            path,
-            logger,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+            stake=stake,
         )
+        if element is None and stake is not None:
+            element, row_text = _find_s411_open_bets_row(
+                driver,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                odds=odds,
+                stake=None,
+            )
+
+        if element is None:
+            logger.warning(
+                f"S411 open-bets: no single wager row for {team_name!r} "
+                f"odds={odds!r} stake={stake!r}"
+            )
+            return None
+
+        png = element.screenshot_as_png
+        if png:
+            preview = re.sub(r"\s+", " ", row_text.splitlines()[0] if row_text else "")[:72]
+            logger.info(f"S411 open-bets row screenshot | {team_name} | {preview}")
+            return _write_png(path, png, logger)
+        return None
     except Exception as exc:
         logger.warning(f"S411 open-bets screenshot failed: {exc}")
         return None
@@ -919,6 +1028,10 @@ def capture_confirmed_bet_screenshot(
             path,
             logger,
             return_to_sport=return_to_sport,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+            stake=stake,
         )
         if shot:
             return shot

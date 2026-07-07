@@ -17,6 +17,7 @@ from utils.config import (
     min_arb_profit_pct_for_bet_type,
     TELEGRAM_ALERTS_ASYNC,
     SPREAD_ARB_MAX_PROFIT_PCT,
+    SPREAD_ARB_SCAN_ENABLED,
     SPREAD_ODDS_MAX_AGE_SECONDS,
     SPREAD_ODDS_MAX_GAP_SECONDS,
     arb_opportunity_alert_chat_ids,
@@ -436,10 +437,9 @@ class ArbitrageController:
     def scan_opportunities(self):
         self.logger.info("========== Arbitrage - Scan Opportunities (START) ==========")
         try:
-            scan_results = [
-                self._scan_moneyline_opportunities(),
-                self._scan_spread_opportunities(),
-            ]
+            scan_results = [self._scan_moneyline_opportunities()]
+            if SPREAD_ARB_SCAN_ENABLED:
+                scan_results.append(self._scan_spread_opportunities())
 
             for result in scan_results:
                 bet_type = result["bet_type"]
@@ -598,6 +598,26 @@ class ArbitrageController:
         ):
             self.logger.info(
                 f"Skipping arb (scan locked in Redis after prior leg) - "
+                f"{bet_type} {o1['team_1']} vs {o1['team_2']} | "
+                f"{t1['bookmaker']} vs {t2['bookmaker']}"
+            )
+            return None
+
+        arb_stub = {
+            "team_1": o1["team_1"],
+            "team_2": o1["team_2"],
+            "team_1_bookmaker": t1["bookmaker"],
+            "team_2_bookmaker": t2["bookmaker"],
+            "game_datetime": o1.get("game_datetime"),
+            "game_date": str(game_date),
+            "bet_type": bet_type,
+        }
+        if spread_value is not None:
+            arb_stub["spread_value"] = spread_value
+        owns, owner_reason = self.cache.other_pair_owns_game_event(arb_stub)
+        if owns:
+            self.logger.info(
+                f"Skipping arb ({owner_reason}) - "
                 f"{bet_type} {o1['team_1']} vs {o1['team_2']} | "
                 f"{t1['bookmaker']} vs {t2['bookmaker']}"
             )

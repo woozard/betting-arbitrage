@@ -182,6 +182,30 @@ class ArbitrageCache:
         return str(gd)[:10] if gd else ""
 
     @staticmethod
+    def matchup_event_key(
+        team_1, team_2, game_date=None, bet_type=None, spread_value=None
+    ):
+        """Matchup identity without book pair — used for one-pair-per-game locks."""
+        teams = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
+        date = str(game_date or "")[:10]
+        bt = (bet_type or "moneyline").strip().lower()
+        if bt == "spread" and spread_value is not None:
+            return f"{date}:{teams[0]}:{teams[1]}:{bt}:{spread_value}"
+        return f"{date}:{teams[0]}:{teams[1]}:{bt}"
+
+    @staticmethod
+    def matchup_event_key_from_arb(arb: dict) -> str:
+        bet_type = ((arb or {}).get("bet_type") or "moneyline").strip().lower()
+        spread_value = (arb or {}).get("spread_value") if bet_type == "spread" else None
+        return ArbitrageCache.matchup_event_key(
+            (arb or {}).get("team_1"),
+            (arb or {}).get("team_2"),
+            ArbitrageCache.event_date_for_arb(arb),
+            bet_type=bet_type,
+            spread_value=spread_value,
+        )
+
+    @staticmethod
     def arb_pair_key_from_arb(arb: dict) -> str:
         bet_type = ((arb or {}).get("bet_type") or "moneyline").strip().lower()
         spread_value = (arb or {}).get("spread_value") if bet_type == "spread" else None
@@ -315,6 +339,7 @@ class ArbitrageCache:
             ttl=self.lock_ttl,
         )
         self._register_book_game_leg(pair_key, bookmaker, bet_type, gid)
+        self.claim_game_event_owner(arb)
 
     def is_arb_leg_placed(self, arb: dict, bookmaker: str) -> bool:
         """True when this book's leg is confirmed for this specific arb pair."""
@@ -349,6 +374,50 @@ class ArbitrageCache:
                 )
             self.redis.delete(key)
 
+    def _game_event_owner_key(self, event_key: str) -> str:
+        return f"game_event_owner:{event_key}"
+
+    def claim_game_event_owner(self, arb: dict) -> None:
+        """Reserve this matchup for one arb pair once a leg is live or partial."""
+        from utils.config import SINGLE_PAIR_PER_GAME
+
+        if not SINGLE_PAIR_PER_GAME:
+            return
+        event_key = self.matchup_event_key_from_arb(arb)
+        pair_key = self.arb_pair_key_from_arb(arb)
+        redis_key = self._game_event_owner_key(event_key)
+        existing = self.redis.get(redis_key)
+        if isinstance(existing, dict) and existing.get("pair_key") not in (None, pair_key):
+            return
+        self.redis.set(
+            redis_key,
+            {"pair_key": pair_key, "marked_at": time.time()},
+            ttl=self.lock_ttl,
+        )
+
+    def clear_game_event_owner(self, arb: dict) -> None:
+        event_key = self.matchup_event_key_from_arb(arb)
+        pair_key = self.arb_pair_key_from_arb(arb)
+        redis_key = self._game_event_owner_key(event_key)
+        existing = self.redis.get(redis_key)
+        if isinstance(existing, dict) and existing.get("pair_key") == pair_key:
+            self.redis.delete(redis_key)
+
+    def other_pair_owns_game_event(self, arb: dict) -> tuple[bool, str]:
+        from utils.config import SINGLE_PAIR_PER_GAME
+
+        if not SINGLE_PAIR_PER_GAME:
+            return False, ""
+        event_key = self.matchup_event_key_from_arb(arb)
+        pair_key = self.arb_pair_key_from_arb(arb)
+        existing = self.redis.get(self._game_event_owner_key(event_key))
+        if not isinstance(existing, dict):
+            return False, ""
+        owner = existing.get("pair_key")
+        if owner and owner != pair_key:
+            return True, f"another pair owns this game ({owner})"
+        return False, ""
+
     def has_other_pair_partial_on_book_game(self, arb: dict, bookmaker: str) -> bool:
         """Block a new pair when another pair still has partial exposure on same book+game."""
         bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
@@ -368,6 +437,9 @@ class ArbitrageCache:
 
     def should_skip_arb_leg_placement(self, arb: dict, bookmaker: str) -> tuple[bool, str]:
         """Return (skip, reason) for betting-loop leg placement."""
+        owns, reason = self.other_pair_owns_game_event(arb)
+        if owns:
+            return True, reason
         if self.is_game_pair_daily_bet_placed(arb, bookmaker):
             return True, "daily game/pair bet already placed on this book"
         if self.is_arb_leg_placed(arb, bookmaker):
@@ -502,7 +574,7 @@ class ArbitrageCache:
     def _partial_exposure_key(self, pair_key):
         return f"partial_exposure:{pair_key}"
 
-    def mark_partial_exposure(self, pair_key, game_datetime=None):
+    def mark_partial_exposure(self, pair_key, game_datetime=None, arb: dict | None = None):
         meta = {"marked_at": time.time()}
         if game_datetime:
             meta["game_datetime"] = game_datetime
@@ -511,6 +583,8 @@ class ArbitrageCache:
             meta,
             ttl=self.lock_ttl,
         )
+        if arb:
+            self.claim_game_event_owner(arb)
 
     def clear_partial_exposure(self, pair_key):
         self.redis.delete(self._partial_exposure_key(pair_key))

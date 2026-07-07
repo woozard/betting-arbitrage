@@ -37,7 +37,10 @@ from utils.helpers import (
     american_odds_to_int,
     BOOK_ALERT_LABELS,
 )
+from utils.hedge_stake import hedge_base_amount_from_first_leg
 from utils.stake_sizing import BaseAmountStake, format_base_amount_stake, base_amount_stake_from_odds
+
+EXCHANGE_FIRST_BOOKMAKERS = frozenset({"4casters"})
 
 REAL_MONEY_BETTING_PAUSED_MSG = "Real money betting paused (REAL_MONEY_BETTING_ENABLED=false)"
 BETAMAPOLA_REAL_MONEY_PAUSED_MSG = (
@@ -141,6 +144,11 @@ def should_skip_arb_leg_in_betting_loop(
         logger.info(
             f"Skipping — daily game/pair bet limit on {bookmaker} | "
             f"{team_name} | {team_1} vs {team_2}"
+        )
+        cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
+    elif reason.startswith("another pair owns this game"):
+        logger.info(
+            f"Skipping — {reason} | {team_name} | {team_1} vs {team_2}"
         )
         cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
     else:
@@ -398,6 +406,87 @@ def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
     return legs[0] == (bookmaker or "").strip().lower()
 
 
+def sequential_arb_betting_enabled(book_1: str, book_2: str) -> bool:
+    """Sequential legs when env flag is on or the configured first leg is an exchange."""
+    if SEQUENTIAL_ARB_BETTING:
+        return True
+    legs = arb_pair_legs(book_1, book_2)
+    if not legs:
+        return False
+    first, _ = legs
+    return first in EXCHANGE_FIRST_BOOKMAKERS
+
+
+def _confirmed_other_leg_stake(cache, arb: dict, bookmaker: str) -> BaseAmountStake | None:
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    other_book = book_2 if bookmaker == book_1 else book_1
+    if not cache.is_arb_leg_placed(arb, other_book):
+        return None
+
+    pair_key = cache.arb_pair_key_from_arb(arb)
+    summary = cache.redis.get(f"arb_real_bets_summary:{pair_key}") or {}
+    other_bm = (other_book or "").strip().lower()
+    b1 = (book_1 or "").strip().lower()
+    side = "leg1" if other_bm == b1 else "leg2"
+    leg_data = summary.get(side) or {}
+
+    risk = leg_data.get("risk")
+    to_win = leg_data.get("to_win")
+    if risk is None or to_win is None:
+        return None
+    try:
+        odds_int = american_odds_to_int(leg_data.get("odds"))
+        risk_f = float(risk)
+        win_f = float(to_win)
+        base = float(leg_data.get("base_amount") or (risk_f if odds_int > 0 else win_f))
+        entry_field = "risk" if odds_int > 0 else "to_win"
+        entry_amount = risk_f if odds_int > 0 else win_f
+        return BaseAmountStake(
+            base_amount=base,
+            american_odds=odds_int,
+            entry_field=entry_field,
+            entry_amount=entry_amount,
+            risk=risk_f,
+            to_win=win_f,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_arb_leg_stake(
+    cache,
+    arb: dict,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    wager_odds,
+    default_base: float,
+    *,
+    logger=None,
+) -> float:
+    """Return base-amount stake for this leg (fill-linked on second leg when sequential)."""
+    if not sequential_arb_betting_enabled(book_1, book_2):
+        return default_base
+    if is_first_leg_bookmaker(book_1, book_2, bookmaker):
+        return default_base
+
+    first_stake = _confirmed_other_leg_stake(cache, arb, bookmaker)
+    if first_stake is None:
+        return default_base
+
+    hedged_base = hedge_base_amount_from_first_leg(
+        first_stake.risk, first_stake.to_win, wager_odds
+    )
+    if logger:
+        logger.info(
+            f"Fill-linked hedge stake | leg1 risk=${first_stake.risk:.2f} "
+            f"to-win=${first_stake.to_win:.2f} → leg2 base=${hedged_base:.2f} "
+            f"@ {wager_odds}"
+        )
+    return hedged_base
+
+
 def odds_tolerance_for_placement(
     cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
 ) -> int:
@@ -425,7 +514,7 @@ def odds_tolerance_for_placement(
 def should_defer_for_sequential_first_leg(
     cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
 ) -> bool:
-    if not SEQUENTIAL_ARB_BETTING:
+    if not sequential_arb_betting_enabled(book_1, book_2):
         return False
     first_leg_book = required_first_leg_book(book_1, book_2, bookmaker)
     if not first_leg_book:
@@ -785,13 +874,16 @@ def finalize_confirmed_bet(
         cache.remove_arbitrage_pair(arb)
         cache.clear_partial_exposure(pair_key)
         cache.clear_arb_pair_legs(arb)
+        cache.clear_game_event_owner(arb)
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
             f"both legs confirmed; arb scan locked and cache cleared"
         )
     else:
         cache.mark_partial_exposure(
-            pair_key, game_datetime=arb.get("game_datetime") or game_date
+            pair_key,
+            game_datetime=arb.get("game_datetime") or game_date,
+            arb=arb,
         )
         logger.info(
             f"Leg confirmed | {bookmaker}/{team_name} | {team_1} vs {team_2} | "
@@ -877,7 +969,7 @@ def finalize_confirmed_bet(
         schedule_complete_summary(cache, logger, arb, telegram_config)
         return
 
-    if not SEQUENTIAL_ARB_BETTING:
+    if not sequential_arb_betting_enabled(book_1, book_2):
         if cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
             return
         identified_at = arb.get("identified_at")

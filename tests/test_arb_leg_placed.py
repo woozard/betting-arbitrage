@@ -2,9 +2,19 @@
 import sys
 import types
 
+import pytest
+
 sys.modules.setdefault("redis", types.ModuleType("redis"))
 
 from cache.arbitrage_cache import ArbitrageCache
+
+
+@pytest.fixture(autouse=True)
+def _disable_single_pair_per_game(monkeypatch):
+    monkeypatch.setenv("SINGLE_PAIR_PER_GAME", "false")
+    import utils.config as config_mod
+
+    monkeypatch.setattr(config_mod, "SINGLE_PAIR_PER_GAME", False)
 
 
 class MemRedis:

@@ -10,6 +10,7 @@ from decimal import Decimal
 from utils.config import (
     TELEGRAM_ALERTS_ASYNC,
     SPREAD_ARB_MAX_PROFIT_PCT,
+    SPREAD_ARB_SCAN_ENABLED,
     SPREAD_ODDS_MAX_AGE_SECONDS,
     SPREAD_ODDS_MAX_GAP_SECONDS,
     INLINE_ARB_SCAN_ENABLED,
@@ -228,6 +229,21 @@ def _try_insert_pair(cache, logger, o1, o2, t1_from, t2_from, bet_type) -> int:
     ):
         return 0
 
+    arb_stub = {
+        "team_1": o1["team_1"],
+        "team_2": o1["team_2"],
+        "team_1_bookmaker": t1["bookmaker"],
+        "team_2_bookmaker": t2["bookmaker"],
+        "game_datetime": o1.get("game_datetime"),
+        "game_date": game_date,
+        "bet_type": bet_type,
+    }
+    if spread_value is not None:
+        arb_stub["spread_value"] = spread_value
+    owns, _ = cache.other_pair_owns_game_event(arb_stub)
+    if owns:
+        return 0
+
     inserted = 0
     max_total_prob = Decimal(str(arb_max_total_prob_for_bet_type(bet_type)))
 
@@ -277,6 +293,8 @@ def scan_inline_arbs_for_odds_row(cache, logger, odd_row: dict) -> int:
         return 0
 
     bet_type = odd_row.get("bet_type") or "moneyline"
+    if bet_type == "spread" and not SPREAD_ARB_SCAN_ENABLED:
+        return 0
     group_key = matchup_group_key(odd_row)
     all_rows = cache.get_odds(bet_type=bet_type)
     peers = [r for r in all_rows if matchup_group_key(r) == group_key]

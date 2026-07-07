@@ -57,6 +57,7 @@ from utils.bet_placement import (
     capture_bet_screenshot_for_alert,
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
+    resolve_arb_leg_stake,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
@@ -3032,6 +3033,17 @@ class BetamapolaController:
                         f"skipping duplicate placement (arb scan lock requires bookmaker confirmation)"
                     )
                     continue
+
+                stake = resolve_arb_leg_stake(
+                    self.cache,
+                    arb,
+                    book_1,
+                    book_2,
+                    self.bookmaker,
+                    wager_odds,
+                    stake,
+                    logger=self.logger,
+                )
 
                 bet_placed, stake_used = self.__execute_bet(
                     game_id,

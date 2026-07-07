@@ -130,6 +130,14 @@ MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '1.01')
 SPREAD_REAL_MONEY_BETTING_ENABLED = os.getenv(
     'SPREAD_REAL_MONEY_BETTING_ENABLED', 'true'
 ).lower() in ('1', 'true', 'yes')
+# Spread/run-line arb detection + Telegram alerts (independent of spread betting).
+SPREAD_ARB_SCAN_ENABLED = os.getenv('SPREAD_ARB_SCAN_ENABLED', 'true').lower() in (
+    '1', 'true', 'yes',
+)
+# One book-pair per matchup/event — blocks a second pair on the same game.
+SINGLE_PAIR_PER_GAME = os.getenv('SINGLE_PAIR_PER_GAME', 'true').lower() in (
+    '1', 'true', 'yes',
+)
 if os.getenv('ARB_MAX_TOTAL_PROB_SPREAD') is not None:
     ARB_MAX_TOTAL_PROB_SPREAD = float(os.getenv('ARB_MAX_TOTAL_PROB_SPREAD'))
 else:
@@ -185,12 +193,12 @@ ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,betamapola:4casters,betamapola:3et,"
+        "sports411:betamapola,paradisewager:betamapola,4casters:betamapola,betamapola:3et,"
         "sports411:paradisewager,"
         "sports411:lowvig,paradisewager:lowvig,"
         "sports411:3et,paradisewager:3et,"
-        "sports411:4casters,paradisewager:4casters,"
-        "lowvig:4casters,3et:4casters",
+        "4casters:sports411,4casters:paradisewager,"
+        "4casters:lowvig,4casters:3et",
     ).split(",")
     if part.strip() and ":" in part
 )
@@ -198,12 +206,12 @@ ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
     (parts[0].strip().lower(), parts[1].strip().lower())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,betamapola:4casters,betamapola:3et,"
+        "sports411:betamapola,paradisewager:betamapola,4casters:betamapola,betamapola:3et,"
         "sports411:paradisewager,"
         "sports411:lowvig,paradisewager:lowvig,"
         "sports411:3et,paradisewager:3et,"
-        "sports411:4casters,paradisewager:4casters,"
-        "lowvig:4casters,3et:4casters",
+        "4casters:sports411,4casters:paradisewager,"
+        "4casters:lowvig,4casters:3et",
     ).split(",")
     if part.strip() and ":" in part
     for parts in [part.strip().split(":", 1)]
@@ -391,6 +399,8 @@ FOURCASTERS_PASSWORD = os.getenv('FOURCASTERS_PASSWORD')
 FOURCASTERS_LABEL = os.getenv('FOURCASTERS_LABEL', 'Bettor')
 FOURCASTERS_API_BASE = os.getenv('FOURCASTERS_API_BASE', 'https://api.4casters.io')
 FOURCASTERS_MLB_LEAGUE = os.getenv('FOURCASTERS_MLB_LEAGUE', 'MLB')
+# Fixed tick haircut on gross API orderbook odds → net scanner odds (4cast UI commission).
+FOURCASTERS_SCAN_ODDS_TICK_HAIRCUT = int(os.getenv('FOURCASTERS_SCAN_ODDS_TICK_HAIRCUT', '3'))
 
 PLATINUMWAGER = {
     'website': 'platinumwager.com',

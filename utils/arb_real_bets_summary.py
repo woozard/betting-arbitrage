@@ -64,6 +64,8 @@ def record_confirmed_leg(
     }
     if ticket_number not in (None, "", 0, "0"):
         leg_entry["ticket_number"] = str(ticket_number).strip()
+    if isinstance(stake, BaseAmountStake):
+        leg_entry["base_amount"] = stake.base_amount
     data[side] = leg_entry
     cache.redis.set(_summary_redis_key(pair_key), data, ttl=cache.lock_ttl)
 

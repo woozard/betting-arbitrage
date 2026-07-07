@@ -70,6 +70,17 @@ def cleanup_stale_partial_exposure(cache, logger, max_age_seconds=None):
             reason = f"exposure age {age:.0f}s"
         cache.clear_partial_exposure(pair_key)
         cache.clear_arb_legs_for_pair_key(pair_key)
+        arb_stub = {
+            "team_1": parsed["team_1"],
+            "team_2": parsed["team_2"],
+            "team_1_bookmaker": parsed["book_1"],
+            "team_2_bookmaker": parsed["book_2"],
+            "game_date": parsed["game_date"],
+            "bet_type": parsed.get("bet_type", "moneyline"),
+        }
+        if parsed.get("spread_value") is not None:
+            arb_stub["spread_value"] = parsed["spread_value"]
+        cache.clear_game_event_owner(arb_stub)
         cache.unlock_arb_scan(
             parsed["team_1"],
             parsed["team_2"],
