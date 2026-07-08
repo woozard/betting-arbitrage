@@ -448,6 +448,92 @@ def should_s411_exchange_hedge_preposition(
     return first_leg in EXCHANGE_FIRST_BOOKMAKERS
 
 
+def _second_leg_bookmaker(book_1: str, book_2: str, first_leg_book: str) -> str:
+    bm = (first_leg_book or "").strip().lower()
+    b1 = (book_1 or "").strip().lower()
+    return book_2 if bm == b1 else book_1
+
+
+def should_wait_for_s411_hedge_preposition(arb: dict, bookmaker: str) -> bool:
+    """True when exchange leg 1 must wait for S411 betslip pre-position (Phase 2)."""
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    bet_type = arb.get("bet_type", "moneyline")
+    if not is_first_leg_bookmaker(book_1, book_2, bookmaker):
+        return False
+    other_book = _second_leg_bookmaker(book_1, book_2, bookmaker)
+    return should_s411_exchange_hedge_preposition(
+        book_1, book_2, other_book, bet_type
+    )
+
+
+def wait_for_s411_hedge_preposition(cache, logger, arb: dict, bookmaker: str) -> bool:
+    """
+    Block until S411 reports betslip pre-position ready, or timeout.
+    Returns True when ready; False on timeout (caller may still place leg 1).
+    """
+    from utils.config import S411_HEDGE_PREPOSITION_WAIT_SECONDS
+
+    if not should_wait_for_s411_hedge_preposition(arb, bookmaker):
+        return False
+
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    pair_key = cache.arb_pair_key_from_arb(arb)
+    hedge_book = _second_leg_bookmaker(book_1, book_2, bookmaker)
+
+    cache.clear_hedge_preposition_ready(pair_key)
+    cache.signal_bet_wake(
+        hedge_book,
+        {
+            "reason": "hedge_preposition",
+            "pair_key": pair_key,
+            "ts": time.time(),
+        },
+    )
+    logger.info(
+        f"Waiting for S411 hedge pre-position | {team_1} vs {team_2} | "
+        f"timeout={S411_HEDGE_PREPOSITION_WAIT_SECONDS:.0f}s"
+    )
+
+    deadline = time.time() + S411_HEDGE_PREPOSITION_WAIT_SECONDS
+    while time.time() < deadline:
+        if cache.is_hedge_preposition_ready(pair_key):
+            logger.info(
+                f"S411 hedge pre-position ready | {team_1} vs {team_2}"
+            )
+            return True
+        time.sleep(0.05)
+
+    logger.warning(
+        f"S411 hedge pre-position not ready within "
+        f"{S411_HEDGE_PREPOSITION_WAIT_SECONDS:.0f}s; placing leg 1 anyway | "
+        f"{team_1} vs {team_2}"
+    )
+    return False
+
+
+def store_arbitrage_for_both_books(cache, arb_data: dict) -> None:
+    """Write arb to both book caches; S411 entry first when pre-position applies."""
+    bet_type = arb_data.get("bet_type", "moneyline")
+    entries = [
+        (arb_data["team_1_bookmaker"], arb_data["team_1_game_id"]),
+        (arb_data["team_2_bookmaker"], arb_data["team_2_game_id"]),
+    ]
+    book_1 = arb_data.get("team_1_bookmaker")
+    book_2 = arb_data.get("team_2_bookmaker")
+    if should_s411_exchange_hedge_preposition(
+        book_1, book_2, "sports411", bet_type
+    ):
+        entries.sort(
+            key=lambda row: 0 if (row[0] or "").strip().lower() == "sports411" else 1
+        )
+    for bookmaker, game_id in entries:
+        cache.add_arbitrage(bookmaker, bet_type, game_id, arb_data)
+
+
 def _confirmed_other_leg_stake(cache, arb: dict, bookmaker: str) -> BaseAmountStake | None:
     book_1 = arb.get("team_1_bookmaker")
     book_2 = arb.get("team_2_bookmaker")

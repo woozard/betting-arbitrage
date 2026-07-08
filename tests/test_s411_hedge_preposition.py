@@ -3,6 +3,9 @@
 from utils.bet_placement import (
     acknowledge_placed_leg,
     should_s411_exchange_hedge_preposition,
+    should_wait_for_s411_hedge_preposition,
+    wait_for_s411_hedge_preposition,
+    store_arbitrage_for_both_books,
     sequential_arb_betting_enabled,
 )
 
@@ -50,6 +53,22 @@ class _FakeCache:
     def signal_bet_wake(self, bookmaker, payload=None):
         self.redis.lpush(f"arb:wake:{bookmaker}", payload or {})
 
+    def clear_hedge_preposition_ready(self, pair_key):
+        self.redis.delete(f"hedge_preposition_ready:{pair_key}")
+
+    def mark_hedge_preposition_ready(self, pair_key, bookmaker):
+        self.redis.set(
+            f"hedge_preposition_ready:{pair_key}",
+            {"bookmaker": bookmaker, "ts": 0},
+        )
+
+    def is_hedge_preposition_ready(self, pair_key):
+        return bool(self.redis.get(f"hedge_preposition_ready:{pair_key}"))
+
+    def add_arbitrage(self, bookmaker, bet_type, game_id, arb_data):
+        self.redis.set(f"arb:{bookmaker}:{game_id}", arb_data)
+        self.signal_bet_wake(bookmaker, {"pair_key": self.arb_pair_key_from_arb(arb_data)})
+
 
 def test_should_s411_exchange_hedge_preposition_for_4cast_pair(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
@@ -87,3 +106,80 @@ def test_acknowledge_placed_leg_wakes_second_book_for_exchange_first(monkeypatch
 
     acknowledge_placed_leg(cache, _Logger(), arb, "4casters", "1", team_name="A")
     assert any(k == "arb:wake:sports411" for k, _ in cache.redis.wake_calls)
+
+
+def test_should_wait_for_s411_hedge_preposition_on_4cast_first_leg(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr(
+        "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
+    )
+    arb = {
+        "team_1_bookmaker": "4casters",
+        "team_2_bookmaker": "sports411",
+        "bet_type": "moneyline",
+    }
+    assert should_wait_for_s411_hedge_preposition(arb, "4casters")
+    assert not should_wait_for_s411_hedge_preposition(arb, "sports411")
+
+
+def test_wait_for_s411_hedge_preposition_returns_when_redis_ready(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr(
+        "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
+    )
+    monkeypatch.setattr(
+        "utils.config.S411_HEDGE_PREPOSITION_WAIT_SECONDS", 1.0, raising=False
+    )
+    cache = _FakeCache()
+
+    class _Logger:
+        def info(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+    arb = {
+        "team_1": "A",
+        "team_2": "B",
+        "team_1_bookmaker": "4casters",
+        "team_2_bookmaker": "sports411",
+        "bet_type": "moneyline",
+    }
+
+    import threading
+
+    def _mark_ready():
+        cache.mark_hedge_preposition_ready("pair:test", "sports411")
+
+    threading.Timer(0.05, _mark_ready).start()
+    assert wait_for_s411_hedge_preposition(cache, _Logger(), arb, "4casters") is True
+    assert any(
+        payload.get("reason") == "hedge_preposition"
+        for _, payload in cache.redis.wake_calls
+    )
+
+
+def test_store_arbitrage_puts_sports411_first(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr(
+        "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
+    )
+    cache = _FakeCache()
+    arb = {
+        "team_1": "A",
+        "team_2": "B",
+        "team_1_bookmaker": "4casters",
+        "team_2_bookmaker": "sports411",
+        "team_1_game_id": "1",
+        "team_2_game_id": "2",
+        "bet_type": "moneyline",
+    }
+    order = []
+
+    def _add_arbitrage(bookmaker, bet_type, game_id, arb_data):
+        order.append(bookmaker)
+
+    cache.add_arbitrage = _add_arbitrage
+    store_arbitrage_for_both_books(cache, arb)
+    assert order == ["sports411", "4casters"]

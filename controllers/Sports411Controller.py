@@ -2430,9 +2430,12 @@ class Sports411Controller:
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
-    def _clear_hedge_preposition(self):
+    def _clear_hedge_preposition(self, pair_key=None):
+        key = pair_key or self._hedge_preposition_key
         self._hedge_preposition_ready = False
         self._hedge_preposition_key = None
+        if key:
+            self.cache.clear_hedge_preposition_ready(key)
 
     def _betslip_has_team(self, team_name: str) -> bool:
         if self._betslip_is_empty():
@@ -2616,7 +2619,7 @@ class Sports411Controller:
 
         if not self.cache.is_arb_leg_placed(arb, first_leg):
             if self._hedge_preposition_key != pair_key:
-                self._clear_hedge_preposition()
+                self._clear_hedge_preposition(self._hedge_preposition_key)
             if not self._hedge_preposition_ready:
                 try:
                     self._refresh_session_before_wager()
@@ -2629,13 +2632,14 @@ class Sports411Controller:
                     )
                     self._hedge_preposition_ready = True
                     self._hedge_preposition_key = pair_key
+                    self.cache.mark_hedge_preposition_ready(pair_key, self.bookmaker)
                     self.logger.info(
                         f"S411 hedge pre-positioned | {team_name} | "
                         f"holding betslip for {first_leg} fill"
                     )
                 except Exception as exc:
                     self.logger.warning(f"S411 pre-position failed: {exc}")
-                    self._clear_hedge_preposition()
+                    self._clear_hedge_preposition(pair_key)
             return "deferred", False, None
 
         self._odds_tolerance = odds_tolerance_for_placement(
@@ -2660,7 +2664,7 @@ class Sports411Controller:
             self.logger.info(
                 f"Skipping placement — bet already on open bets: {open_msg}"
             )
-            self._clear_hedge_preposition()
+            self._clear_hedge_preposition(pair_key)
             return "placed", True, stake_plan
 
         try:
@@ -2700,7 +2704,7 @@ class Sports411Controller:
                     spread_line=spread_line,
                 )
         finally:
-            self._clear_hedge_preposition()
+            self._clear_hedge_preposition(pair_key)
 
         return "done", bet_placed, stake_used
 

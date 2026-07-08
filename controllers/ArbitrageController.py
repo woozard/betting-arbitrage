@@ -556,13 +556,9 @@ class ArbitrageController:
         }
 
     def __store_arbitrage_cache(self, arb_data):
-        bet_type = arb_data.get("bet_type", "moneyline")
-        self.cache.add_arbitrage(
-            arb_data["team_1_bookmaker"], bet_type, arb_data["team_1_game_id"], arb_data
-        )
-        self.cache.add_arbitrage(
-            arb_data["team_2_bookmaker"], bet_type, arb_data["team_2_game_id"], arb_data
-        )
+        from utils.bet_placement import store_arbitrage_for_both_books
+
+        store_arbitrage_for_both_books(self.cache, arb_data)
 
     def __insert_arbitrage(
         self,

@@ -101,6 +101,10 @@ SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in
 S411_EXCHANGE_HEDGE_PREPOSITION = os.getenv(
     'S411_EXCHANGE_HEDGE_PREPOSITION', 'true'
 ).lower() in ('1', 'true', 'yes')
+# Max seconds 4casters waits for S411 betslip pre-position before placing leg 1.
+S411_HEDGE_PREPOSITION_WAIT_SECONDS = float(
+    os.getenv('S411_HEDGE_PREPOSITION_WAIT_SECONDS', '10')
+)
 # One bet per book per arb pair per matchup within this window (seconds).
 GAME_PAIR_BET_COOLDOWN_SECONDS = int(os.getenv('GAME_PAIR_BET_COOLDOWN_SECONDS', '3600'))
 ARB_TTL_SECONDS = int(os.getenv('ARB_TTL_SECONDS', '300'))

@@ -142,6 +142,27 @@ class ArbitrageCache:
         _, payload = result
         return payload if isinstance(payload, dict) else {"raw": payload}
 
+    def _hedge_preposition_ready_key(self, pair_key: str) -> str:
+        return f"hedge_preposition_ready:{pair_key}"
+
+    def mark_hedge_preposition_ready(self, pair_key: str, bookmaker: str):
+        if not pair_key:
+            return
+        self.redis.set(
+            self._hedge_preposition_ready_key(pair_key),
+            {"bookmaker": (bookmaker or "").strip().lower(), "ts": time.time()},
+            ttl=120,
+        )
+
+    def clear_hedge_preposition_ready(self, pair_key: str):
+        if pair_key:
+            self.redis.delete(self._hedge_preposition_ready_key(pair_key))
+
+    def is_hedge_preposition_ready(self, pair_key: str) -> bool:
+        if not pair_key:
+            return False
+        return bool(self.redis.get(self._hedge_preposition_ready_key(pair_key)))
+
     def get_arbitrage(self, bookmaker=None, bet_type=None, game_id=None):
         b = bookmaker or "*"
         t = bet_type or "*"

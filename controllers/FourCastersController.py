@@ -20,6 +20,7 @@ from utils.bet_placement import (
     odds_tolerance_for_placement,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
+    wait_for_s411_hedge_preposition,
 )
 from utils.betting_watchdog import (
     BettingLoopWatchdog,
@@ -807,6 +808,10 @@ class FourCastersController:
                         wager_odds,
                         stake,
                         logger=self.logger,
+                    )
+
+                    wait_for_s411_hedge_preposition(
+                        self.cache, self.logger, arb, self.bookmaker
                     )
 
                     bet_placed, stake_used = self.__execute_bet(

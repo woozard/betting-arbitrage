@@ -137,13 +137,9 @@ def build_arb_data(
 
 
 def _store_arb(cache, arb_data: dict):
-    bet_type = arb_data.get("bet_type", "moneyline")
-    cache.add_arbitrage(
-        arb_data["team_1_bookmaker"], bet_type, arb_data["team_1_game_id"], arb_data
-    )
-    cache.add_arbitrage(
-        arb_data["team_2_bookmaker"], bet_type, arb_data["team_2_game_id"], arb_data
-    )
+    from utils.bet_placement import store_arbitrage_for_both_books
+
+    store_arbitrage_for_both_books(cache, arb_data)
 
 
 def _send_opportunity_alert(cache, logger, arb_data: dict):
