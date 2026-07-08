@@ -19,7 +19,7 @@ from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc   # ← NEW: for explicit table-missing error handling
 import undetected_chromedriver as uc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
+from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import (
@@ -45,6 +45,7 @@ from utils.bet_placement import (
     maybe_notify_partial_arb_exposure,
     should_defer_for_sequential_first_leg,
     resolve_arb_leg_stake,
+    should_s411_exchange_hedge_preposition,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
@@ -109,6 +110,8 @@ class Sports411Controller:
         self._last_bet_error = None
         self._pending_check_cache = {}
         self._arb_fail_counts = {}
+        self._hedge_preposition_ready = False
+        self._hedge_preposition_key = None
 
         # Site Config
         self.bookmaker = site['bookmaker']
@@ -2412,39 +2415,30 @@ class Sports411Controller:
         finally:
             self.logger.info("========== Execute Bet (END) ==========")
 
-    def _execute_bet_attempt(
+    def _clear_hedge_preposition(self):
+        self._hedge_preposition_ready = False
+        self._hedge_preposition_key = None
+
+    def _betslip_has_team(self, team_name: str) -> bool:
+        if self._betslip_is_empty():
+            return False
+        seen = (self._get_betslip_team_name() or "").strip().lower()
+        return seen == (team_name or "").strip().lower()
+
+    def _open_betslip_for_wager(
         self,
         game_id: str,
         team_name: str,
         moneyline_odd: str,
-        stake: float = 1.0,
         bet_type: str = "moneyline",
         spread_line: float | None = None,
     ):
-        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
-        market_label = (
-            f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
-        )
-        self.logger.info(
-            f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
-            f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
-        )
-
-        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
-        if already_open:
-            self.logger.info(
-                f"Skipping placement — bet already on open bets: {open_msg}"
-            )
-            return True, stake_plan
-
-        self._refresh_session_before_wager()
-
+        """Navigate to game and add selection to betslip (no stake / no Place Bet)."""
         if not self._game_visible_on_page(game_id):
             if self._is_off_sport_page(self.driver.current_url):
                 self.logger.info(f"Navigating to {self.sport_name} page before bet placement")
                 self._return_to_sport_page()
 
-            game_container = None
             try:
                 game_container = WebDriverWait(self.driver, 12).until(
                     EC.presence_of_element_located(
@@ -2482,7 +2476,6 @@ class Sports411Controller:
             line_kind = "Moneyline"
 
         self._reject_if_line_moved(moneyline_odd, live_odds, f"board click for {team_name}")
-
         self.logger.info(f"{line_kind} Label: {line_label}")
 
         self.wait.until(EC.presence_of_element_located((By.ID, "betslip")))
@@ -2505,8 +2498,17 @@ class Sports411Controller:
             )
 
         self.logger.info(f"Betslip verified | Team: {betslip_team}")
-        self._reject_if_line_moved(moneyline_odd, self._get_betslip_odds_text(), "betslip after add")
+        self._reject_if_line_moved(
+            moneyline_odd, self._get_betslip_odds_text(), "betslip after add"
+        )
 
+    def _submit_betslip_wager(
+        self,
+        stake_plan: BaseAmountStake,
+        moneyline_odd: str,
+        team_name: str,
+    ):
+        """Fill stake on an open betslip and click Place Bet."""
         try:
             bet_limits = self.wait.until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "#betslip .bet-limits"))
@@ -2550,7 +2552,6 @@ class Sports411Controller:
         self._accept_line_changes()
         self._install_wager_network_hook()
 
-        # Production path: one Selenium Place Bet click (no retries — avoids duplicates).
         if self.attach_browser and self.use_xdotool:
             coords = self._element_screen_coords_for_xdotool(place_bet_btn)
             self.logger.info(
@@ -2575,6 +2576,151 @@ class Sports411Controller:
 
         self.logger.info(f"Bet accepted by bookmaker: {message}")
         return True, stake_plan
+
+    def _run_exchange_hedge_preposition(
+        self,
+        arb: dict,
+        book_1: str,
+        book_2: str,
+        *,
+        game_id: str,
+        team_name: str,
+        wager_odds,
+        stake: float,
+        bet_type: str,
+        spread_line,
+        team_1: str,
+        team_2: str,
+    ):
+        """Pre-open S411 betslip while waiting for exchange leg 1; complete on Redis ack."""
+        first_leg = required_first_leg_book(book_1, book_2, self.bookmaker)
+        if not first_leg:
+            return None, False, None
+
+        pair_key = self.cache.arb_pair_key_from_arb(arb)
+
+        if not self.cache.is_arb_leg_placed(arb, first_leg):
+            if self._hedge_preposition_key != pair_key:
+                self._clear_hedge_preposition()
+            if not self._hedge_preposition_ready:
+                try:
+                    self._refresh_session_before_wager()
+                    self._open_betslip_for_wager(
+                        game_id,
+                        team_name,
+                        wager_odds,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
+                    )
+                    self._hedge_preposition_ready = True
+                    self._hedge_preposition_key = pair_key
+                    self.logger.info(
+                        f"S411 hedge pre-positioned | {team_name} | "
+                        f"holding betslip for {first_leg} fill"
+                    )
+                except Exception as exc:
+                    self.logger.warning(f"S411 pre-position failed: {exc}")
+                    self._clear_hedge_preposition()
+            return "deferred", False, None
+
+        self._odds_tolerance = odds_tolerance_for_placement(
+            self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+        )
+        stake = resolve_arb_leg_stake(
+            self.cache,
+            arb,
+            book_1,
+            book_2,
+            self.bookmaker,
+            wager_odds,
+            stake,
+            logger=self.logger,
+        )
+        stake_plan = base_amount_stake_from_odds(wager_odds, stake)
+
+        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
+        if already_open:
+            self.logger.info(
+                f"Skipping placement — bet already on open bets: {open_msg}"
+            )
+            self._clear_hedge_preposition()
+            return "placed", True, stake_plan
+
+        try:
+            if self._hedge_preposition_ready and self._hedge_preposition_key == pair_key:
+                if not self._betslip_has_team(team_name):
+                    self.logger.info("Pre-position stale; reopening betslip")
+                    self._refresh_session_before_wager()
+                    self._open_betslip_for_wager(
+                        game_id,
+                        team_name,
+                        wager_odds,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
+                    )
+                self._reject_if_line_moved(
+                    wager_odds,
+                    self._get_betslip_odds_text(),
+                    "pre-positioned betslip before submit",
+                )
+                self.logger.info(
+                    f"Completing pre-positioned S411 hedge | {team_name} | "
+                    f"{format_base_amount_stake(stake_plan)}"
+                )
+                bet_placed, stake_used = self._submit_betslip_wager(
+                    stake_plan, wager_odds, team_name
+                )
+            else:
+                self.logger.info(
+                    f"No pre-position ready; full S411 bet path | {team_1} vs {team_2}"
+                )
+                bet_placed, stake_used = self.__execute_bet(
+                    game_id,
+                    team_name,
+                    wager_odds,
+                    stake,
+                    bet_type=bet_type,
+                    spread_line=spread_line,
+                )
+        finally:
+            self._clear_hedge_preposition()
+
+        return "done", bet_placed, stake_used
+
+    def _execute_bet_attempt(
+        self,
+        game_id: str,
+        team_name: str,
+        moneyline_odd: str,
+        stake: float = 1.0,
+        bet_type: str = "moneyline",
+        spread_line: float | None = None,
+    ):
+        stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
+        market_label = (
+            f"spread {spread_line:+.1f}" if bet_type == "spread" and spread_line is not None else bet_type
+        )
+        self.logger.info(
+            f"Placing Bet | Game ID: {game_id} | Team: {team_name} | "
+            f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
+        )
+
+        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
+        if already_open:
+            self.logger.info(
+                f"Skipping placement — bet already on open bets: {open_msg}"
+            )
+            return True, stake_plan
+
+        self._refresh_session_before_wager()
+        self._open_betslip_for_wager(
+            game_id,
+            team_name,
+            moneyline_odd,
+            bet_type=bet_type,
+            spread_line=spread_line,
+        )
+        return self._submit_betslip_wager(stake_plan, moneyline_odd, team_name)
 
     def _quit_driver(self):
         """Safely terminate only this controller's WebDriver session."""
@@ -2924,7 +3070,28 @@ class Sports411Controller:
                     )
                     continue
 
-                if should_defer_for_sequential_first_leg(
+                bet_placed = False
+                stake_used = stake
+
+                if should_s411_exchange_hedge_preposition(
+                    book_1, book_2, self.bookmaker, bet_type
+                ):
+                    mode, bet_placed, stake_used = self._run_exchange_hedge_preposition(
+                        arb,
+                        book_1,
+                        book_2,
+                        game_id=game_id,
+                        team_name=team_name,
+                        wager_odds=wager_odds,
+                        stake=stake,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
+                        team_1=team_1,
+                        team_2=team_2,
+                    )
+                    if mode == "deferred":
+                        continue
+                elif should_defer_for_sequential_first_leg(
                     self.cache, arb, book_1, book_2, self.bookmaker, bet_type
                 ):
                     self.logger.info(
@@ -2932,42 +3099,42 @@ class Sports411Controller:
                         f"{self.bookmaker} | {team_1} vs {team_2}"
                     )
                     continue
+                else:
+                    if self._has_existing_open_bet(team_name, team_1, team_2):
+                        self.logger.warning(
+                            f"Open wager already on open-bets for {team_name} on {self.bookmaker}; "
+                            f"skipping duplicate placement"
+                        )
+                        self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
+                        continue
 
-                if self._has_existing_open_bet(team_name, team_1, team_2):
-                    self.logger.warning(
-                        f"Open wager already on open-bets for {team_name} on {self.bookmaker}; "
-                        f"skipping duplicate placement"
+                    self._odds_tolerance = odds_tolerance_for_placement(
+                        self.cache, arb, book_1, book_2, self.bookmaker, bet_type
                     )
-                    self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
-                    continue
+                    if self._odds_tolerance:
+                        self.logger.info(
+                            f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
+                        )
 
-                self._odds_tolerance = odds_tolerance_for_placement(
-                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
-                )
-                if self._odds_tolerance:
-                    self.logger.info(
-                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
+                    stake = resolve_arb_leg_stake(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        wager_odds,
+                        stake,
+                        logger=self.logger,
                     )
 
-                stake = resolve_arb_leg_stake(
-                    self.cache,
-                    arb,
-                    book_1,
-                    book_2,
-                    self.bookmaker,
-                    wager_odds,
-                    stake,
-                    logger=self.logger,
-                )
-
-                bet_placed, stake_used = self.__execute_bet(
-                    game_id,
-                    team_name,
-                    wager_odds,
-                    stake,
-                    bet_type=bet_type,
-                    spread_line=spread_line,
-                )
+                    bet_placed, stake_used = self.__execute_bet(
+                        game_id,
+                        team_name,
+                        wager_odds,
+                        stake,
+                        bet_type=bet_type,
+                        spread_line=spread_line,
+                    )
 
                 if not bet_placed:
                     recovered, open_msg = self._recover_bet_from_open_bets(

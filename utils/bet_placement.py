@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import threading
+import time
 
 from utils.config import (
     REAL_MONEY_BETTING_ENABLED,
@@ -417,6 +418,26 @@ def sequential_arb_betting_enabled(book_1: str, book_2: str) -> bool:
     return first in EXCHANGE_FIRST_BOOKMAKERS
 
 
+def should_s411_exchange_hedge_preposition(
+    book_1: str, book_2: str, bookmaker: str, bet_type: str
+) -> bool:
+    """True when S411 should pre-open betslip while waiting for an exchange leg-1 fill."""
+    from utils.config import S411_EXCHANGE_HEDGE_PREPOSITION
+
+    if not S411_EXCHANGE_HEDGE_PREPOSITION:
+        return False
+    if (bet_type or "moneyline").strip().lower() != "moneyline":
+        return False
+    if (bookmaker or "").strip().lower() != "sports411":
+        return False
+    if not sequential_arb_betting_enabled(book_1, book_2):
+        return False
+    if is_first_leg_bookmaker(book_1, book_2, bookmaker):
+        return False
+    first_leg = required_first_leg_book(book_1, book_2, bookmaker)
+    return first_leg in EXCHANGE_FIRST_BOOKMAKERS
+
+
 def _confirmed_other_leg_stake(cache, arb: dict, bookmaker: str) -> BaseAmountStake | None:
     book_1 = arb.get("team_1_bookmaker")
     book_2 = arb.get("team_2_bookmaker")
@@ -764,6 +785,23 @@ def acknowledge_placed_leg(
         bet_type=bet_type, spread_value=spread_value,
     )
     cache.mark_game_pair_daily_bet(arb, bookmaker, game_id)
+
+    if sequential_arb_betting_enabled(book_1, book_2) and is_first_leg_bookmaker(
+        book_1, book_2, bookmaker
+    ):
+        bm = (bookmaker or "").strip().lower()
+        b1 = (book_1 or "").strip().lower()
+        other_book = book_2 if bm == b1 else book_1
+        if other_book:
+            cache.signal_bet_wake(
+                other_book,
+                {
+                    "reason": "leg1_acknowledged",
+                    "pair_key": cache.arb_pair_key_from_arb(arb),
+                    "ts": time.time(),
+                },
+            )
+
     logger.info(
         f"Leg acknowledged (pre-screenshot) | {bookmaker}/{team_name or 'team'} | "
         f"{team_1} vs {team_2}"

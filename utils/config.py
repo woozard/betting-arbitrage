@@ -97,6 +97,10 @@ BETAMAPOLA_REAL_MONEY_BETTING_ENABLED = os.getenv(
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in (
     '1', 'true', 'yes',
 )
+# S411 leg 2: open betslip while waiting for 4casters fill, then stake+click on ack.
+S411_EXCHANGE_HEDGE_PREPOSITION = os.getenv(
+    'S411_EXCHANGE_HEDGE_PREPOSITION', 'true'
+).lower() in ('1', 'true', 'yes')
 ARB_TTL_SECONDS = int(os.getenv('ARB_TTL_SECONDS', '300'))
 TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',
