@@ -1,7 +1,7 @@
 import time
 
 from cache.redis_cache import RedisCache
-from utils.config import REDIS, ARB_TTL_SECONDS
+from utils.config import REDIS, ARB_TTL_SECONDS, GAME_PAIR_BET_COOLDOWN_SECONDS
 
 
 class ArbitrageCache:
@@ -441,7 +441,7 @@ class ArbitrageCache:
         if owns:
             return True, reason
         if self.is_game_pair_daily_bet_placed(arb, bookmaker):
-            return True, "daily game/pair bet already placed on this book"
+            return True, "pair/book bet cooldown active on this book"
         if self.is_arb_leg_placed(arb, bookmaker):
             return True, "leg already confirmed for this pair"
         if self.has_other_pair_partial_on_book_game(arb, bookmaker):
@@ -451,10 +451,10 @@ class ArbitrageCache:
     def _game_pair_daily_bet_key(self, pair_key: str, bookmaker: str, bet_type: str) -> str:
         bm = (bookmaker or "").strip().lower()
         bt = (bet_type or "moneyline").strip().lower()
-        return f"game_pair_daily_bet:{pair_key}:{bm}:{bt}"
+        return f"game_pair_bet_cooldown:{pair_key}:{bm}:{bt}"
 
     def is_game_pair_daily_bet_placed(self, arb: dict, bookmaker: str) -> bool:
-        """True when this book already placed on this matchup/pair today."""
+        """True when this book placed on this pair/matchup within the cooldown window."""
         pair_key = self.arb_pair_key_from_arb(arb)
         bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
         return bool(
@@ -464,7 +464,7 @@ class ArbitrageCache:
     def mark_game_pair_daily_bet(
         self, arb: dict, bookmaker: str, game_id: str | None = None
     ) -> None:
-        """One bet per book per game/pair per day — survives leg-flag cleanup."""
+        """One bet per book per pair per cooldown window — survives leg-flag cleanup."""
         pair_key = self.arb_pair_key_from_arb(arb)
         bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
         bm = (bookmaker or "").strip().lower()
@@ -477,8 +477,9 @@ class ArbitrageCache:
                 "pair_key": pair_key,
                 "bookmaker": bm,
                 "bet_type": bet_type,
+                "cooldown_seconds": GAME_PAIR_BET_COOLDOWN_SECONDS,
             },
-            ttl=self.lock_ttl,
+            ttl=GAME_PAIR_BET_COOLDOWN_SECONDS,
         )
 
     def purge_legacy_leg_placed_keys(self) -> int:

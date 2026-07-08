@@ -101,6 +101,8 @@ SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in
 S411_EXCHANGE_HEDGE_PREPOSITION = os.getenv(
     'S411_EXCHANGE_HEDGE_PREPOSITION', 'true'
 ).lower() in ('1', 'true', 'yes')
+# One bet per book per arb pair per matchup within this window (seconds).
+GAME_PAIR_BET_COOLDOWN_SECONDS = int(os.getenv('GAME_PAIR_BET_COOLDOWN_SECONDS', '3600'))
 ARB_TTL_SECONDS = int(os.getenv('ARB_TTL_SECONDS', '300'))
 TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',

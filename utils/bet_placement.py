@@ -141,9 +141,9 @@ def should_skip_arb_leg_in_betting_loop(
             f"{team_name} | {team_1} vs {team_2}"
         )
         cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
-    elif reason == "daily game/pair bet already placed on this book":
+    elif reason == "pair/book bet cooldown active on this book":
         logger.info(
-            f"Skipping — daily game/pair bet limit on {bookmaker} | "
+            f"Skipping — pair/book bet cooldown on {bookmaker} | "
             f"{team_name} | {team_1} vs {team_2}"
         )
         cache.remove_arbitrage_for_bookmaker(arb, bookmaker)

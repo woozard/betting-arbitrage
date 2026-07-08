@@ -142,7 +142,7 @@ def test_is_arb_leg_placed_does_not_read_legacy_global_key():
     assert cache.is_arb_leg_placed(arb, "4casters") is False
 
 
-def test_game_pair_daily_bet_blocks_repeat_after_leg_clear():
+def test_game_pair_bet_cooldown_blocks_repeat_after_leg_clear():
     cache = ArbitrageCache()
     cache.redis = MemRedis()
 
@@ -151,9 +151,9 @@ def test_game_pair_daily_bet_blocks_repeat_after_leg_clear():
 
     skip, reason = cache.should_skip_arb_leg_placement(arb, "paradisewager")
     assert skip is True
-    assert "daily" in reason
+    assert "cooldown" in reason
 
     cache.clear_arb_pair_legs(arb)
     skip, reason = cache.should_skip_arb_leg_placement(arb, "paradisewager")
     assert skip is True
-    assert "daily" in reason
+    assert "cooldown" in reason
