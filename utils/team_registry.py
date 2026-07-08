@@ -166,15 +166,9 @@ def canonical_matchup_key(
     sport: str = "baseball",
     league: str = "mlb",
 ) -> tuple[tuple[str, str], str]:
-    """Sorted canonical team pair + YYYY-MM-DD date for cross-book grouping."""
-    dt = game_datetime or ""
-    date_key = (dt[:10] if isinstance(dt, str) else str(dt)[:10]) if dt else ""
-    pair = tuple(
-        sorted(
-            [
-                canonical_team(team_1, sport=sport, league=league),
-                canonical_team(team_2, sport=sport, league=league),
-            ]
-        )
+    """Sorted canonical team pair + UTC minute schedule key for cross-book grouping."""
+    from utils.match_identity import canonical_schedule_key
+
+    return canonical_schedule_key(
+        team_1, team_2, game_datetime, sport=sport, league=league
     )
-    return pair, date_key

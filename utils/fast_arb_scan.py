@@ -19,6 +19,7 @@ from utils.config import (
     arb_opportunity_alert_chat_ids,
 )
 from utils.game_registry import matchup_group_key
+from utils.match_identity import validate_cross_book_game_datetimes
 from utils.helpers import (
     align_cross_book_moneylines,
     align_cross_book_spreads,
@@ -92,6 +93,8 @@ def build_arb_data(
     spread_value=None,
 ):
     t1, t2 = _resolve_sides(o1, o2, t1_from, t2_from)
+    o1_src = o1 if t1_from == "o1" else o2
+    o2_src = o2 if t2_from == "o2" else o1
     game_dt = parse_game_datetime(o1.get("game_datetime"))
     from datetime import datetime
     game_date_str = str(game_dt.date()) if game_dt else str(datetime.utcnow().date())
@@ -112,6 +115,8 @@ def build_arb_data(
         "league": o1["league"],
         "game_date": game_date_str,
         "game_datetime": game_dt.strftime("%Y-%m-%d %H:%M:%S") if game_dt else o1.get("game_datetime"),
+        "team_1_game_datetime": o1_src.get("game_datetime"),
+        "team_2_game_datetime": o2_src.get("game_datetime"),
         "team_1": o1["team_1"],
         "team_1_bookmaker": t1["bookmaker"],
         "team_1_game_id": t1["game_id"],
@@ -192,6 +197,20 @@ def _send_opportunity_alert(cache, logger, arb_data: dict):
 
 
 def _try_insert_pair(cache, logger, o1, o2, t1_from, t2_from, bet_type) -> int:
+    dt_reason = validate_cross_book_game_datetimes(
+        o1.get("game_datetime"),
+        o2.get("game_datetime"),
+        team_1=o1.get("team_1") or "",
+        team_2=o1.get("team_2") or "",
+    )
+    if dt_reason:
+        logger.info(
+            f"Skipping inline arb ({dt_reason}) - "
+            f"{o1.get('team_1')} vs {o1.get('team_2')} | "
+            f"{o1.get('bookmaker')} vs {o2.get('bookmaker')}"
+        )
+        return 0
+
     if not is_game_pregame(o1.get("game_datetime")) or not is_game_pregame(o2.get("game_datetime")):
         return 0
 

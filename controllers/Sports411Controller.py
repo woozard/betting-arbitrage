@@ -1048,6 +1048,7 @@ class Sports411Controller:
     def _parse_games_from_html(self, html: str) -> list:
         soup = BeautifulSoup(html or "", "html.parser")
         games = []
+        team_pair_occurrence: dict[tuple, int] = {}
         for game in soup.select("div.sports-league-game"):
             try:
                 game_id = game.get("idgame")
@@ -1063,7 +1064,11 @@ class Sports411Controller:
                 if not team_1 or not team_2 or not team_1_ml or not team_2_ml:
                     continue
 
-                game_datetime_str = self._extract_game_datetime(game)
+                pair = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
+                occurrence = team_pair_occurrence.get(pair, 0)
+                team_pair_occurrence[pair] = occurrence + 1
+
+                game_datetime_str = self._extract_game_datetime(game, occurrence_index=occurrence)
                 if not game_datetime_str:
                     game_datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1123,9 +1128,11 @@ class Sports411Controller:
     # --------------------------------------------------------
     # Game datetime extraction (critical for cross-book matching on game_datetime)
     # --------------------------------------------------------
-    def _extract_game_datetime(self, game_soup):
+    def _extract_game_datetime(self, game_soup, occurrence_index: int = 0):
         """Best-effort extraction of scheduled game start time from the sports-league-game element.
-        Returns string in %Y-%m-%d %H:%M:%S using today's date + found time, or None.
+
+        occurrence_index disambiguates when the same matchup appears twice (today + tomorrow).
+        Returns UTC-normalized %Y-%m-%d %H:%M:%S or None.
         """
         candidates = []
         # Try common time-related selectors that appear in betting schedule UIs
@@ -1167,15 +1174,29 @@ class Sports411Controller:
                 m = re.search(pat, cand)
                 if m:
                     time_part = m.group(1)
-                    return self._combine_date_with_time(time_part)
+                    return self._resolve_schedule_datetime(time_part, occurrence_index)
 
         return None
 
+    def _resolve_schedule_datetime(self, time_str: str, occurrence_index: int = 0) -> str | None:
+        from utils.match_identity import schedule_datetime_with_occurrence
+
+        resolved = schedule_datetime_with_occurrence(
+            time_str,
+            occurrence_index=occurrence_index,
+            tz_name=self.game_tz,
+        )
+        if resolved:
+            return resolved
+        return self._combine_date_with_time(time_str, occurrence_index=occurrence_index)
+
     @staticmethod
     def _matchup_key(team_1: str, team_2: str, game_datetime: str) -> tuple:
+        from utils.match_identity import game_datetime_minute_key
+
         teams = tuple(sorted([(team_1 or "").strip().lower(), (team_2 or "").strip().lower()]))
-        date_part = (game_datetime or "")[:10]
-        return teams + (date_part,)
+        minute_key = game_datetime_minute_key(game_datetime) or (game_datetime or "")[:10]
+        return teams + (minute_key,)
 
     @staticmethod
     def _moneyline_is_populated(game: dict) -> bool:
@@ -1187,77 +1208,54 @@ class Sports411Controller:
 
     @staticmethod
     def _pick_canonical_game(existing: dict, candidate: dict) -> dict:
-        """When the DOM lists the same matchup twice, prefer rows with real ML odds.
-
-        If both have odds, keep the higher idgame (matches live bet clicks).
-        """
+        """When the same idgame appears twice in the DOM, prefer the row with real ML odds."""
         existing_ok = Sports411Controller._moneyline_is_populated(existing)
         candidate_ok = Sports411Controller._moneyline_is_populated(candidate)
         if existing_ok and not candidate_ok:
             return existing
         if candidate_ok and not existing_ok:
             return candidate
-        try:
-            existing_id = int(existing.get("game_id") or 0)
-            candidate_id = int(candidate.get("game_id") or 0)
-        except (TypeError, ValueError):
-            return existing if existing_ok else candidate
-        return candidate if candidate_id > existing_id else existing
+        return candidate
 
     def _dedupe_games_by_matchup(self, games: list) -> list:
-        seen = {}
+        """Drop repeated DOM rows for the same idgame only — never merge different game_ids."""
+        seen: dict[str, dict] = {}
         for game in games:
-            key = self._matchup_key(
-                game.get("team_1"), game.get("team_2"), game.get("game_datetime")
-            )
-            if key not in seen:
-                seen[key] = game
+            gid = str(game.get("game_id") or "").strip()
+            if not gid:
+                continue
+            if gid not in seen:
+                seen[gid] = game
                 continue
 
-            prev = seen[key]
+            prev = seen[gid]
             chosen = self._pick_canonical_game(prev, game)
             dropped = prev if chosen is game else game
             kept = chosen
             self.logger.warning(
-                f"Dropping duplicate S411 game_id={dropped.get('game_id')} "
+                f"Dropping duplicate S411 DOM row game_id={dropped.get('game_id')} "
                 f"({dropped.get('team_1')} vs {dropped.get('team_2')}, "
                 f"ML {dropped.get('moneyline')}); "
                 f"keeping game_id={kept.get('game_id')} "
                 f"(ML {kept.get('moneyline')})"
             )
-            seen[key] = chosen
+            seen[gid] = chosen
 
         return list(seen.values())
 
-    def _combine_date_with_time(self, time_str: str) -> str:
-        """ '7:10 PM' or '19:10' or '19:10:00' -> '2026-06-01 19:10:00' (today's date)
-        The resulting string is passed through parse_to_mysql_datetime with this book's
-        game_tz so that it gets localized and converted to UTC. This ensures game_datetime
-        strings are consistent for cross-book matching regardless of what TZ each bookmaker
-        uses to display times.
-        """
-        try:
-            time_str = time_str.strip()
-            is_pm = bool(re.search(r'pm', time_str, re.I))
-            is_am = bool(re.search(r'am', time_str, re.I))
-            clean = re.sub(r'\s*[APap][Mm]', '', time_str).strip()
-            tparts = clean.split(':')
-            hour = int(tparts[0])
-            minute = int(tparts[1]) if len(tparts) > 1 else 0
-            if is_pm and hour != 12:
-                hour += 12
-            elif is_am and hour == 12:
-                hour = 0
-            tz = pytz.timezone(self.game_tz)
-            today = datetime.now(tz).date()
-            dt = datetime(today.year, today.month, today.day, hour, minute, 0)
-            local_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-            # Normalize using this book's TZ (set in __init__) to UTC
-            return parse_to_mysql_datetime(local_str, tz_name=self.game_tz)
-        except Exception:
-            # fallback: normalize server now() as if in game tz (rare case)
-            local_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return parse_to_mysql_datetime(local_str, tz_name=self.game_tz)
+    def _combine_date_with_time(self, time_str: str, occurrence_index: int = 0) -> str:
+        """Fallback schedule resolver when occurrence-aware helper returns None."""
+        from utils.match_identity import schedule_datetime_with_occurrence
+
+        resolved = schedule_datetime_with_occurrence(
+            time_str,
+            occurrence_index=occurrence_index,
+            tz_name=self.game_tz,
+        )
+        if resolved:
+            return resolved
+        local_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return parse_to_mysql_datetime(local_str, tz_name=self.game_tz)
 
     def _zenrows_get(self, url: str, js_render: bool = True, wait: int = 15000):
         """Zenrows helper – fast and reliable for odds fetching"""
@@ -2207,7 +2205,9 @@ class Sports411Controller:
         page_compact = page_l.lower().replace(" ", "")
         return any(p.replace(" ", "").lower() in page_compact for p in patterns)
 
-    def _verify_open_bet_on_pending(self, team_name: str, stake: float):
+    def _verify_open_bet_on_pending(
+        self, team_name: str, stake: float, *, expected_odds=None
+    ):
         try:
             page = self._fetch_pending_page_text()
             if not page or team_name.lower() not in (page or "").lower():
@@ -2220,6 +2220,21 @@ class Sports411Controller:
             team_l = team_name.lower()
             if team_l not in page_l:
                 return False, "Bet not found on open bets page"
+            if expected_odds is not None:
+                from utils.stake_sizing import BaseAmountStake
+
+                odds_val = (
+                    int(expected_odds)
+                    if not isinstance(expected_odds, BaseAmountStake)
+                    else int(expected_odds.american_odds)
+                )
+                odds_patterns = [
+                    f"ml{odds_val:+d}".lower().replace("+", ""),
+                    f"{odds_val:+d}",
+                    str(odds_val),
+                ]
+                if not any(p.replace("+", "") in page_l.replace(" ", "") for p in odds_patterns):
+                    return False, f"Open bet odds {odds_val:+d} not found for {team_name}"
             if self._stake_on_open_bets_page(page, stake):
                 return True, "Open bet found on open bets page"
             return False, "Team found on open bets page but stake not verified"
@@ -2638,7 +2653,9 @@ class Sports411Controller:
         )
         stake_plan = base_amount_stake_from_odds(wager_odds, stake)
 
-        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
+        already_open, open_msg = self._verify_open_bet_on_pending(
+            team_name, stake_plan, expected_odds=stake_plan
+        )
         if already_open:
             self.logger.info(
                 f"Skipping placement — bet already on open bets: {open_msg}"
@@ -2705,7 +2722,9 @@ class Sports411Controller:
             f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
 
-        already_open, open_msg = self._verify_open_bet_on_pending(team_name, stake_plan)
+        already_open, open_msg = self._verify_open_bet_on_pending(
+            team_name, stake_plan, expected_odds=stake_plan
+        )
         if already_open:
             self.logger.info(
                 f"Skipping placement — bet already on open bets: {open_msg}"

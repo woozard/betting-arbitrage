@@ -17,6 +17,7 @@ from utils.config import (
     required_first_leg_book,
 )
 from utils.arb_placement import SPREAD_BETTING_UNSUPPORTED_BOOKS, arb_leg_for_book
+from utils.match_identity import validate_arb_same_match
 from utils.moneyline_arb import (
     validate_cross_leg_moneyline_signs,
     validate_moneyline_arb_payload,
@@ -129,6 +130,15 @@ def should_skip_arb_leg_in_betting_loop(
     cross_reason = validate_cross_leg_moneyline_signs(cache, arb, bookmaker, leg)
     if cross_reason:
         logger.info(f"Skipping — {cross_reason} | {team_name} | {team_1} vs {team_2}")
+        cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
+        return True
+
+    match_reason = validate_arb_same_match(arb)
+    if match_reason:
+        logger.error(
+            f"Skipping — same-match guard: {match_reason} | {bookmaker} | "
+            f"{team_name} | {team_1} vs {team_2}"
+        )
         cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
         return True
 
@@ -827,11 +837,13 @@ def finalize_confirmed_bet_with_screenshot(
     extra_lines: list[str] | None = None,
     ticket_number=None,
     placed_odds=None,
+    leg_already_acknowledged: bool = False,
 ) -> None:
     """Acknowledge leg immediately, capture screenshot, then finish alerts/DB."""
-    acknowledge_placed_leg(
-        cache, logger, arb, bookmaker, game_id, team_name=team_name
-    )
+    if not leg_already_acknowledged:
+        acknowledge_placed_leg(
+            cache, logger, arb, bookmaker, game_id, team_name=team_name
+        )
     screenshot_path = capture_bet_screenshot_for_alert(
         logger,
         bookmaker,

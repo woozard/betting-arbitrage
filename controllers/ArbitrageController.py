@@ -42,6 +42,7 @@ from utils.helpers import (
 )
 from utils.timing import time_it
 from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
+from utils.match_identity import validate_cross_book_game_datetimes
 from utils.exposure_cleanup import tick_exposure_cleanup
 from cache.arbitrage_cache import ArbitrageCache
 
@@ -157,14 +158,11 @@ class ArbitrageController:
         if candidate["created_at"] < current["created_at"]:
             return current
 
-        # Same scrape timestamp: S411 often inserts two game_ids for one matchup.
-        if candidate.get("bookmaker") == "sports411":
-            try:
-                cand_id = int(candidate.get("game_id") or 0)
-                cur_id = int(current.get("game_id") or 0)
-                return candidate if cand_id > cur_id else current
-            except (TypeError, ValueError):
-                pass
+        # Same scrape timestamp: prefer the row with a later (still pregame) start when tied.
+        cand_dt = parse_game_datetime(candidate.get("game_datetime"))
+        cur_dt = parse_game_datetime(current.get("game_datetime"))
+        if cand_dt and cur_dt and cand_dt != cur_dt:
+            return candidate if cand_dt > cur_dt else current
         return current
 
     def get_recent_moneyline_odds_from_db(
@@ -509,6 +507,8 @@ class ArbitrageController:
         spread_value=None,
     ):
         t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
+        o1_src = o1 if t1_from == "o1" else o2
+        o2_src = o2 if t2_from == "o2" else o1
         game_dt = parse_game_datetime(o1.get("game_datetime"))
         game_date = game_dt.date() if game_dt else datetime.utcnow().date()
 
@@ -528,6 +528,8 @@ class ArbitrageController:
             "league": o1["league"],
             "game_date": str(game_date),
             "game_datetime": game_dt.strftime("%Y-%m-%d %H:%M:%S") if game_dt else None,
+            "team_1_game_datetime": o1_src.get("game_datetime"),
+            "team_2_game_datetime": o2_src.get("game_datetime"),
 
             "team_1": o1["team_1"],
             "team_1_bookmaker": t1["bookmaker"],
@@ -577,6 +579,20 @@ class ArbitrageController:
         o1 = new_odds
         o2 = existing
         t1, t2 = self.__resolve_sides(o1, o2, t1_from, t2_from)
+
+        dt_reason = validate_cross_book_game_datetimes(
+            o1.get("game_datetime"),
+            o2.get("game_datetime"),
+            team_1=o1.get("team_1") or "",
+            team_2=o1.get("team_2") or "",
+        )
+        if dt_reason:
+            self.logger.info(
+                f"Skipping arb ({dt_reason}) - "
+                f"{bet_type} {o1['team_1']} vs {o1['team_2']} | "
+                f"{t1['bookmaker']} vs {t2['bookmaker']}"
+            )
+            return None
 
         if not is_game_pregame(o1.get("game_datetime")) or not is_game_pregame(o2.get("game_datetime")):
             self.logger.info(
