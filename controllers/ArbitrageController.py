@@ -44,6 +44,7 @@ from utils.timing import time_it
 from utils.game_registry import attach_canonical_game_ids, matchup_group_key, odds_dedup_key
 from utils.match_identity import validate_cross_book_game_datetimes
 from utils.exposure_cleanup import tick_exposure_cleanup
+from utils.bet_placement import wait_for_arb_execution_pause_clear
 from cache.arbitrage_cache import ArbitrageCache
 
 
@@ -131,6 +132,11 @@ class ArbitrageController:
                 self._exposure_cleanup_at = tick_exposure_cleanup(
                     self.cache, self.logger, self._exposure_cleanup_at
                 )
+                wait_for_arb_execution_pause_clear(
+                    self.cache, self.logger, component="Arb scanner"
+                )
+                if self.cache.is_arb_execution_paused():
+                    continue
                 self.scan_opportunities()
                 time.sleep(delay)
         except KeyboardInterrupt:
@@ -433,6 +439,11 @@ class ArbitrageController:
 
     @time_it
     def scan_opportunities(self):
+        if self.cache.is_arb_execution_paused():
+            self.logger.info(
+                "Skipping scan — execution pause active (bets in flight)"
+            )
+            return
         self.logger.info("========== Arbitrage - Scan Opportunities (START) ==========")
         try:
             scan_results = [self._scan_moneyline_opportunities()]

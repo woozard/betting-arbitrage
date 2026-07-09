@@ -324,6 +324,15 @@ def check_arb_scanner_health() -> list[HealthIssue]:
     running = _process_running("arbitrage.py")
     lines = _tail_lines("arbitrage.log")
     log_age = _log_mtime("arbitrage.log")
+
+    try:
+        from cache.arbitrage_cache import ArbitrageCache
+
+        if ArbitrageCache().is_arb_execution_paused():
+            return issues
+    except Exception:
+        pass
+
     log_stale = log_age is not None and (time.time() - log_age) > OPS_ARB_SCAN_STALE_SECONDS
 
     if lines and IMPORT_ERROR.search("".join(lines[-40:])):
