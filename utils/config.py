@@ -133,7 +133,8 @@ def profit_pct_to_max_total_prob(profit_pct: float) -> float:
     return 1.0 - (profit_pct / 100.0)
 
 
-MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '1.01'))
+# Testing: allow near-miss / slightly negative ML arbs (e.g. -1.02%). Set back to 1.01 for production.
+MIN_ARB_PROFIT_PCT = float(os.getenv('MIN_ARB_PROFIT_PCT', '-1.02'))
 if os.getenv('ARB_MAX_TOTAL_PROB') is not None:
     ARB_MAX_TOTAL_PROB = float(os.getenv('ARB_MAX_TOTAL_PROB'))
 elif MIN_ARB_PROFIT_PCT != 0:
