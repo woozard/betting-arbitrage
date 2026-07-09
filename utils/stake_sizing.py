@@ -113,6 +113,35 @@ def format_base_amount_stake(stake: BaseAmountStake) -> str:
     )
 
 
+def cap_base_amount_stake_to_max_risk(
+    stake_plan: BaseAmountStake, max_risk: float
+) -> BaseAmountStake:
+    """Shrink a stake plan when exchange liquidity is below the requested risk."""
+    try:
+        cap = round(float(max_risk), 2)
+    except (TypeError, ValueError):
+        return stake_plan
+    if cap <= 0 or cap >= stake_plan.risk - 0.005:
+        return stake_plan
+
+    capped_risk = cap
+    capped_to_win = american_to_win_from_risk(capped_risk, stake_plan.american_odds)
+    if stake_plan.american_odds > 0:
+        base_amount = capped_risk
+        entry_amount = capped_risk
+    else:
+        base_amount = capped_to_win
+        entry_amount = capped_to_win
+    return BaseAmountStake(
+        base_amount=round(base_amount, 2),
+        american_odds=stake_plan.american_odds,
+        entry_field=stake_plan.entry_field,
+        entry_amount=round(entry_amount, 2),
+        risk=capped_risk,
+        to_win=capped_to_win,
+    )
+
+
 def stake_matches_verification_amount(stake, amount: float, tol: float = 0.011) -> bool:
     try:
         target = float(amount)

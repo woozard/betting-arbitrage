@@ -48,6 +48,7 @@ def record_confirmed_leg(
     stake,
     *,
     ticket_number=None,
+    orderbook_max_risk: float | None = None,
 ) -> None:
     _store_arb_snapshot(cache, pair_key, arb)
     data = cache.redis.get(_summary_redis_key(pair_key)) or {}
@@ -66,6 +67,11 @@ def record_confirmed_leg(
         leg_entry["ticket_number"] = str(ticket_number).strip()
     if isinstance(stake, BaseAmountStake):
         leg_entry["base_amount"] = stake.base_amount
+    if orderbook_max_risk is not None:
+        try:
+            leg_entry["orderbook_max_risk"] = round(float(orderbook_max_risk), 2)
+        except (TypeError, ValueError):
+            pass
     data[side] = leg_entry
     cache.redis.set(_summary_redis_key(pair_key), data, ttl=cache.lock_ttl)
 
@@ -151,6 +157,7 @@ def _build_summary_alert(cache, pair_key: str, outcome: str) -> str | None:
         leg2_placed_odds=leg2.get("odds") if leg2.get("placed") else None,
         leg1_ticket=leg1.get("ticket_number"),
         leg2_ticket=leg2.get("ticket_number"),
+        leg1_orderbook_max_risk=leg1.get("orderbook_max_risk"),
     )
     if outcome == "complete":
         header = "===== Arb Complete (Real Money) ====="

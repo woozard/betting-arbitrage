@@ -1151,6 +1151,7 @@ def format_arb_complete_alert(
     leg2_placed_odds=None,
     leg1_ticket=None,
     leg2_ticket=None,
+    leg1_orderbook_max_risk=None,
 ) -> str:
     """Compact confirmed-arb alert (same layout as opportunity alerts + per-leg stakes).
 
@@ -1201,7 +1202,14 @@ def format_arb_complete_alert(
         text = str(ticket).strip()
         return f" · #{text}" if text else ""
 
-    def _stake_suffix(odds, actual: tuple[float, float] | None = None, failure: str | None = None, ticket=None) -> str:
+    def _stake_suffix(
+        odds,
+        actual: tuple[float, float] | None = None,
+        failure: str | None = None,
+        ticket=None,
+        *,
+        orderbook_max=None,
+    ) -> str:
         if failure:
             short = failure if len(failure) <= 48 else failure[:45] + "..."
             return f" · NOT PLACED ({short})"
@@ -1212,6 +1220,11 @@ def format_arb_complete_alert(
         else:
             plan = base_amount_stake_from_odds(odds, base)
             stake_part = f" · ${plan.risk:.2f}→${plan.to_win:.2f}"
+        if orderbook_max is not None:
+            try:
+                stake_part += f" · max ${float(orderbook_max):.2f}"
+            except (TypeError, ValueError):
+                pass
         return stake_part + _ticket_suffix(ticket)
 
     status_mark = "✓" if outcome == "complete" else "✗"
@@ -1226,7 +1239,7 @@ def format_arb_complete_alert(
         if line1 is None or line2 is None:
             leg1 = (
                 f"{short_1} {odds1} {book1}"
-                f"{_stake_suffix(odds1_raw, leg1_stake, leg1_failure, leg1_ticket)}"
+                f"{_stake_suffix(odds1_raw, leg1_stake, leg1_failure, leg1_ticket, orderbook_max=leg1_orderbook_max_risk)}"
             )
             leg2 = (
                 f"{short_2} {odds2} {book2}"
@@ -1235,7 +1248,7 @@ def format_arb_complete_alert(
         else:
             leg1 = (
                 f"{short_1} {line1:+.1f} {odds1} {book1}"
-                f"{_stake_suffix(odds1_raw, leg1_stake, leg1_failure, leg1_ticket)}"
+                f"{_stake_suffix(odds1_raw, leg1_stake, leg1_failure, leg1_ticket, orderbook_max=leg1_orderbook_max_risk)}"
             )
             leg2 = (
                 f"{short_2} {line2:+.1f} {odds2} {book2}"
@@ -1244,7 +1257,7 @@ def format_arb_complete_alert(
     else:
         leg1 = (
             f"{short_1} {odds1} {book1}"
-            f"{_stake_suffix(odds1_raw, leg1_stake, leg1_failure, leg1_ticket)}"
+            f"{_stake_suffix(odds1_raw, leg1_stake, leg1_failure, leg1_ticket, orderbook_max=leg1_orderbook_max_risk)}"
         )
         leg2 = (
             f"{short_2} {odds2} {book2}"

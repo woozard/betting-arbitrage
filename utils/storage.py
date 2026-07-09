@@ -215,7 +215,8 @@ class Storage:
                 team_name=bet.get("team_name"),
 
                 odds=bet["odds"],
-                stake=bet.get("stake")
+                stake=bet.get("stake"),
+                orderbook_max_risk=bet.get("orderbook_max_risk"),
             )
 
             self.db.add(bet_row)
@@ -225,7 +226,13 @@ class Storage:
             self.logger.info(
                 f"DB - Bet Saved (bookmaker={bet['bookmaker']} - "
                 f"bet_type={bet['bet_type']} - game_id={bet['game_id']} - "
-                f"team_no={bet['team_no']})"
+                f"team_no={bet['team_no']}"
+                + (
+                    f" - orderbook_max_risk={bet['orderbook_max_risk']:.2f}"
+                    if bet.get("orderbook_max_risk") is not None
+                    else ""
+                )
+                + ")"
             )
 
         except IntegrityError:

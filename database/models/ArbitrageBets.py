@@ -58,6 +58,7 @@ class ArbitrageBets(Base):
 
     odds = Column('odds', DECIMAL(10, 2), nullable=False)
     stake = Column('stake', DECIMAL(10, 2), nullable=True)
+    orderbook_max_risk = Column('orderbook_max_risk', DECIMAL(10, 2), nullable=True)
 
     def __init__(
         self,
@@ -72,7 +73,8 @@ class ArbitrageBets(Base):
         team_no: int,
         team_name: str = None,
         odds=None,
-        stake=None
+        stake=None,
+        orderbook_max_risk=None,
     ):
         self.sport = sport
         self.league = league
@@ -90,6 +92,7 @@ class ArbitrageBets(Base):
 
         self.odds = odds
         self.stake = stake
+        self.orderbook_max_risk = orderbook_max_risk
 
 
 def __get_instance__():

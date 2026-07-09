@@ -48,9 +48,11 @@ from utils.storage import Storage
 from utils.stake_sizing import (
     BaseAmountStake,
     base_amount_stake_from_odds,
+    cap_base_amount_stake_to_max_risk,
     format_base_amount_stake,
     stake_from_fourcasters_fill,
 )
+from utils.fourcasters_liquidity import max_taker_risk_from_orders
 from utils.timing import time_it
 
 MLB_RUN_LINE = 1.5
@@ -323,14 +325,21 @@ class FourCastersController:
         return None, None
 
     def _live_moneyline_gross_for_team(self, game_id: str, team_no: int) -> str | None:
+        orders = self._moneyline_orders_for_team(game_id, team_no)
+        if not orders:
+            return None
+        odds = self._best_order_odds_gross(orders)
+        return self._format_american_str(odds) if odds is not None else None
+
+    def _moneyline_orders_for_team(self, game_id: str, team_no: int) -> list:
         rows = self.api.get_orderbook(game_id=game_id)
         if not rows:
-            return None
+            return []
         game = rows[0]
-        odds = self._best_order_odds_gross(
+        return list(
             game.get("awayMoneylines") if team_no == 1 else game.get("homeMoneylines")
+            or []
         )
-        return self._format_american_str(odds) if odds is not None else None
 
     def _live_moneyline_for_team(self, game_id: str, team_no: int) -> str | None:
         gross = self._live_moneyline_gross_for_team(game_id, team_no)
@@ -666,6 +675,27 @@ class FourCastersController:
                 use_odds = american_odds
 
         api_bet_type = "spread" if bet_type == "spread" else "moneyline"
+        self._last_orderbook_max_risk = None
+        if bet_type == "moneyline":
+            orders = self._moneyline_orders_for_team(game_id, team_no)
+            max_risk = max_taker_risk_from_orders(
+                orders,
+                participant_id=participant_id,
+                gross_odds=int(use_odds),
+            )
+            if max_risk is not None:
+                self._last_orderbook_max_risk = max_risk
+                self.logger.info(
+                    f"4casters orderbook max risk ${max_risk:.2f} @ {use_odds:+d} "
+                    f"(stake risk ${stake_plan.risk:.2f})"
+                )
+                if max_risk < stake_plan.risk - 0.005:
+                    self.logger.info(
+                        f"4casters capping stake to orderbook max ${max_risk:.2f} "
+                        f"(requested risk ${stake_plan.risk:.2f})"
+                    )
+                    stake_plan = cap_base_amount_stake_to_max_risk(stake_plan, max_risk)
+
         confirmed, message = self._place_bet_via_api(
             game_id,
             participant_id,
@@ -855,6 +885,7 @@ class FourCastersController:
                             driver=self._ensure_screenshot_driver(),
                             open_bets_url="https://4casters.io/my-bets/active-wagers",
                             placed_odds=placed_odds,
+                            orderbook_max_risk=getattr(self, "_last_orderbook_max_risk", None),
                         )
                     else:
                         if should_notify_failed_bet(self._last_bet_error):

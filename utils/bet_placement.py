@@ -680,6 +680,7 @@ def _build_leg_confirmed_alert(
     other_leg_placed: bool,
     *,
     ticket_number=None,
+    orderbook_max_risk: float | None = None,
 ) -> str:
     identified_at = arb.get("identified_at")
     sport = arb.get("sport")
@@ -720,6 +721,11 @@ def _build_leg_confirmed_alert(
         f"Bet: {bet_line}",
         f"Stake: {_format_real_money_stake(stake)}",
     ]
+    if orderbook_max_risk is not None and leg_no == 1:
+        try:
+            lines.append(f"Max Bet: ${float(orderbook_max_risk):.2f}")
+        except (TypeError, ValueError):
+            pass
     if ticket_line:
         lines.append(ticket_line)
     lines.extend([
@@ -924,11 +930,27 @@ def finalize_confirmed_bet_with_screenshot(
     ticket_number=None,
     placed_odds=None,
     leg_already_acknowledged: bool = False,
+    orderbook_max_risk: float | None = None,
 ) -> None:
     """Acknowledge leg immediately, capture screenshot, then finish alerts/DB."""
+    pair_key = cache.arb_pair_key_from_arb(arb)
+    odds_for_record = placed_odds if placed_odds is not None else moneyline_odd
+
     if not leg_already_acknowledged:
         acknowledge_placed_leg(
             cache, logger, arb, bookmaker, game_id, team_name=team_name
+        )
+        record_confirmed_leg(
+            cache,
+            pair_key,
+            arb,
+            bookmaker,
+            team_no,
+            team_name,
+            odds_for_record,
+            stake,
+            ticket_number=ticket_number,
+            orderbook_max_risk=orderbook_max_risk,
         )
     screenshot_path = capture_bet_screenshot_for_alert(
         logger,
@@ -960,6 +982,7 @@ def finalize_confirmed_bet_with_screenshot(
         ticket_number=ticket_number,
         placed_odds=placed_odds,
         leg_already_acknowledged=True,
+        orderbook_max_risk=orderbook_max_risk,
     )
 
 
@@ -980,6 +1003,7 @@ def finalize_confirmed_bet(
     ticket_number=None,
     placed_odds=None,
     leg_already_acknowledged: bool = False,
+    orderbook_max_risk: float | None = None,
 ):
     """Run after a bookmaker has confirmed bet acceptance (not merely clicked Place Bet)."""
     sport = arb.get("sport")
@@ -1043,6 +1067,8 @@ def finalize_confirmed_bet(
     if isinstance(stake, BaseAmountStake):
         bet_data["to_win"] = stake.to_win
         bet_data["base_amount"] = stake.base_amount
+    if orderbook_max_risk is not None:
+        bet_data["orderbook_max_risk"] = orderbook_max_risk
     if storage.save_bet(bet_data):
         logger.info("DB - Bet Saved")
     else:
@@ -1061,6 +1087,7 @@ def finalize_confirmed_bet(
         odds_for_record,
         stake,
         ticket_number=ticket_number,
+        orderbook_max_risk=orderbook_max_risk,
     )
 
     if not cache.bet_confirmed_alert_already_sent(bookmaker, bet_type, game_id):
@@ -1074,6 +1101,7 @@ def finalize_confirmed_bet(
             other_book,
             other_leg_placed,
             ticket_number=ticket_number,
+            orderbook_max_risk=orderbook_max_risk,
         )
         if real_bets_chat and _dispatch_ops_alert(
             logger,

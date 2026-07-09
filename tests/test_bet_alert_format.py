@@ -71,6 +71,43 @@ def test_leg_confirmed_alert_without_ticket():
     assert "Waiting for leg 2" in alert
 
 
+def test_leg_confirmed_alert_shows_max_bet_on_leg_one():
+    arb = _twins_arb()
+    arb["team_1_bookmaker"] = "4casters"
+    arb["team_2_bookmaker"] = "sports411"
+    alert = _build_leg_confirmed_alert(
+        arb,
+        "4casters",
+        team_no=1,
+        team_name="Minnesota Twins",
+        stake=20.0,
+        moneyline_odd=120,
+        other_book="sports411",
+        other_leg_placed=False,
+        orderbook_max_risk=3462.0,
+    )
+    assert "Max Bet: $3462.00" in alert
+    assert "Leg 1 of 2" in alert
+
+
+def test_arb_complete_shows_leg1_orderbook_max():
+    arb = _twins_arb()
+    arb["team_1_bookmaker"] = "4casters"
+    arb["team_2_bookmaker"] = "sports411"
+    alert = format_arb_complete_alert(
+        arb,
+        outcome="complete",
+        leg1_stake=(17.0, 13.82),
+        leg2_stake=(20.0, 16.0),
+        leg1_placed_odds=-123,
+        leg2_placed_odds=120,
+        leg1_orderbook_max_risk=17.0,
+    )
+    assert "max $17.00" in alert
+    assert "Orioles" not in alert  # twins arb
+    assert "Twins" in alert
+
+
 def test_arb_complete_uses_placed_odds_and_ticket():
     arb = _twins_arb()
     alert = format_arb_complete_alert(
