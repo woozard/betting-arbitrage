@@ -1,7 +1,7 @@
 import time
 
 from cache.redis_cache import RedisCache
-from utils.config import REDIS, ARB_TTL_SECONDS, GAME_PAIR_BET_COOLDOWN_SECONDS
+from utils.config import REDIS, ARB_TTL_SECONDS, GAME_PAIR_BET_COOLDOWN_SECONDS, ARB_EXECUTION_PAUSE_SECONDS
 
 
 class ArbitrageCache:
@@ -625,6 +625,38 @@ class ArbitrageCache:
 
     def has_partial_exposure(self):
         return bool(self.redis.scan("partial_exposure:*"))
+
+    def _arb_execution_pause_key(self):
+        return "arb_execution_pause"
+
+    def mark_arb_execution_pause(self, arb: dict | None = None):
+        meta = {"started_at": time.time()}
+        if arb:
+            meta["pair_key"] = self.arb_pair_key_from_arb(arb)
+            meta["match"] = f"{arb.get('team_1')} vs {arb.get('team_2')}"
+        self.redis.set(
+            self._arb_execution_pause_key(),
+            meta,
+            ttl=ARB_EXECUTION_PAUSE_SECONDS,
+        )
+
+    def is_arb_execution_paused(self):
+        return bool(self.redis.get(self._arb_execution_pause_key()))
+
+    def get_arb_execution_pause_meta(self):
+        data = self.redis.get(self._arb_execution_pause_key())
+        return data if isinstance(data, dict) else None
+
+    def arb_execution_pause_remaining_seconds(self) -> float:
+        meta = self.get_arb_execution_pause_meta() or {}
+        started = meta.get("started_at")
+        if started is None:
+            return 0.0
+        try:
+            elapsed = time.time() - float(started)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, float(ARB_EXECUTION_PAUSE_SECONDS) - elapsed)
 
     def remove_arbitrage_for_bookmaker(self, arb_data, bookmaker):
         """Remove only the confirming bookmaker's cache entry; keep the other leg actionable."""

@@ -615,6 +615,14 @@ class ArbitrageController:
             )
             return None
 
+        if self.cache.is_arb_execution_paused():
+            self.logger.info(
+                f"Skipping arb (execution pause active) - "
+                f"{bet_type} {o1['team_1']} vs {o1['team_2']} | "
+                f"{t1['bookmaker']} vs {t2['bookmaker']}"
+            )
+            return None
+
         arb_stub = {
             "team_1": o1["team_1"],
             "team_2": o1["team_2"],

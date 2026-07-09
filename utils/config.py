@@ -108,6 +108,8 @@ S411_HEDGE_PREPOSITION_WAIT_SECONDS = float(
 # One bet per book per arb pair per matchup within this window (seconds).
 GAME_PAIR_BET_COOLDOWN_SECONDS = int(os.getenv('GAME_PAIR_BET_COOLDOWN_SECONDS', '3600'))
 ARB_TTL_SECONDS = int(os.getenv('ARB_TTL_SECONDS', '300'))
+# After first-leg placement starts, block new arb scans/placement for this many seconds.
+ARB_EXECUTION_PAUSE_SECONDS = int(os.getenv('ARB_EXECUTION_PAUSE_SECONDS', '300'))
 TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',
 )

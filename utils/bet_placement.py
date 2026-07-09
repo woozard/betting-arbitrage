@@ -142,6 +142,14 @@ def should_skip_arb_leg_in_betting_loop(
         cache.remove_arbitrage_for_bookmaker(arb, bookmaker)
         return True
 
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    bet_type = arb.get("bet_type", "moneyline")
+    if should_pause_for_arb_execution_cooldown(
+        cache, arb, book_1, book_2, bookmaker, bet_type, logger
+    ):
+        return True
+
     skip, reason = cache.should_skip_arb_leg_placement(arb, bookmaker)
     if not skip:
         return False
@@ -637,6 +645,74 @@ def should_defer_for_sequential_first_leg(
     if not first_leg_book:
         return False
     return not cache.is_arb_leg_placed(arb, first_leg_book)
+
+
+def should_pause_for_arb_execution_cooldown(
+    cache,
+    arb: dict,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    bet_type: str = "moneyline",
+    logger=None,
+) -> bool:
+    """True when a global execution pause is active and this leg must wait."""
+    if not cache.is_arb_execution_paused():
+        return False
+    if may_continue_arb_during_execution_pause(
+        cache, arb, book_1, book_2, bookmaker, bet_type
+    ):
+        return False
+    if logger:
+        remaining = cache.arb_execution_pause_remaining_seconds()
+        logger.info(
+            f"Skipping — arb execution pause ({remaining:.0f}s left) | "
+            f"{bookmaker} | {arb.get('team_1')} vs {arb.get('team_2')}"
+        )
+    return True
+
+
+def may_continue_arb_during_execution_pause(
+    cache,
+    arb: dict,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    bet_type: str = "moneyline",
+) -> bool:
+    """Allow the in-flight arb's second leg while blocking new first legs."""
+    if not sequential_arb_betting_enabled(book_1, book_2):
+        return False
+    first_leg = required_first_leg_book(book_1, book_2, bookmaker)
+    if not first_leg:
+        return False
+    bm = (bookmaker or "").strip().lower()
+    if bm == (first_leg or "").strip().lower():
+        return False
+    return cache.is_arb_leg_placed(arb, first_leg)
+
+
+def mark_arb_execution_pause_if_first_leg(
+    cache,
+    arb: dict,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    logger=None,
+) -> None:
+    """Start the global execution pause when committing to place leg 1."""
+    if not is_first_leg_bookmaker(book_1, book_2, bookmaker):
+        return
+    if cache.is_arb_execution_paused():
+        return
+    from utils.config import ARB_EXECUTION_PAUSE_SECONDS
+
+    cache.mark_arb_execution_pause(arb)
+    if logger:
+        logger.info(
+            f"Arb execution pause started ({ARB_EXECUTION_PAUSE_SECONDS}s) — "
+            f"blocking new arbs | {arb.get('team_1')} vs {arb.get('team_2')}"
+        )
 
 
 def should_pause_first_leg_for_exposure(

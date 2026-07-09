@@ -193,6 +193,9 @@ def _send_opportunity_alert(cache, logger, arb_data: dict):
 
 
 def _try_insert_pair(cache, logger, o1, o2, t1_from, t2_from, bet_type) -> int:
+    if cache.is_arb_execution_paused():
+        return 0
+
     dt_reason = validate_cross_book_game_datetimes(
         o1.get("game_datetime"),
         o2.get("game_datetime"),
@@ -305,6 +308,8 @@ def scan_inline_arbs_for_odds_row(cache, logger, odd_row: dict) -> int:
     On hit: write arb cache, wake both betting loops, fire Telegram alert.
     """
     if not INLINE_ARB_SCAN_ENABLED or not odd_row:
+        return 0
+    if cache.is_arb_execution_paused():
         return 0
 
     bet_type = odd_row.get("bet_type") or "moneyline"

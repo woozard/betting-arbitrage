@@ -16,6 +16,7 @@ from utils.bet_placement import (
     should_defer_for_sequential_first_leg,
     resolve_arb_leg_stake,
     should_notify_failed_bet,
+    mark_arb_execution_pause_if_first_leg,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
     should_skip_spread_arb_for_placement,
@@ -840,6 +841,15 @@ class FourCastersController:
                         logger=self.logger,
                     )
 
+                    mark_arb_execution_pause_if_first_leg(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        self.logger,
+                    )
+
                     wait_for_s411_hedge_preposition(
                         self.cache, self.logger, arb, self.bookmaker
                     )
@@ -898,6 +908,7 @@ class FourCastersController:
                                 self._last_bet_error or "Bet not accepted by bookmaker",
                                 TELEGRAM,
                             )
+                    break
         except KeyboardInterrupt:
             self.logger.info("4casters betting stopped by user")
         finally:
