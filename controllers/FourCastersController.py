@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import time
 from datetime import datetime
 
@@ -100,6 +101,7 @@ class FourCastersController:
         self._schedule_cache = []
         self._force_relogin = False
         self._screenshot_driver = None
+        self._screenshot_lock = threading.Lock()
 
     def _ensure_screenshot_driver(self):
         from utils.fourcasters_web import ensure_fourcasters_web_session
@@ -946,10 +948,12 @@ class FourCastersController:
                             wager_odds,
                             TELEGRAM,
                             extra_lines=extra_lines or None,
-                            driver=self._ensure_screenshot_driver(),
+                            driver_factory=self._ensure_screenshot_driver,
                             open_bets_url="https://4casters.io/my-bets/active-wagers",
                             placed_odds=placed_odds,
                             orderbook_max_risk=getattr(self, "_last_orderbook_max_risk", None),
+                            async_screenshot=True,
+                            screenshot_lock=self._screenshot_lock,
                         )
                     else:
                         if should_notify_failed_bet(self._last_bet_error):

@@ -19,12 +19,21 @@ class FourCastersClient:
     def __init__(
         self,
         api_base: str | None = None,
-        max_retries: int = 4,
-        retry_sleep: float = 2.0,
+        max_retries: int | None = None,
+        retry_sleep: float | None = None,
     ):
         self.api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
-        self.max_retries = max_retries
-        self.retry_sleep = retry_sleep
+        # Fast retries so a transient error during placement doesn't cost ~15s.
+        self.max_retries = (
+            max_retries
+            if max_retries is not None
+            else int(os.getenv("FOURCASTERS_MAX_RETRIES", "4"))
+        )
+        self.retry_sleep = (
+            retry_sleep
+            if retry_sleep is not None
+            else float(os.getenv("FOURCASTERS_RETRY_SLEEP_SEC", "0.4"))
+        )
         self._token: str | None = None
 
     @property

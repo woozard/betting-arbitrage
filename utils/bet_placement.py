@@ -1150,8 +1150,18 @@ def finalize_confirmed_bet_with_screenshot(
     placed_odds=None,
     leg_already_acknowledged: bool = False,
     orderbook_max_risk: float | None = None,
+    async_screenshot: bool = False,
+    screenshot_lock=None,
+    driver_factory=None,
 ) -> None:
-    """Acknowledge leg immediately, capture screenshot, then finish alerts/DB."""
+    """Acknowledge leg immediately, then capture screenshot + finish alerts/DB.
+
+    When async_screenshot is True the leg is acknowledged synchronously (fast,
+    ~API-ack latency) and the slow screenshot + alert/DB finalize runs in a
+    background thread so the betting loop isn't blocked. Pass driver_factory
+    (instead of driver) to also resolve/spin-up the screenshot browser off the
+    critical path.
+    """
     pair_key = cache.arb_pair_key_from_arb(arb)
     odds_for_record = placed_odds if placed_odds is not None else moneyline_odd
 
@@ -1171,38 +1181,62 @@ def finalize_confirmed_bet_with_screenshot(
             ticket_number=ticket_number,
             orderbook_max_risk=orderbook_max_risk,
         )
-    screenshot_path = capture_bet_screenshot_for_alert(
-        logger,
-        bookmaker,
-        arb,
-        team_name,
-        game_id,
-        stake,
-        placed_odds if placed_odds is not None else moneyline_odd,
-        driver=driver,
-        open_bets_url=open_bets_url,
-        return_to_sport=return_to_sport,
-        extra_lines=extra_lines,
-        ticket_number=ticket_number,
-    )
-    finalize_confirmed_bet(
-        cache,
-        storage,
-        logger,
-        arb,
-        bookmaker,
-        team_no,
-        team_name,
-        game_id,
-        stake,
-        moneyline_odd,
-        telegram_config,
-        screenshot_path=screenshot_path,
-        ticket_number=ticket_number,
-        placed_odds=placed_odds,
-        leg_already_acknowledged=True,
-        orderbook_max_risk=orderbook_max_risk,
-    )
+
+    def _screenshot_then_finalize():
+        screenshot_path = None
+        try:
+            if screenshot_lock is not None:
+                screenshot_lock.acquire()
+            try:
+                shot_driver = driver
+                if shot_driver is None and driver_factory is not None:
+                    shot_driver = driver_factory()
+                screenshot_path = capture_bet_screenshot_for_alert(
+                    logger,
+                    bookmaker,
+                    arb,
+                    team_name,
+                    game_id,
+                    stake,
+                    placed_odds if placed_odds is not None else moneyline_odd,
+                    driver=shot_driver,
+                    open_bets_url=open_bets_url,
+                    return_to_sport=return_to_sport,
+                    extra_lines=extra_lines,
+                    ticket_number=ticket_number,
+                )
+            finally:
+                if screenshot_lock is not None:
+                    screenshot_lock.release()
+        except Exception as exc:
+            logger.warning(f"Bet screenshot failed (continuing to finalize): {exc}")
+
+        try:
+            finalize_confirmed_bet(
+                cache,
+                storage,
+                logger,
+                arb,
+                bookmaker,
+                team_no,
+                team_name,
+                game_id,
+                stake,
+                moneyline_odd,
+                telegram_config,
+                screenshot_path=screenshot_path,
+                ticket_number=ticket_number,
+                placed_odds=placed_odds,
+                leg_already_acknowledged=True,
+                orderbook_max_risk=orderbook_max_risk,
+            )
+        except Exception as exc:
+            logger.error(f"Bet finalize failed: {exc}", exc_info=True)
+
+    if async_screenshot:
+        threading.Thread(target=_screenshot_then_finalize, daemon=True).start()
+        return
+    _screenshot_then_finalize()
 
 
 def finalize_confirmed_bet(
