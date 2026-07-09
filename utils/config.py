@@ -174,11 +174,12 @@ def min_arb_profit_pct_for_bet_type(bet_type: str) -> float:
 
 
 # Odds watch — shared defaults (ML + spread); override per-book via env if needed.
-ODDS_WATCH_POLL_SECONDS = float(os.getenv("ODDS_WATCH_POLL_SEC", "5"))
-ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("ODDS_WATCH_FORCE_SCAN_SEC", "5"))
+ODDS_WATCH_POLL_SECONDS = float(os.getenv("ODDS_WATCH_POLL_SEC", "1"))
+ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("ODDS_WATCH_FORCE_SCAN_SEC", "1"))
 
 # Arb scanner loop delay (seconds between DB scans). Backup path when inline scan misses.
-ARB_SCAN_DELAY_SECONDS = float(os.getenv("ARB_SCAN_DELAY_SEC", "0.5"))
+# Each scan takes ~2–3s; delay 0 runs back-to-back (fastest backup cadence).
+ARB_SCAN_DELAY_SECONDS = float(os.getenv("ARB_SCAN_DELAY_SEC", "0"))
 
 # Inline arb detection on odds persist (Redis cross-book compare, sub-100ms wake).
 INLINE_ARB_SCAN_ENABLED = os.getenv("INLINE_ARB_SCAN_ENABLED", "true").lower() in (
@@ -187,7 +188,7 @@ INLINE_ARB_SCAN_ENABLED = os.getenv("INLINE_ARB_SCAN_ENABLED", "true").lower() i
 
 # Betting loops block on Redis wake queue (ms) instead of fixed multi-second sleeps.
 BET_WAKE_BLPOP_MS = int(os.getenv("BET_WAKE_BLPOP_MS", "50"))
-BETTING_IDLE_POLL_SECONDS = float(os.getenv("BETTING_IDLE_POLL_SEC", "5"))
+BETTING_IDLE_POLL_SECONDS = float(os.getenv("BETTING_IDLE_POLL_SEC", "1"))
 
 # Betamapola: Angular pick + ProcessTicket HTTP (skip DOM bet-slip UI when possible).
 BETAMAPOLA_API_PLACEMENT = os.getenv("BETAMAPOLA_API_PLACEMENT", "true").lower() in (

@@ -82,8 +82,8 @@ class Sports411Controller:
     OPEN_BETS_POLL_TIMEOUT_SECONDS = 45
     PLACE_BET_READY_TIMEOUT = 20
     MAX_SOFT_NAV_FAILURES = 3
-    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("SPORTS411_ODDS_FORCE_SCAN_SEC", "5"))
-    ODDS_WATCH_POLL_SECONDS = float(os.getenv("SPORTS411_ODDS_POLL_SEC", "5"))
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("SPORTS411_ODDS_FORCE_SCAN_SEC", "1"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("SPORTS411_ODDS_POLL_SEC", "1"))
 
     # ===================================================================
     # Multi-sport support (NBA + MLB) + remove duplicate sport override

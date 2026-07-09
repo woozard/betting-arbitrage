@@ -59,9 +59,9 @@ MLB_RUN_LINE = 1.5
 
 
 class FourCastersController:
-    ODDS_WATCH_POLL_SECONDS = float(os.getenv("FOURCASTERS_ODDS_POLL_SEC", "5"))
-    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("FOURCASTERS_ODDS_FORCE_SCAN_SEC", "5"))
-    ODDS_IDLE_POLL_SECONDS = float(os.getenv("FOURCASTERS_ODDS_IDLE_POLL_SEC", "5"))
+    ODDS_WATCH_POLL_SECONDS = float(os.getenv("FOURCASTERS_ODDS_POLL_SEC", "1"))
+    ODDS_WATCH_FORCE_SCAN_SECONDS = int(os.getenv("FOURCASTERS_ODDS_FORCE_SCAN_SEC", "1"))
+    ODDS_IDLE_POLL_SECONDS = float(os.getenv("FOURCASTERS_ODDS_IDLE_POLL_SEC", "1"))
 
     def __init__(self, account, site, sport="baseball"):
         self.account_id = account.account
