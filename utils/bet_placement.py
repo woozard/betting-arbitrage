@@ -9,6 +9,7 @@ from utils.config import (
     SPREAD_REAL_MONEY_BETTING_ENABLED,
     BETAMAPOLA_REAL_MONEY_BETTING_ENABLED,
     SEQUENTIAL_ARB_BETTING,
+    PARALLEL_EXCHANGE_ARB_BETTING,
     TELEGRAM_ALERTS_ASYNC,
     SECOND_LEG_ODDS_TOLERANCE,
     SPREAD_SECOND_LEG_ODDS_TOLERANCE,
@@ -425,8 +426,23 @@ def is_first_leg_bookmaker(book_1: str, book_2: str, bookmaker: str) -> bool:
     return legs[0] == (bookmaker or "").strip().lower()
 
 
+def parallel_arb_betting_enabled(book_1: str, book_2: str) -> bool:
+    """Both legs place immediately on exchange-first pairs (e.g. 4casters + S411)."""
+    if SEQUENTIAL_ARB_BETTING:
+        return False
+    if not PARALLEL_EXCHANGE_ARB_BETTING:
+        return False
+    legs = arb_pair_legs(book_1, book_2)
+    if not legs:
+        return False
+    first, _ = legs
+    return first in EXCHANGE_FIRST_BOOKMAKERS
+
+
 def sequential_arb_betting_enabled(book_1: str, book_2: str) -> bool:
     """Sequential legs when env flag is on or the configured first leg is an exchange."""
+    if parallel_arb_betting_enabled(book_1, book_2):
+        return False
     if SEQUENTIAL_ARB_BETTING:
         return True
     legs = arb_pair_legs(book_1, book_2)
@@ -442,6 +458,8 @@ def should_s411_exchange_hedge_preposition(
     """True when S411 should pre-open betslip while waiting for an exchange leg-1 fill."""
     from utils.config import S411_EXCHANGE_HEDGE_PREPOSITION
 
+    if parallel_arb_betting_enabled(book_1, book_2):
+        return False
     if not S411_EXCHANGE_HEDGE_PREPOSITION:
         return False
     if (bet_type or "moneyline").strip().lower() != "moneyline":
@@ -524,7 +542,7 @@ def wait_for_s411_hedge_preposition(cache, logger, arb: dict, bookmaker: str) ->
 
 
 def store_arbitrage_for_both_books(cache, arb_data: dict) -> None:
-    """Write arb to both book caches; S411 entry first when pre-position applies."""
+    """Write arb to both book caches; wake both books immediately."""
     bet_type = arb_data.get("bet_type", "moneyline")
     entries = [
         (arb_data["team_1_bookmaker"], arb_data["team_1_game_id"]),
@@ -532,14 +550,27 @@ def store_arbitrage_for_both_books(cache, arb_data: dict) -> None:
     ]
     book_1 = arb_data.get("team_1_bookmaker")
     book_2 = arb_data.get("team_2_bookmaker")
-    if should_s411_exchange_hedge_preposition(
-        book_1, book_2, "sports411", bet_type
+    if (
+        not parallel_arb_betting_enabled(book_1, book_2)
+        and should_s411_exchange_hedge_preposition(
+            book_1, book_2, "sports411", bet_type
+        )
     ):
         entries.sort(
             key=lambda row: 0 if (row[0] or "").strip().lower() == "sports411" else 1
         )
     for bookmaker, game_id in entries:
         cache.add_arbitrage(bookmaker, bet_type, game_id, arb_data)
+
+
+def _planned_first_leg_stake(arb: dict, first_leg_book: str, default_base: float):
+    """Stake plan for the exchange leg from scan odds (parallel hedge sizing)."""
+    from utils.stake_sizing import base_amount_stake_from_odds
+
+    leg = arb_leg_for_book(arb, first_leg_book)
+    if not leg:
+        return None
+    return base_amount_stake_from_odds(leg.get("odds"), default_base)
 
 
 def _confirmed_other_leg_stake(cache, arb: dict, bookmaker: str) -> BaseAmountStake | None:
@@ -591,6 +622,26 @@ def resolve_arb_leg_stake(
     logger=None,
 ) -> float:
     """Return base-amount stake for this leg (fill-linked on second leg when sequential)."""
+    if parallel_arb_betting_enabled(book_1, book_2):
+        if is_first_leg_bookmaker(book_1, book_2, bookmaker):
+            return default_base
+        first_leg = required_first_leg_book(book_1, book_2, bookmaker)
+        if not first_leg:
+            return default_base
+        planned = _planned_first_leg_stake(arb, first_leg, default_base)
+        if planned is None:
+            return default_base
+        hedged_base = hedge_base_amount_from_first_leg(
+            planned.risk, planned.to_win, wager_odds
+        )
+        if logger:
+            logger.info(
+                f"Parallel hedge stake | planned leg1 risk=${planned.risk:.2f} "
+                f"to-win=${planned.to_win:.2f} → leg2 base=${hedged_base:.2f} "
+                f"@ {wager_odds}"
+            )
+        return hedged_base
+
     if not sequential_arb_betting_enabled(book_1, book_2):
         return default_base
     if is_first_leg_bookmaker(book_1, book_2, bookmaker):
@@ -681,6 +732,12 @@ def may_continue_arb_during_execution_pause(
     bet_type: str = "moneyline",
 ) -> bool:
     """Allow the in-flight arb's second leg while blocking new first legs."""
+    if parallel_arb_betting_enabled(book_1, book_2):
+        pair_key = cache.arb_pair_key_from_arb(arb)
+        pause_meta = cache.get_arb_execution_pause_meta() or {}
+        if pause_meta.get("pair_key") == pair_key:
+            return True
+        return False
     if not sequential_arb_betting_enabled(book_1, book_2):
         return False
     first_leg = required_first_leg_book(book_1, book_2, bookmaker)
@@ -689,7 +746,15 @@ def may_continue_arb_during_execution_pause(
     bm = (bookmaker or "").strip().lower()
     if bm == (first_leg or "").strip().lower():
         return False
-    return cache.is_arb_leg_placed(arb, first_leg)
+    if cache.is_arb_leg_placed(arb, first_leg):
+        return True
+    pair_key = cache.arb_pair_key_from_arb(arb)
+    if cache.has_partial_exposure_for_pair(pair_key):
+        return True
+    pause_meta = cache.get_arb_execution_pause_meta() or {}
+    if pause_meta.get("pair_key") == pair_key:
+        return True
+    return False
 
 
 def mark_arb_execution_pause_if_first_leg(
@@ -701,7 +766,24 @@ def mark_arb_execution_pause_if_first_leg(
     logger=None,
 ) -> None:
     """Start the global execution pause when committing to place leg 1."""
-    if not is_first_leg_bookmaker(book_1, book_2, bookmaker):
+    mark_arb_execution_pause_on_placement_start(
+        cache, arb, book_1, book_2, bookmaker, logger
+    )
+
+
+def mark_arb_execution_pause_on_placement_start(
+    cache,
+    arb: dict,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    logger=None,
+) -> None:
+    """Start execution pause when an arb begins placing (leg 1 sequential, or either leg parallel)."""
+    if parallel_arb_betting_enabled(book_1, book_2):
+        if cache.is_arb_execution_paused():
+            return
+    elif not is_first_leg_bookmaker(book_1, book_2, bookmaker):
         return
     if cache.is_arb_execution_paused():
         return
@@ -709,8 +791,9 @@ def mark_arb_execution_pause_if_first_leg(
 
     cache.mark_arb_execution_pause(arb)
     if logger:
+        mode = "parallel" if parallel_arb_betting_enabled(book_1, book_2) else "sequential"
         logger.info(
-            f"Arb execution pause started ({ARB_EXECUTION_PAUSE_SECONDS}s) — "
+            f"Arb execution pause started ({ARB_EXECUTION_PAUSE_SECONDS}s, {mode}) — "
             f"blocking new arbs | {arb.get('team_1')} vs {arb.get('team_2')}"
         )
 
@@ -734,15 +817,18 @@ def should_pause_first_leg_for_exposure(
         return cache.has_partial_exposure()
 
     pair_key = cache.arb_pair_key_from_arb(arb)
-    if not cache.has_partial_exposure_for_pair(pair_key):
-        return False
-
     bm = (bookmaker or "").strip().lower()
     b1 = (book_1 or "").strip().lower()
     other_book = book_2 if bm == b1 else book_1
-    if cache.is_arb_leg_placed(arb, other_book):
-        return False
-    return True
+    other_leg_placed = cache.is_arb_leg_placed(arb, other_book)
+
+    if cache.is_arb_leg_placed(arb, bookmaker) and not other_leg_placed:
+        return True
+    if cache.has_partial_exposure_for_pair(pair_key) and not other_leg_placed:
+        return True
+    if cache.has_other_pair_partial_on_book_game(arb, bookmaker):
+        return True
+    return False
 
 
 def _build_leg_confirmed_alert(
@@ -808,6 +894,63 @@ def _build_leg_confirmed_alert(
         "",
         f"Arb spotted: {format_utc_timestamp(identified_at)}",
         f"Status: {status}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _build_repeat_leg1_exposure_alert(
+    arb: dict,
+    bookmaker: str,
+    team_no: int,
+    team_name: str,
+    stake: float,
+    moneyline_odd,
+    other_book: str,
+    *,
+    ticket_number=None,
+    orderbook_max_risk: float | None = None,
+) -> str:
+    """Warn when a second leg-1 fill lands on the same game (added unhedged exposure)."""
+    team_1 = arb.get("team_1")
+    team_2 = arb.get("team_2")
+    bet_type = arb.get("bet_type", "moneyline")
+    book_1 = arb.get("team_1_bookmaker")
+    book_2 = arb.get("team_2_bookmaker")
+    book_label = _book_alert_label(bookmaker)
+    other_label = _book_alert_label(other_book)
+    pair = f"{_book_alert_label(book_1)} × {_book_alert_label(book_2)}"
+    bet_line = _format_placed_bet_line(arb, team_name, team_no, moneyline_odd)
+    game_schedule = format_arb_game_schedule(arb)
+    ticket_line = format_alert_ticket_line(ticket_number)
+
+    market = bet_type
+    if bet_type == "spread":
+        market = f"spread ({arb.get('spread_value')})"
+
+    lines = [
+        "===== WARNING — Duplicate Leg 1 (Added Exposure) =====",
+        "",
+        f"{team_1} vs {team_2}",
+        f"Date: {game_schedule}",
+        "",
+        f"Book: {book_label} · leg 1/2 · {pair}",
+        f"Market: {market}",
+        f"Bet: {bet_line}",
+        f"Stake: {_format_real_money_stake(stake)}",
+        "⚠️ Another leg-1 fill on this game — hedge still incomplete.",
+        f"Still waiting for leg 2 on {other_label}",
+    ]
+    if orderbook_max_risk is not None:
+        try:
+            lines.append(f"Max Bet: ${float(orderbook_max_risk):.2f}")
+        except (TypeError, ValueError):
+            pass
+    if ticket_line:
+        lines.append(ticket_line)
+    lines.extend([
+        "",
+        f"Arb spotted: {format_utc_timestamp(arb.get('identified_at'))}",
         "",
     ])
     return "\n".join(lines)
@@ -1187,10 +1330,38 @@ def finalize_confirmed_bet(
         ):
             cache.mark_bet_confirmed_alert_sent(bookmaker, bet_type, game_id)
     else:
-        logger.info(
-            f"Skipping duplicate leg-confirmed Telegram alert - {bookmaker}/{team_name} | "
-            f"{team_1} vs {team_2} | game_id={game_id}"
-        )
+        if other_leg_placed:
+            logger.info(
+                f"Skipping duplicate leg-confirmed Telegram alert - {bookmaker}/{team_name} | "
+                f"{team_1} vs {team_2} | game_id={game_id}"
+            )
+        else:
+            repeat_alert = _build_repeat_leg1_exposure_alert(
+                arb,
+                bookmaker,
+                team_no,
+                team_name,
+                stake,
+                odds_for_record,
+                other_book,
+                ticket_number=ticket_number,
+                orderbook_max_risk=orderbook_max_risk,
+            )
+            if real_bets_chat and _dispatch_ops_alert(
+                logger,
+                repeat_alert,
+                real_bets_chat,
+                label="Duplicate Leg 1 Exposure Alert",
+            ):
+                logger.info(
+                    f"Sent duplicate leg-1 exposure warning - {bookmaker}/{team_name} | "
+                    f"{team_1} vs {team_2} | game_id={game_id}"
+                )
+            else:
+                logger.info(
+                    f"Skipping duplicate leg-confirmed Telegram alert - {bookmaker}/{team_name} | "
+                    f"{team_1} vs {team_2} | game_id={game_id}"
+                )
 
     if screenshot_path and os.path.isfile(screenshot_path) and screenshots_chat:
         _dispatch_ops_alert(

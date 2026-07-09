@@ -39,8 +39,6 @@ def _game_still_actionable(parsed: dict, meta: dict | None) -> bool:
 
 def cleanup_stale_partial_exposure(cache, logger, max_age_seconds=None):
     """Clear abandoned partial-exposure flags and unlock stale arb scans."""
-    max_age = max_age_seconds or DEFAULT_MAX_AGE_SECONDS
-    now = time.time()
     cleared = 0
 
     legacy_removed = cache.purge_legacy_leg_placed_keys()
@@ -57,17 +55,12 @@ def cleanup_stale_partial_exposure(cache, logger, max_age_seconds=None):
             continue
 
         meta = cache.get_partial_exposure_meta(pair_key) or {}
-        marked_at = meta.get("marked_at")
-        age = (now - float(marked_at)) if marked_at else (max_age + 1)
-
         game_still_actionable = _game_still_actionable(parsed, meta)
-        if age <= max_age and game_still_actionable:
+        if game_still_actionable:
+            # Keep unhedged exposure until the game starts — do not clear on age alone.
             continue
 
-        if not game_still_actionable:
-            reason = "game started or finished"
-        else:
-            reason = f"exposure age {age:.0f}s"
+        reason = "game started or finished"
         cache.clear_partial_exposure(pair_key)
         cache.clear_arb_legs_for_pair_key(pair_key)
         arb_stub = {

@@ -482,6 +482,22 @@ class ArbitrageCache:
             self.redis.get(self._game_pair_daily_bet_key(pair_key, bookmaker, bet_type))
         )
 
+    def _game_pair_bet_cooldown_ttl(self, arb: dict | None) -> int:
+        """Cooldown lasts until game start (or default), capped at lock_ttl."""
+        from datetime import datetime
+
+        from utils.helpers import parse_game_datetime
+
+        default = GAME_PAIR_BET_COOLDOWN_SECONDS
+        if not arb:
+            return default
+        gdt = arb.get("game_datetime") or arb.get("game_date")
+        dt = parse_game_datetime(gdt)
+        if not dt:
+            return default
+        remaining = (dt - datetime.utcnow()).total_seconds() + 7200
+        return max(default, min(int(remaining), self.lock_ttl))
+
     def mark_game_pair_daily_bet(
         self, arb: dict, bookmaker: str, game_id: str | None = None
     ) -> None:
@@ -490,6 +506,7 @@ class ArbitrageCache:
         bet_type = (arb.get("bet_type") or "moneyline").strip().lower()
         bm = (bookmaker or "").strip().lower()
         gid = game_id or self.game_id_for_book(arb, bookmaker)
+        cooldown_ttl = self._game_pair_bet_cooldown_ttl(arb)
         self.redis.set(
             self._game_pair_daily_bet_key(pair_key, bookmaker, bet_type),
             {
@@ -498,9 +515,9 @@ class ArbitrageCache:
                 "pair_key": pair_key,
                 "bookmaker": bm,
                 "bet_type": bet_type,
-                "cooldown_seconds": GAME_PAIR_BET_COOLDOWN_SECONDS,
+                "cooldown_seconds": cooldown_ttl,
             },
-            ttl=GAME_PAIR_BET_COOLDOWN_SECONDS,
+            ttl=cooldown_ttl,
         )
 
     def purge_legacy_leg_placed_keys(self) -> int:

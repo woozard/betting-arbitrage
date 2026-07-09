@@ -114,7 +114,7 @@ def test_cleanup_clears_after_game_start():
     assert not cache.has_partial_exposure_for_pair(pair_key)
 
 
-def test_cleanup_clears_stale_age_even_when_pregame():
+def test_cleanup_keeps_pregame_exposure_past_max_age():
     cache = ArbitrageCache()
     cache.redis = MemRedis()
     pair_key = (
@@ -129,4 +129,5 @@ def test_cleanup_clears_stale_age_even_when_pregame():
     logger = logging.getLogger("test_exposure_cleanup")
 
     cleared = cleanup_stale_partial_exposure(cache, logger, max_age_seconds=3600)
-    assert cleared == 1
+    assert cleared == 0
+    assert cache.has_partial_exposure_for_pair(pair_key)

@@ -17,11 +17,15 @@ class _FakeRedis:
 
 
 class _FakeCache:
-    def __init__(self, *, paused=False, leg_placed=None):
+    def __init__(self, *, paused=False, leg_placed=None, partial_exposure=False, pause_pair_key=None):
+        pause_meta = {"started_at": 1.0}
+        if pause_pair_key:
+            pause_meta["pair_key"] = pause_pair_key
         self.redis = _FakeRedis(
-            {"arb_execution_pause": {"started_at": 1.0}} if paused else {}
+            {"arb_execution_pause": pause_meta} if paused else {}
         )
         self._leg_placed = leg_placed or {}
+        self._partial_exposure = partial_exposure
 
     def is_arb_execution_paused(self):
         return bool(self.redis.get("arb_execution_pause"))
@@ -38,6 +42,12 @@ class _FakeCache:
     def is_arb_leg_placed(self, arb, bookmaker):
         return self._leg_placed.get((bookmaker or "").lower(), False)
 
+    def has_partial_exposure_for_pair(self, pair_key):
+        return self._partial_exposure
+
+    def get_arb_execution_pause_meta(self):
+        return self.redis.get("arb_execution_pause")
+
 
 def _arb():
     return {
@@ -48,7 +58,8 @@ def _arb():
     }
 
 
-def test_mark_pause_only_for_first_leg_book():
+def test_mark_pause_only_for_first_leg_book(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     cache = _FakeCache()
     mark_arb_execution_pause_if_first_leg(
         cache, _arb(), "sports411", "4casters", "4casters"
@@ -62,7 +73,8 @@ def test_mark_pause_only_for_first_leg_book():
     assert not cache2.is_arb_execution_paused()
 
 
-def test_pause_blocks_new_first_leg():
+def test_pause_blocks_new_first_leg(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     cache = _FakeCache(paused=True)
     arb = _arb()
     assert should_pause_for_arb_execution_cooldown(
@@ -70,12 +82,31 @@ def test_pause_blocks_new_first_leg():
     )
 
 
-def test_pause_allows_second_leg_after_first_confirmed():
+def test_pause_allows_second_leg_after_first_confirmed(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     cache = _FakeCache(paused=True, leg_placed={"4casters": True})
     arb = _arb()
     assert not should_pause_for_arb_execution_cooldown(
         cache, arb, "sports411", "4casters", "sports411", "moneyline"
     )
     assert may_continue_arb_during_execution_pause(
+        cache, arb, "sports411", "4casters", "sports411", "moneyline"
+    )
+
+
+def test_pause_allows_second_leg_for_in_flight_pair_before_ack(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
+    cache = _FakeCache(paused=True, pause_pair_key="pair:test")
+    arb = _arb()
+    assert not should_pause_for_arb_execution_cooldown(
+        cache, arb, "sports411", "4casters", "sports411", "moneyline"
+    )
+
+
+def test_pause_allows_second_leg_when_partial_exposure_exists(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
+    cache = _FakeCache(paused=True, partial_exposure=True)
+    arb = _arb()
+    assert not should_pause_for_arb_execution_cooldown(
         cache, arb, "sports411", "4casters", "sports411", "moneyline"
     )

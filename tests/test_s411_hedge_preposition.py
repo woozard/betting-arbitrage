@@ -72,6 +72,7 @@ class _FakeCache:
 
 def test_should_s411_exchange_hedge_preposition_for_4cast_pair(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     monkeypatch.setattr(
         "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
     )
@@ -88,6 +89,7 @@ def test_should_s411_exchange_hedge_preposition_for_4cast_pair(monkeypatch):
 
 def test_acknowledge_placed_leg_wakes_second_book_for_exchange_first(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     cache = _FakeCache()
     arb = {
         "team_1": "A",
@@ -110,6 +112,7 @@ def test_acknowledge_placed_leg_wakes_second_book_for_exchange_first(monkeypatch
 
 def test_should_wait_for_s411_hedge_preposition_on_4cast_first_leg(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     monkeypatch.setattr(
         "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
     )
@@ -124,6 +127,7 @@ def test_should_wait_for_s411_hedge_preposition_on_4cast_first_leg(monkeypatch):
 
 def test_wait_for_s411_hedge_preposition_returns_when_redis_ready(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     monkeypatch.setattr(
         "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
     )
@@ -162,6 +166,7 @@ def test_wait_for_s411_hedge_preposition_returns_when_redis_ready(monkeypatch):
 
 def test_store_arbitrage_puts_sports411_first(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     monkeypatch.setattr(
         "utils.config.S411_EXCHANGE_HEDGE_PREPOSITION", True, raising=False
     )

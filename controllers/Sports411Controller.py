@@ -47,6 +47,7 @@ from utils.bet_placement import (
     should_defer_for_sequential_first_leg,
     resolve_arb_leg_stake,
     should_s411_exchange_hedge_preposition,
+    mark_arb_execution_pause_on_placement_start,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
@@ -3236,6 +3237,15 @@ class Sports411Controller:
                         self.logger.info(
                             f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
                         )
+
+                    mark_arb_execution_pause_on_placement_start(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        self.logger,
+                    )
 
                     stake = resolve_arb_leg_stake(
                         self.cache,

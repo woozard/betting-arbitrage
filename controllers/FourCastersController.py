@@ -16,12 +16,11 @@ from utils.bet_placement import (
     should_defer_for_sequential_first_leg,
     resolve_arb_leg_stake,
     should_notify_failed_bet,
-    mark_arb_execution_pause_if_first_leg,
+    mark_arb_execution_pause_on_placement_start,
     should_pause_first_leg_for_exposure,
     odds_tolerance_for_placement,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
-    wait_for_s411_hedge_preposition,
 )
 from utils.betting_watchdog import (
     BettingLoopWatchdog,
@@ -819,6 +818,10 @@ class FourCastersController:
                     if should_pause_first_leg_for_exposure(
                         self.cache, book_1, book_2, self.bookmaker, arb, bet_type
                     ):
+                        self.logger.info(
+                            f"Skipping arb — open partial exposure; pausing new first legs | "
+                            f"{team_1} vs {team_2}"
+                        )
                         continue
 
                     if should_defer_for_sequential_first_leg(
@@ -841,17 +844,13 @@ class FourCastersController:
                         logger=self.logger,
                     )
 
-                    mark_arb_execution_pause_if_first_leg(
+                    mark_arb_execution_pause_on_placement_start(
                         self.cache,
                         arb,
                         book_1,
                         book_2,
                         self.bookmaker,
                         self.logger,
-                    )
-
-                    wait_for_s411_hedge_preposition(
-                        self.cache, self.logger, arb, self.bookmaker
                     )
 
                     bet_placed, stake_used = self.__execute_bet(

@@ -97,7 +97,11 @@ BETAMAPOLA_REAL_MONEY_BETTING_ENABLED = os.getenv(
 SEQUENTIAL_ARB_BETTING = os.getenv('SEQUENTIAL_ARB_BETTING', 'false').lower() in (
     '1', 'true', 'yes',
 )
-# S411 leg 2: open betslip while waiting for 4casters fill, then stake+click on ack.
+# Place both legs at once on exchange pairs (4casters + S411): no wait for pre-position or leg-1 ack.
+PARALLEL_EXCHANGE_ARB_BETTING = os.getenv(
+    'PARALLEL_EXCHANGE_ARB_BETTING', 'true'
+).lower() in ('1', 'true', 'yes')
+# Legacy sequential path: open S411 betslip while waiting for 4casters fill, then stake+click on ack.
 S411_EXCHANGE_HEDGE_PREPOSITION = os.getenv(
     'S411_EXCHANGE_HEDGE_PREPOSITION', 'true'
 ).lower() in ('1', 'true', 'yes')

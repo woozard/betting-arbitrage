@@ -33,11 +33,23 @@ def test_arb_pair_legs_fourcasters_first():
 
 def test_sequential_enabled_for_exchange_first_pair_without_env_flag(monkeypatch):
     monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     assert sequential_arb_betting_enabled("sports411", "4casters") is True
     assert sequential_arb_betting_enabled("sports411", "betamapola") is False
 
 
-def test_should_defer_second_leg_until_first_confirmed():
+def test_parallel_enabled_for_exchange_pair_by_default(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.SEQUENTIAL_ARB_BETTING", False)
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", True)
+    from utils.bet_placement import parallel_arb_betting_enabled
+
+    assert parallel_arb_betting_enabled("sports411", "4casters") is True
+    assert sequential_arb_betting_enabled("sports411", "4casters") is False
+    assert sequential_arb_betting_enabled("sports411", "betamapola") is False
+
+
+def test_should_defer_second_leg_until_first_confirmed(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     arb = {
         "team_1": "A",
         "team_2": "B",
@@ -55,7 +67,8 @@ def test_should_defer_second_leg_until_first_confirmed():
     ) is False
 
 
-def test_resolve_arb_leg_stake_sizes_from_first_leg_fill():
+def test_resolve_arb_leg_stake_sizes_from_first_leg_fill(monkeypatch):
+    monkeypatch.setattr("utils.bet_placement.PARALLEL_EXCHANGE_ARB_BETTING", False)
     arb = {
         "team_1": "Mariners",
         "team_2": "Orioles",
