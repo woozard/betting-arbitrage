@@ -32,6 +32,7 @@ from utils.helpers import (
     send_monitoring_alert,
     spread_values_match,
 )
+from utils.bet_screenshot import verify_s411_open_bet_ticket
 from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
@@ -2205,44 +2206,57 @@ class Sports411Controller:
         page_compact = page_l.lower().replace(" ", "")
         return any(p.replace(" ", "").lower() in page_compact for p in patterns)
 
+    @staticmethod
+    def _open_bet_odds_value(stake, expected_odds=None):
+        if expected_odds is not None:
+            from utils.stake_sizing import BaseAmountStake
+
+            if isinstance(expected_odds, BaseAmountStake):
+                return int(expected_odds.american_odds)
+            try:
+                return int(expected_odds)
+            except (TypeError, ValueError):
+                pass
+        from utils.stake_sizing import BaseAmountStake
+
+        if isinstance(stake, BaseAmountStake):
+            return int(stake.american_odds)
+        return None
+
     def _verify_open_bet_on_pending(
-        self, team_name: str, stake: float, *, expected_odds=None
+        self,
+        team_name: str,
+        stake,
+        *,
+        expected_odds=None,
+        team_1: str = "",
+        team_2: str = "",
     ):
-        try:
-            page = self._fetch_pending_page_text()
-            if not page or team_name.lower() not in (page or "").lower():
-                self.driver.get(self._open_bets_url())
-                time.sleep(2.5)
-                page = self.driver.page_source
-                self._return_to_sport_page()
-
-            page_l = (page or "").lower()
-            team_l = team_name.lower()
-            if team_l not in page_l:
-                return False, "Bet not found on open bets page"
-            if expected_odds is not None:
-                from utils.stake_sizing import BaseAmountStake
-
-                odds_val = (
-                    int(expected_odds)
-                    if not isinstance(expected_odds, BaseAmountStake)
-                    else int(expected_odds.american_odds)
-                )
-                odds_patterns = [
-                    f"ml{odds_val:+d}".lower().replace("+", ""),
-                    f"{odds_val:+d}",
-                    str(odds_val),
-                ]
-                if not any(p.replace("+", "") in page_l.replace(" ", "") for p in odds_patterns):
-                    return False, f"Open bet odds {odds_val:+d} not found for {team_name}"
-            if self._stake_on_open_bets_page(page, stake):
-                return True, "Open bet found on open bets page"
-            return False, "Team found on open bets page but stake not verified"
-        except Exception as e:
-            return False, f"Could not verify open bet: {e}"
+        odds = self._open_bet_odds_value(stake, expected_odds)
+        if odds is None:
+            return False, "Open bet verification requires expected odds"
+        confirmed, message = verify_s411_open_bet_ticket(
+            self.driver,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+            stake=stake,
+            open_bets_url=self._open_bets_url(),
+            logger=self.logger,
+            return_to_sport=self._return_to_sport_page,
+        )
+        return confirmed, message
 
     def _poll_open_bet_on_pending(
-        self, team_name: str, stake: float, timeout: int = None
+        self,
+        team_name: str,
+        stake,
+        timeout: int = None,
+        *,
+        expected_odds=None,
+        team_1: str = "",
+        team_2: str = "",
     ):
         """SendBets uses asyncPost — wager may appear on open-bets after WagerResult:false."""
         timeout = timeout or self.OPEN_BETS_POLL_TIMEOUT_SECONDS
@@ -2250,7 +2264,13 @@ class Sports411Controller:
         attempt = 0
         while time.time() < deadline:
             attempt += 1
-            confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
+            confirmed, message = self._verify_open_bet_on_pending(
+                team_name,
+                stake,
+                expected_odds=expected_odds,
+                team_1=team_1,
+                team_2=team_2,
+            )
             if confirmed:
                 self.logger.info(
                     f"Open bet confirmed (poll {attempt}): {message}"
@@ -2262,15 +2282,32 @@ class Sports411Controller:
             time.sleep(2)
         return False, "Bet not found on open bets page after polling"
 
-    def _recover_bet_from_open_bets(self, team_name: str, stake: float) -> tuple:
+    def _recover_bet_from_open_bets(
+        self,
+        team_name: str,
+        stake,
+        *,
+        expected_odds=None,
+        team_1: str = "",
+        team_2: str = "",
+    ) -> tuple:
         """True when the book accepted the wager even if SendBets/confirm failed."""
-        return self._poll_open_bet_on_pending(team_name, stake)
+        return self._poll_open_bet_on_pending(
+            team_name,
+            stake,
+            expected_odds=expected_odds,
+            team_1=team_1,
+            team_2=team_2,
+        )
 
     def _confirm_bet_accepted(
         self,
         team_name: str,
-        stake: float,
+        stake,
         timeout: int = None,
+        *,
+        team_1: str = "",
+        team_2: str = "",
     ):
         timeout = timeout or self.CONFIRM_TIMEOUT_SECONDS
         deadline = time.time() + timeout
@@ -2318,7 +2355,10 @@ class Sports411Controller:
                         f"SendBets API rejected ({detail}); checking open bets (asyncPost)"
                     )
                     confirmed, open_msg = self._recover_bet_from_open_bets(
-                        team_name, stake
+                        team_name,
+                        stake,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
                     if confirmed:
                         return True, f"Open bet confirmed ({open_msg})"
@@ -2333,7 +2373,10 @@ class Sports411Controller:
                     if self._message_requires_relogin(body):
                         self._invalidate_wager_session()
                     confirmed, open_msg = self._recover_bet_from_open_bets(
-                        team_name, stake
+                        team_name,
+                        stake,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
                     if confirmed:
                         return True, f"Open bet confirmed ({open_msg})"
@@ -2351,7 +2394,12 @@ class Sports411Controller:
             self.logger.warning(
                 "SendBets seen without acceptance; polling open bets page"
             )
-            confirmed, message = self._recover_bet_from_open_bets(team_name, stake)
+            confirmed, message = self._recover_bet_from_open_bets(
+                team_name,
+                stake,
+                team_1=team_1,
+                team_2=team_2,
+            )
             if confirmed:
                 return True, message
             return False, "SendBets returned no acceptance and bet not on open bets"
@@ -2359,7 +2407,12 @@ class Sports411Controller:
         self.logger.warning(
             f"No API confirmation within {timeout}s; checking open bets page"
         )
-        confirmed, message = self._verify_open_bet_on_pending(team_name, stake)
+        confirmed, message = self._verify_open_bet_on_pending(
+            team_name,
+            stake,
+            team_1=team_1,
+            team_2=team_2,
+        )
         if confirmed:
             return True, message
         return False, message
@@ -2374,6 +2427,9 @@ class Sports411Controller:
         stake: float = 1.0,
         bet_type: str = "moneyline",
         spread_line: float | None = None,
+        *,
+        team_1: str = "",
+        team_2: str = "",
     ):
         self.logger.info("========== Execute Bet (START) ==========")
         self._last_bet_error = None
@@ -2395,10 +2451,16 @@ class Sports411Controller:
                         stake,
                         bet_type=bet_type,
                         spread_line=spread_line,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
                 except Exception as e:
                     confirmed, open_msg = self._verify_open_bet_on_pending(
-                        team_name, stake_plan
+                        team_name,
+                        stake_plan,
+                        expected_odds=stake_plan,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
                     if confirmed:
                         self.logger.info(
@@ -2418,7 +2480,12 @@ class Sports411Controller:
 
         except Exception as e:
             self._last_bet_error = str(e)
-            confirmed, pending_msg = self._recover_bet_from_open_bets(team_name, stake_plan)
+            confirmed, pending_msg = self._recover_bet_from_open_bets(
+                team_name,
+                stake_plan,
+                team_1=team_1,
+                team_2=team_2,
+            )
             if confirmed:
                 self.logger.info(
                     f"Place Bet raised '{e}' but bet is on open bets: {pending_msg}"
@@ -2525,6 +2592,9 @@ class Sports411Controller:
         stake_plan: BaseAmountStake,
         moneyline_odd: str,
         team_name: str,
+        *,
+        team_1: str = "",
+        team_2: str = "",
     ):
         """Fill stake on an open betslip and click Place Bet."""
         try:
@@ -2588,7 +2658,12 @@ class Sports411Controller:
                 "No wager network activity detected immediately after Place Bet click"
             )
 
-        confirmed, message = self._confirm_bet_accepted(team_name, stake_plan)
+        confirmed, message = self._confirm_bet_accepted(
+            team_name,
+            stake_plan,
+            team_1=team_1,
+            team_2=team_2,
+        )
         if not confirmed:
             raise Exception(message or "Bet not accepted by bookmaker")
 
@@ -2658,7 +2733,11 @@ class Sports411Controller:
         stake_plan = base_amount_stake_from_odds(wager_odds, stake)
 
         already_open, open_msg = self._verify_open_bet_on_pending(
-            team_name, stake_plan, expected_odds=stake_plan
+            team_name,
+            stake_plan,
+            expected_odds=stake_plan,
+            team_1=team_1,
+            team_2=team_2,
         )
         if already_open:
             self.logger.info(
@@ -2689,7 +2768,11 @@ class Sports411Controller:
                     f"{format_base_amount_stake(stake_plan)}"
                 )
                 bet_placed, stake_used = self._submit_betslip_wager(
-                    stake_plan, wager_odds, team_name
+                    stake_plan,
+                    wager_odds,
+                    team_name,
+                    team_1=team_1,
+                    team_2=team_2,
                 )
             else:
                 self.logger.info(
@@ -2702,6 +2785,8 @@ class Sports411Controller:
                     stake,
                     bet_type=bet_type,
                     spread_line=spread_line,
+                    team_1=team_1,
+                    team_2=team_2,
                 )
         finally:
             self._clear_hedge_preposition(pair_key)
@@ -2716,6 +2801,9 @@ class Sports411Controller:
         stake: float = 1.0,
         bet_type: str = "moneyline",
         spread_line: float | None = None,
+        *,
+        team_1: str = "",
+        team_2: str = "",
     ):
         stake_plan = base_amount_stake_from_odds(moneyline_odd, stake)
         market_label = (
@@ -2727,7 +2815,11 @@ class Sports411Controller:
         )
 
         already_open, open_msg = self._verify_open_bet_on_pending(
-            team_name, stake_plan, expected_odds=stake_plan
+            team_name,
+            stake_plan,
+            expected_odds=stake_plan,
+            team_1=team_1,
+            team_2=team_2,
         )
         if already_open:
             self.logger.info(
@@ -2743,7 +2835,13 @@ class Sports411Controller:
             bet_type=bet_type,
             spread_line=spread_line,
         )
-        return self._submit_betslip_wager(stake_plan, moneyline_odd, team_name)
+        return self._submit_betslip_wager(
+            stake_plan,
+            moneyline_odd,
+            team_name,
+            team_1=team_1,
+            team_2=team_2,
+        )
 
     def _quit_driver(self):
         """Safely terminate only this controller's WebDriver session."""
@@ -3157,11 +3255,21 @@ class Sports411Controller:
                         stake,
                         bet_type=bet_type,
                         spread_line=spread_line,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
 
                 if not bet_placed:
+                    recovery_stake = stake_used
+                    if not isinstance(recovery_stake, BaseAmountStake):
+                        recovery_stake = base_amount_stake_from_odds(
+                            wager_odds, recovery_stake
+                        )
                     recovered, open_msg = self._recover_bet_from_open_bets(
-                        team_name, stake
+                        team_name,
+                        recovery_stake,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
                     if recovered:
                         self.logger.info(
@@ -3169,7 +3277,7 @@ class Sports411Controller:
                             f"{open_msg}"
                         )
                         bet_placed = True
-                        stake_used = stake
+                        stake_used = recovery_stake
                     elif should_notify_failed_bet(self._last_bet_error):
                         maybe_notify_partial_arb_exposure(
                             self.cache,

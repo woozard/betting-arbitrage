@@ -789,13 +789,74 @@ def _find_s411_open_bets_ticket(
     if scored:
         scored.sort(key=lambda item: (-item[0], item[1]))
         best_score = scored[0][0]
-        if best_score > 0:
+        if best_score >= 50:
             _, _, element, text = scored[0]
             return element, text
 
-    # Newest wager is the first row on /en/open-bets/.
-    first = tickets[0]
-    return first, (first.text or "").strip()
+    return None, None
+
+
+def verify_s411_open_bet_ticket(
+    driver,
+    *,
+    team_name: str,
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
+    open_bets_url: str,
+    logger=None,
+    return_to_sport=None,
+) -> tuple[bool, str]:
+    """Strict open-bets check: one ticket row must match team, odds, and stake."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    try:
+        driver.get(open_bets_url)
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "#openBetsContainer, div.open-bets-container, div.ticket")
+            )
+        )
+        time.sleep(0.5)
+
+        tickets = _s411_list_open_bet_tickets(driver)
+        if not tickets:
+            return False, "No open bet tickets on page"
+
+        for ticket in tickets:
+            text = (ticket.text or "").strip()
+            if not _s411_ticket_matches(
+                text,
+                team_name=team_name,
+                team_1=team_1,
+                team_2=team_2,
+                odds=odds,
+                stake=stake,
+            ):
+                continue
+            if logger:
+                preview = re.sub(r"\s+", " ", text.splitlines()[0] if text else "")[:72]
+                logger.info(f"S411 open-bet verified | {team_name} | {preview}")
+            return True, "Open bet ticket verified on open bets page"
+
+        return False, (
+            f"No matching open bet ticket for {team_name!r} "
+            f"odds={odds!r} stake={stake!r}"
+        )
+    except Exception as exc:
+        return False, f"Could not verify open bet: {exc}"
+    finally:
+        if return_to_sport:
+            try:
+                return_to_sport()
+            except Exception as exc:
+                if logger:
+                    logger.warning(
+                        f"S411 return to sport page after open-bet verify failed: {exc}"
+                    )
 
 
 def _find_s411_open_bets_row(

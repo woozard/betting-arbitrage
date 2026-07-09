@@ -65,6 +65,38 @@ def test_open_bets_row_rejects_wrong_odds():
     )
 
 
+def test_ticket_rejects_other_team_with_same_stake():
+    cubs = (
+        "Chicago Cubs ML+120 ( ACTION )\n"
+        "Chicago Cubs vs Baltimore Orioles\n"
+        "Risk: $20.00 | Win: $24.00"
+    )
+    assert not _s411_ticket_matches(
+        cubs,
+        team_name="Kansas City Royals",
+        team_1="Kansas City Royals",
+        team_2="New York Mets",
+        odds=133,
+        stake=20.0,
+    )
+
+
+def test_ticket_matches_royals_plus_133():
+    royals = (
+        "Kansas City Royals ML+133 ( ACTION )\n"
+        "Kansas City Royals vs New York Mets\n"
+        "Risk: $20.00 | Win: $26.60"
+    )
+    assert _s411_ticket_matches(
+        royals,
+        team_name="Kansas City Royals",
+        team_1="Kansas City Royals",
+        team_2="New York Mets",
+        odds=133,
+        stake=20.0,
+    )
+
+
 def test_ticket_matches_by_ticket_number():
     text = (
         "Chicago Cubs ML+120 ( ACTION )\n"
