@@ -645,11 +645,11 @@ def _s411_open_bets_row_valid(
     odds=None,
     stake=None,
 ) -> bool:
-    """True for a single S411 open-bet row, not the full My Open Bets page."""
+    """True for a single S411 open-bet ticket, not the full My Open Bets page."""
     text = (text or "").strip()
-    if len(text) < 20 or len(text) > 500:
+    if len(text) < 20 or len(text) > 1200:
         return False
-    if re.search(r"my\s+open\s+bets", text, re.I) and len(text) > 250:
+    if re.search(r"my\s+open\s+bets", text, re.I) and len(text) > 350:
         return False
     action_hits = len(re.findall(r"\(\s*ACTION\s*\)", text, re.I))
     if action_hits != 1:
@@ -659,7 +659,7 @@ def _s411_open_bets_row_valid(
 
     text_l = text.lower()
     team_needles = _betamapola_team_needles(team_name, team_1, team_2)
-    if not any(needle in text_l for needle in team_needles):
+    if team_needles and not any(needle in text_l for needle in team_needles):
         return False
 
     if odds is not None and str(odds).strip() != "":
@@ -676,6 +676,128 @@ def _s411_open_bets_row_valid(
     return True
 
 
+def _s411_ticket_matches(
+    text: str,
+    *,
+    team_name: str = "",
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
+    ticket_number=None,
+) -> bool:
+    if ticket_number and str(ticket_number).strip():
+        if f"ticket # {ticket_number}".lower() not in text.lower().replace("  ", " "):
+            if str(ticket_number) not in text:
+                return False
+    return _s411_open_bets_row_valid(
+        text,
+        team_name=team_name,
+        team_1=team_1,
+        team_2=team_2,
+        odds=odds,
+        stake=stake,
+    )
+
+
+def _s411_list_open_bet_tickets(driver):
+    from selenium.webdriver.common.by import By
+
+    for selector in (
+        "#openBetsContainer div.ticket",
+        "div.open-bets-container div.ticket",
+        "div.ticket.ng-star-inserted",
+        "div.ticket",
+    ):
+        try:
+            tickets = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            continue
+        visible = [t for t in tickets if (t.text or "").strip()]
+        if visible:
+            return visible
+    return []
+
+
+def _s411_expand_ticket(driver, ticket_element, logger) -> None:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    try:
+        toggle = ticket_element.find_element(
+            By.CSS_SELECTOR, 'a[data-toggle="collapse"], a[aria-controls^="ticket_"]'
+        )
+    except Exception:
+        return
+
+    expanded = (toggle.get_attribute("aria-expanded") or "").lower() == "true"
+    if not expanded:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
+            toggle.click()
+        except Exception as exc:
+            logger.warning(f"S411 open-bets: could not expand ticket row: {exc}")
+            return
+
+    try:
+        WebDriverWait(driver, 5).until(
+            lambda d: "ticket #" in (ticket_element.text or "").lower()
+            or "game start" in (ticket_element.text or "").lower()
+            or (toggle.get_attribute("aria-expanded") or "").lower() == "true"
+        )
+    except Exception:
+        time.sleep(0.6)
+
+
+def _find_s411_open_bets_ticket(
+    driver,
+    *,
+    team_name: str,
+    team_1: str = "",
+    team_2: str = "",
+    odds=None,
+    stake=None,
+    ticket_number=None,
+):
+    tickets = _s411_list_open_bet_tickets(driver)
+    if not tickets:
+        return None, None
+
+    scored: list[tuple[int, int, object, str]] = []
+    for idx, ticket in enumerate(tickets):
+        text = (ticket.text or "").strip()
+        if not text:
+            continue
+        score = 0
+        if ticket_number and str(ticket_number) in text:
+            score += 100
+        if _s411_ticket_matches(
+            text,
+            team_name=team_name,
+            team_1=team_1,
+            team_2=team_2,
+            odds=odds,
+            stake=stake,
+            ticket_number=ticket_number,
+        ):
+            score += 50
+        elif team_name and team_name.lower() in text.lower():
+            score += 10
+        scored.append((score, idx, ticket, text))
+
+    if scored:
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score = scored[0][0]
+        if best_score > 0:
+            _, _, element, text = scored[0]
+            return element, text
+
+    # Newest wager is the first row on /en/open-bets/.
+    first = tickets[0]
+    return first, (first.text or "").strip()
+
+
 def _find_s411_open_bets_row(
     driver,
     *,
@@ -685,42 +807,14 @@ def _find_s411_open_bets_row(
     odds=None,
     stake=None,
 ):
-    from selenium.webdriver.common.by import By
-
-    rows = []
-    for selector in (
-        '[class*="wager"]',
-        '[class*="Wager"]',
-        '[class*="open-bet"]',
-        '[class*="OpenBet"]',
-        '[class*="bet-item"]',
-        "main li",
-        "main article",
-        "main div",
-    ):
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        except Exception:
-            continue
-        for element in elements:
-            text = (element.text or "").strip()
-            if not _s411_open_bets_row_valid(
-                text,
-                team_name=team_name,
-                team_1=team_1,
-                team_2=team_2,
-                odds=odds,
-                stake=stake,
-            ):
-                continue
-            rows.append((len(text), element, text))
-
-    if not rows:
-        return None, None
-
-    rows.sort(key=lambda item: item[0])
-    _, element, text = rows[0]
-    return element, text
+    return _find_s411_open_bets_ticket(
+        driver,
+        team_name=team_name,
+        team_1=team_1,
+        team_2=team_2,
+        odds=odds,
+        stake=stake,
+    )
 
 
 def capture_s411_open_bet(
@@ -735,42 +829,58 @@ def capture_s411_open_bet(
     team_2: str = "",
     odds=None,
     stake=None,
+    ticket_number=None,
 ) -> str | None:
-    """Screenshot one open-bet row on S411 (not the full pending list)."""
+    """Open /en/open-bets/, expand the target ticket row, screenshot that div."""
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
     try:
         driver.get(open_bets_url)
-        time.sleep(2.5)
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "#openBetsContainer, div.open-bets-container, div.ticket")
+            )
+        )
+        time.sleep(0.8)
 
-        element, row_text = _find_s411_open_bets_row(
+        element, row_text = _find_s411_open_bets_ticket(
             driver,
             team_name=team_name,
             team_1=team_1,
             team_2=team_2,
             odds=odds,
             stake=stake,
+            ticket_number=ticket_number,
         )
         if element is None and stake is not None:
-            element, row_text = _find_s411_open_bets_row(
+            element, row_text = _find_s411_open_bets_ticket(
                 driver,
                 team_name=team_name,
                 team_1=team_1,
                 team_2=team_2,
                 odds=odds,
                 stake=None,
+                ticket_number=ticket_number,
             )
 
         if element is None:
             logger.warning(
-                f"S411 open-bets: no single wager row for {team_name!r} "
-                f"odds={odds!r} stake={stake!r}"
+                f"S411 open-bets: no ticket row for {team_name!r} "
+                f"odds={odds!r} stake={stake!r} ticket={ticket_number!r}"
             )
             return None
+
+        _s411_expand_ticket(driver, element, logger)
+        time.sleep(0.3)
 
         png = element.screenshot_as_png
         if png:
             preview = re.sub(r"\s+", " ", row_text.splitlines()[0] if row_text else "")[:72]
-            logger.info(f"S411 open-bets row screenshot | {team_name} | {preview}")
+            logger.info(f"S411 open-bets ticket screenshot | {team_name} | {preview}")
             return _write_png(path, png, logger)
+        logger.warning("S411 open-bets: ticket element screenshot empty")
         return None
     except Exception as exc:
         logger.warning(f"S411 open-bets screenshot failed: {exc}")
@@ -1032,9 +1142,15 @@ def capture_confirmed_bet_screenshot(
             team_2=team_2,
             odds=odds,
             stake=stake,
+            ticket_number=ticket_number,
         )
         if shot:
             return shot
+        logger.warning(
+            f"S411 open-bets ticket screenshot unavailable for {team_name}; "
+            "skipping synthetic receipt"
+        )
+        return None
 
     if bm == "4casters":
         if driver is not None:

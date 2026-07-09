@@ -1,6 +1,7 @@
 from utils.bet_screenshot import (
     _s411_odds_needles,
     _s411_open_bets_row_valid,
+    _s411_ticket_matches,
 )
 
 
@@ -14,6 +15,10 @@ def test_open_bets_row_valid_accepts_single_wager():
     text = (
         "Tampa Bay Rays ML-117 ( ACTION )\n"
         "New York Yankees vs Tampa Bay Rays\n"
+        "MLB Straight Bet\n"
+        "Game Start 07/08/2026 @ 12:45 PM\n"
+        "Placed 07/08/2026 @ 08:30 AM\n"
+        "Ticket # 736001492\n"
         "Risk: $23.40 | Win: $20.00"
     )
     assert _s411_open_bets_row_valid(
@@ -57,4 +62,22 @@ def test_open_bets_row_rejects_wrong_odds():
         team_name="Tampa Bay Rays",
         odds=-150,
         stake=23.40,
+    )
+
+
+def test_ticket_matches_by_ticket_number():
+    text = (
+        "Chicago Cubs ML+120 ( ACTION )\n"
+        "Chicago Cubs vs Baltimore Orioles\n"
+        "MLB Straight Bet\n"
+        "Ticket # 736031775\n"
+        "Risk: $20.00 | Win: $24.00"
+    )
+    assert _s411_ticket_matches(
+        text,
+        team_name="Chicago Cubs",
+        team_1="Chicago Cubs",
+        team_2="Baltimore Orioles",
+        odds=120,
+        ticket_number="736031775",
     )
