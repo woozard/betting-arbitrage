@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import time
 from datetime import datetime
 
@@ -26,7 +27,12 @@ from utils.betting_watchdog import (
     BettingLoopWatchdog,
     OddsScanHealthWatchdog,
 )
-from utils.config import TELEGRAM, is_active_arb_pair, FOURCASTERS_MLB_LEAGUE
+from utils.config import (
+    TELEGRAM,
+    is_active_arb_pair,
+    FOURCASTERS_MLB_LEAGUE,
+    FOURCASTERS_FAST_PLACE,
+)
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.fourcasters_client import FourCastersApiError, FourCastersClient
 from utils.fourcasters_odds import (
@@ -95,6 +101,7 @@ class FourCastersController:
         self._schedule_cache = []
         self._force_relogin = False
         self._screenshot_driver = None
+        self._screenshot_lock = threading.Lock()
 
     def _ensure_screenshot_driver(self):
         from utils.fourcasters_web import ensure_fourcasters_web_session
@@ -628,6 +635,17 @@ class FourCastersController:
         if not participant_id:
             raise FourCastersApiError(f"No participant id for {team_name} on game {game_id}")
 
+        # Fast path (moneyline): trust the scan odds and fire the order immediately —
+        # skip the pre-place line-move re-check and orderbook max-risk cap (extra API round-trips).
+        if FOURCASTERS_FAST_PLACE and bet_type == "moneyline":
+            return self._fast_place_moneyline(
+                game_id,
+                participant_id,
+                moneyline_odd,
+                stake_plan,
+                team_name=team_name,
+            )
+
         spread_market = game_row.get("spread") or {}
         live_gross = None
         if bet_type == "spread":
@@ -703,6 +721,45 @@ class FourCastersController:
             stake_plan.risk,
             bet_type=api_bet_type,
             spread_number=spread_number,
+        )
+        if not confirmed:
+            raise FourCastersApiError(message or "Bet not accepted by bookmaker")
+        fill = getattr(self, "_last_fill", None) or {}
+        actual_stake = stake_from_fourcasters_fill(fill, stake_plan)
+        if actual_stake.american_odds != stake_plan.american_odds:
+            self.logger.info(
+                f"4casters effective fill odds: {actual_stake.american_odds:+d} "
+                f"(arb net {moneyline_odd}, risk=${actual_stake.risk:.2f} win=${actual_stake.to_win:.2f})"
+            )
+        self.logger.info(f"Bet accepted by bookmaker: {message}")
+        return True, actual_stake
+
+    def _fast_place_moneyline(
+        self,
+        game_id: str,
+        participant_id: str,
+        moneyline_odd: str,
+        stake_plan: BaseAmountStake,
+        *,
+        team_name: str = None,
+    ):
+        """Fire the moneyline order straight from scan odds (no re-read / max-risk cap)."""
+        try:
+            american_odds = american_odds_to_int(moneyline_odd)
+        except (TypeError, ValueError) as e:
+            raise FourCastersApiError(f"Invalid American odds: {moneyline_odd}") from e
+
+        self._last_orderbook_max_risk = None
+        self.logger.info(
+            f"4casters fast place | {team_name} | odds {american_odds:+d} "
+            f"risk ${stake_plan.risk:.2f} (skipped line re-check + max-risk cap)"
+        )
+        confirmed, message = self._place_bet_via_api(
+            game_id,
+            participant_id,
+            american_odds,
+            stake_plan.risk,
+            bet_type="moneyline",
         )
         if not confirmed:
             raise FourCastersApiError(message or "Bet not accepted by bookmaker")
@@ -891,10 +948,12 @@ class FourCastersController:
                             wager_odds,
                             TELEGRAM,
                             extra_lines=extra_lines or None,
-                            driver=self._ensure_screenshot_driver(),
+                            driver_factory=self._ensure_screenshot_driver,
                             open_bets_url="https://4casters.io/my-bets/active-wagers",
                             placed_odds=placed_odds,
                             orderbook_max_risk=getattr(self, "_last_orderbook_max_risk", None),
+                            async_screenshot=True,
+                            screenshot_lock=self._screenshot_lock,
                         )
                     else:
                         if should_notify_failed_bet(self._last_bet_error):
