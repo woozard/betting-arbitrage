@@ -106,6 +106,12 @@ PARALLEL_EXCHANGE_ARB_BETTING = os.getenv(
 FOURCASTERS_FAST_PLACE = os.getenv(
     'FOURCASTERS_FAST_PLACE', 'true'
 ).lower() in ('1', 'true', 'yes')
+# S411 fast path: on the first placement attempt skip the pre-place open-bets
+# navigations (we just scanned the line and are on the sport page) — click the
+# line and place right away. Post-failure recovery still verifies open bets.
+S411_FAST_PLACE = os.getenv(
+    'S411_FAST_PLACE', 'true'
+).lower() in ('1', 'true', 'yes')
 # Legacy sequential path: open S411 betslip while waiting for 4casters fill, then stake+click on ack.
 S411_EXCHANGE_HEDGE_PREPOSITION = os.getenv(
     'S411_EXCHANGE_HEDGE_PREPOSITION', 'true'
