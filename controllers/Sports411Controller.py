@@ -19,7 +19,15 @@ from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc   # ← NEW: for explicit table-missing error handling
 import undetected_chromedriver as uc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, required_first_leg_book
+from utils.config import (
+    PROXY1,
+    PROXY2,
+    TELEGRAM,
+    ZENROWS_API_KEY,
+    is_active_arb_pair,
+    required_first_leg_book,
+    S411_FAST_PLACE,
+)
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import (
@@ -2815,18 +2823,22 @@ class Sports411Controller:
             f"Market: {market_label} | Odds: {moneyline_odd} | {format_base_amount_stake(stake_plan)}"
         )
 
-        already_open, open_msg = self._verify_open_bet_on_pending(
-            team_name,
-            stake_plan,
-            expected_odds=stake_plan,
-            team_1=team_1,
-            team_2=team_2,
-        )
-        if already_open:
-            self.logger.info(
-                f"Skipping placement — bet already on open bets: {open_msg}"
+        # Fast path: skip the pre-place open-bets navigation — we just scanned this
+        # line and are on the sport page. Duplicate protection is handled upstream
+        # (leg flags / cooldown) and the post-failure recovery still checks open bets.
+        if not S411_FAST_PLACE:
+            already_open, open_msg = self._verify_open_bet_on_pending(
+                team_name,
+                stake_plan,
+                expected_odds=stake_plan,
+                team_1=team_1,
+                team_2=team_2,
             )
-            return True, stake_plan
+            if already_open:
+                self.logger.info(
+                    f"Skipping placement — bet already on open bets: {open_msg}"
+                )
+                return True, stake_plan
 
         self._refresh_session_before_wager()
         self._open_betslip_for_wager(
@@ -3222,7 +3234,9 @@ class Sports411Controller:
                     )
                     continue
                 else:
-                    if self._has_existing_open_bet(team_name, team_1, team_2):
+                    if not S411_FAST_PLACE and self._has_existing_open_bet(
+                        team_name, team_1, team_2
+                    ):
                         self.logger.warning(
                             f"Open wager already on open-bets for {team_name} on {self.bookmaker}; "
                             f"skipping duplicate placement"
