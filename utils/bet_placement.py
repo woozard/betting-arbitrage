@@ -798,6 +798,34 @@ def mark_arb_execution_pause_on_placement_start(
         )
 
 
+def wait_for_arb_execution_pause_clear(
+    cache,
+    logger=None,
+    *,
+    poll_seconds: float = 1.0,
+    component: str = "Arb scanner",
+) -> bool:
+    """Block until the global execution pause clears. Returns True if we waited."""
+    if not cache.is_arb_execution_paused():
+        return False
+
+    remaining = cache.arb_execution_pause_remaining_seconds()
+    meta = cache.get_arb_execution_pause_meta() or {}
+    match = meta.get("match") or "in-flight arb"
+    if logger:
+        logger.info(
+            f"{component} paused — execution pause active ({remaining:.0f}s left) | "
+            f"{match}"
+        )
+
+    while cache.is_arb_execution_paused():
+        time.sleep(poll_seconds)
+
+    if logger:
+        logger.info(f"{component} resuming — execution pause cleared")
+    return True
+
+
 def should_pause_first_leg_for_exposure(
     cache,
     book_1: str,

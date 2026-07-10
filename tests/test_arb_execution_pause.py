@@ -2,6 +2,7 @@ from utils.bet_placement import (
     mark_arb_execution_pause_if_first_leg,
     may_continue_arb_during_execution_pause,
     should_pause_for_arb_execution_cooldown,
+    wait_for_arb_execution_pause_clear,
 )
 
 
@@ -110,3 +111,24 @@ def test_pause_allows_second_leg_when_partial_exposure_exists(monkeypatch):
     assert not should_pause_for_arb_execution_cooldown(
         cache, arb, "sports411", "4casters", "sports411", "moneyline"
     )
+
+
+def test_wait_for_execution_pause_clear_returns_false_when_not_paused():
+    cache = _FakeCache()
+    assert wait_for_arb_execution_pause_clear(cache) is False
+
+
+def test_wait_for_execution_pause_clear_blocks_until_cleared(monkeypatch):
+    cache = _FakeCache(paused=True, pause_pair_key="pair:test")
+    calls = {"n": 0}
+
+    def _paused():
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            cache.redis._data.pop("arb_execution_pause", None)
+        return bool(cache.redis.get("arb_execution_pause"))
+
+    monkeypatch.setattr(cache, "is_arb_execution_paused", _paused)
+    monkeypatch.setattr("utils.bet_placement.time.sleep", lambda _s: None)
+    assert wait_for_arb_execution_pause_clear(cache) is True
+    assert calls["n"] >= 2
