@@ -643,6 +643,21 @@ class ArbitrageCache:
     def has_partial_exposure(self):
         return bool(self.redis.scan("partial_exposure:*"))
 
+    def _fourcasters_max_risk_key(self, game_id: str) -> str:
+        return f"fourcasters_max_risk:{game_id}"
+
+    def set_fourcasters_max_risk(self, game_id: str, per_team: dict, ttl: int = 120):
+        """Publish per-team max taker risk (available liquidity) for a 4casters game."""
+        if not game_id or not per_team:
+            return
+        self.redis.set(self._fourcasters_max_risk_key(str(game_id)), per_team, ttl=ttl)
+
+    def get_fourcasters_max_risk(self, game_id: str):
+        if not game_id:
+            return None
+        data = self.redis.get(self._fourcasters_max_risk_key(str(game_id)))
+        return data if isinstance(data, dict) else None
+
     def _arb_execution_pause_key(self):
         return "arb_execution_pause"
 

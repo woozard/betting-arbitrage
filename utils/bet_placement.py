@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import re
 import threading
@@ -610,6 +611,65 @@ def _confirmed_other_leg_stake(cache, arb: dict, bookmaker: str) -> BaseAmountSt
         return None
 
 
+def _round_down_to_50(amount: float) -> float:
+    """Floor to the nearest lower multiple of 50 (clean book-facing numbers)."""
+    return float(math.floor(float(amount) / 50.0) * 50)
+
+
+def fourcasters_liquidity_capped_base(
+    cache, arb: dict, default_base: float, logger=None
+) -> float:
+    """Cap the base stake so the 4casters leg's risk fits available liquidity.
+
+    Uses the per-team max taker risk published from scan data (no extra API call).
+    Only reduces when the 4casters bet size limit is below the desired stake;
+    the reduced amount is floored to a clean multiple of 50 and shared by both legs.
+    """
+    b1 = (arb.get("team_1_bookmaker") or "").strip().lower()
+    b2 = (arb.get("team_2_bookmaker") or "").strip().lower()
+    if b1 == "4casters":
+        game_id, side, odds = arb.get("team_1_game_id"), "team_1", arb.get("team_1_odds")
+    elif b2 == "4casters":
+        game_id, side, odds = arb.get("team_2_game_id"), "team_2", arb.get("team_2_odds")
+    else:
+        return default_base
+
+    getter = getattr(cache, "get_fourcasters_max_risk", None)
+    if getter is None:
+        return default_base
+    data = getter(game_id)
+    if not data:
+        return default_base
+    max_risk = data.get(side)
+    if max_risk is None:
+        return default_base
+
+    try:
+        desired_risk = base_amount_stake_from_odds(odds, default_base).risk
+    except Exception:
+        return default_base
+    if desired_risk <= 0:
+        return default_base
+
+    max_risk = float(max_risk)
+    if desired_risk <= max_risk:
+        return default_base
+
+    # Scale the base down so the placed risk fits under available liquidity,
+    # then floor to a clean multiple of 50 (never below one 50 chunk).
+    risk_per_base = desired_risk / float(default_base)
+    max_base = max_risk / risk_per_base if risk_per_base > 0 else default_base
+    capped = _round_down_to_50(max_base)
+    if capped < 50:
+        capped = 50.0
+    if logger:
+        logger.info(
+            f"4casters liquidity cap | max_risk=${max_risk:.2f} < desired_risk=${desired_risk:.2f} "
+            f"→ base ${float(default_base):.2f}→${capped:.2f} (chunks of 50)"
+        )
+    return capped
+
+
 def resolve_arb_leg_stake(
     cache,
     arb: dict,
@@ -622,6 +682,10 @@ def resolve_arb_leg_stake(
     logger=None,
 ) -> float:
     """Return base-amount stake for this leg (fill-linked on second leg when sequential)."""
+    # Cap the shared base to 4casters available liquidity (same value for both legs).
+    default_base = fourcasters_liquidity_capped_base(
+        cache, arb, default_base, logger=logger
+    )
     if parallel_arb_betting_enabled(book_1, book_2):
         if is_first_leg_bookmaker(book_1, book_2, bookmaker):
             return default_base

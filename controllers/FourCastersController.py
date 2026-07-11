@@ -243,6 +243,28 @@ class FourCastersController:
             game_dt = parse_to_mysql_datetime(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
 
         game_id = str(game.get("id"))
+
+        away_gross = self._best_order_odds_gross(game.get("awayMoneylines"))
+        home_gross = self._best_order_odds_gross(game.get("homeMoneylines"))
+        max_risk_away = (
+            max_taker_risk_from_orders(
+                game.get("awayMoneylines"),
+                participant_id=away_id,
+                gross_odds=away_gross,
+            )
+            if away_gross is not None
+            else None
+        )
+        max_risk_home = (
+            max_taker_risk_from_orders(
+                game.get("homeMoneylines"),
+                participant_id=home_id,
+                gross_odds=home_gross,
+            )
+            if home_gross is not None
+            else None
+        )
+
         return {
             "bookmaker": self.bookmaker,
             "sport": self.sport_name,
@@ -252,6 +274,7 @@ class FourCastersController:
             "match": f"{team_1} vs {team_2}",
             "team_1": team_1,
             "team_2": team_2,
+            "max_risk": {"team_1": max_risk_away, "team_2": max_risk_home},
             "moneyline": {
                 "team_1": self._format_american_str(ml_away),
                 "team_2": self._format_american_str(ml_home),
@@ -301,6 +324,12 @@ class FourCastersController:
             parsed = self._parse_game_row(row)
             if parsed:
                 games.append(parsed)
+                max_risk = parsed.get("max_risk")
+                if max_risk and any(v is not None for v in max_risk.values()):
+                    try:
+                        self.cache.set_fourcasters_max_risk(parsed["game_id"], max_risk)
+                    except Exception as exc:
+                        self.logger.warning(f"Could not publish 4casters max risk: {exc}")
         self._schedule_cache = games
         self.logger.info(
             f"Parsed {len(games)} pregame {self.sport_name} rows from 4casters {self._league_code}"
