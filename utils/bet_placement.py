@@ -616,6 +616,19 @@ def _round_down_to_50(amount: float) -> float:
     return float(math.floor(float(amount) / 50.0) * 50)
 
 
+def _round_down_stake(amount: float) -> float:
+    """Clean book-facing stake, always rounding DOWN so we never exceed liquidity.
+
+    >= 50 → nearest lower multiple of 50 (e.g. 290→250).
+    < 50  → nearest lower multiple of 10 (e.g. 48.23→40, 25.42→20), min 10.
+    """
+    amount = float(amount)
+    if amount >= 50:
+        return float(math.floor(amount / 50.0) * 50)
+    chunk = float(math.floor(amount / 10.0) * 10)
+    return chunk if chunk >= 10 else 10.0
+
+
 def fourcasters_liquidity_capped_base(
     cache, arb: dict, default_base: float, logger=None
 ) -> float:
@@ -656,12 +669,10 @@ def fourcasters_liquidity_capped_base(
         return default_base
 
     # Scale the base down so the placed risk fits under available liquidity,
-    # then floor to a clean multiple of 50 (never below one 50 chunk).
+    # then floor to a clean book-facing chunk (50s ≥ 50, else 10s, min 10).
     risk_per_base = desired_risk / float(default_base)
     max_base = max_risk / risk_per_base if risk_per_base > 0 else default_base
-    capped = _round_down_to_50(max_base)
-    if capped < 50:
-        capped = 50.0
+    capped = _round_down_stake(max_base)
     if logger:
         logger.info(
             f"4casters liquidity cap | max_risk=${max_risk:.2f} < desired_risk=${desired_risk:.2f} "

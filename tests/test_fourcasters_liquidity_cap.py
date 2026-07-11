@@ -3,6 +3,7 @@
 import utils.bet_placement as bp
 from utils.bet_placement import (
     _round_down_to_50,
+    _round_down_stake,
     fourcasters_liquidity_capped_base,
 )
 
@@ -56,9 +57,25 @@ def test_cap_favorite_keeps_risk_within_liquidity():
     assert capped == 150.0
 
 
-def test_cap_clamps_to_50_minimum():
-    cache = _FakeCache({"g4c": {"team_1": 30, "team_2": 999}})
-    assert fourcasters_liquidity_capped_base(cache, _arb(120), 300.0) == 50.0
+def test_round_down_stake_below_50_uses_10s():
+    assert _round_down_stake(25.42) == 20
+    assert _round_down_stake(30.54) == 30
+    assert _round_down_stake(48.23) == 40
+    assert _round_down_stake(49.99) == 40
+    assert _round_down_stake(50) == 50
+    assert _round_down_stake(9.5) == 10  # floor never below 10
+    assert _round_down_stake(290) == 250
+
+
+def test_cap_below_50_rounds_to_10s():
+    # underdog +120: base==risk; limit 48.23 (< 100 desired) → floor-10 → 40.
+    cache = _FakeCache({"g4c": {"team_1": 48.23, "team_2": 999}})
+    assert fourcasters_liquidity_capped_base(cache, _arb(120), 100.0) == 40.0
+
+
+def test_cap_tiny_liquidity_clamps_to_10():
+    cache = _FakeCache({"g4c": {"team_1": 6.5, "team_2": 999}})
+    assert fourcasters_liquidity_capped_base(cache, _arb(120), 100.0) == 10.0
 
 
 def test_no_cap_when_no_fourcasters_leg():
