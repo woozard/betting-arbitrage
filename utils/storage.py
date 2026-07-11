@@ -1,4 +1,4 @@
-from database.config import __get_db1_session__
+from database.config import __get_db1_session__, db1_session_scope
 from database.models.DailyFigures import DailyFigures
 from database.models.AccountBalance import AccountBalance
 from database.models.ArbitrageOdds import ArbitrageOdds
@@ -198,29 +198,33 @@ class Storage:
 
         saved = False
 
+        # Use a short-lived, independent session: save_bet can run on a background
+        # finalize thread, and the shared singleton session is not thread-safe
+        # (concurrent commit() raises IllegalStateChangeError).
         try:
-            bet_row = ArbitrageBets(
-                sport=bet["sport"],
-                league=bet.get("league"),
-                game_id=bet["game_id"],
-                game_datetime=bet["game_datetime"],
+            with db1_session_scope() as session:
+                bet_row = ArbitrageBets(
+                    sport=bet["sport"],
+                    league=bet.get("league"),
+                    game_id=bet["game_id"],
+                    game_datetime=bet["game_datetime"],
 
-                team_1=bet["team_1"],
-                team_2=bet["team_2"],
+                    team_1=bet["team_1"],
+                    team_2=bet["team_2"],
 
-                bookmaker=bet["bookmaker"],
-                bet_type=bet["bet_type"],
+                    bookmaker=bet["bookmaker"],
+                    bet_type=bet["bet_type"],
 
-                team_no=bet["team_no"],
-                team_name=bet.get("team_name"),
+                    team_no=bet["team_no"],
+                    team_name=bet.get("team_name"),
 
-                odds=bet["odds"],
-                stake=bet.get("stake"),
-                orderbook_max_risk=bet.get("orderbook_max_risk"),
-            )
+                    odds=bet["odds"],
+                    stake=bet.get("stake"),
+                    orderbook_max_risk=bet.get("orderbook_max_risk"),
+                )
 
-            self.db.add(bet_row)
-            self.db.commit()
+                session.add(bet_row)
+                session.commit()
             saved = True
 
             self.logger.info(
@@ -236,11 +240,9 @@ class Storage:
             )
 
         except IntegrityError:
-            self.db.rollback()
             self.logger.warning("DB - Duplicate Bet Skipped")
 
         except Exception as e:
-            self.db.rollback()
             self.logger.exception(f"DB - Bet Error: {e}")
 
         self.logger.info("========== Save Bet (END) ==========")
