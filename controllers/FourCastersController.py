@@ -964,6 +964,14 @@ class FourCastersController:
                             if isinstance(stake_used, BaseAmountStake)
                             else None
                         )
+                        # Max size (available liquidity) for this side from scan data.
+                        scan_max_size = getattr(self, "_last_orderbook_max_risk", None)
+                        try:
+                            mr = self.cache.get_fourcasters_max_risk(game_id)
+                            if mr and mr.get(f"team_{team_no}") is not None:
+                                scan_max_size = mr.get(f"team_{team_no}")
+                        except Exception:
+                            pass
                         finalize_confirmed_bet_with_screenshot(
                             self.cache,
                             self.storage,
@@ -980,7 +988,7 @@ class FourCastersController:
                             driver_factory=self._ensure_screenshot_driver,
                             open_bets_url="https://4casters.io/my-bets/active-wagers",
                             placed_odds=placed_odds,
-                            orderbook_max_risk=getattr(self, "_last_orderbook_max_risk", None),
+                            orderbook_max_risk=scan_max_size,
                             async_screenshot=True,
                             screenshot_lock=self._screenshot_lock,
                         )

@@ -86,8 +86,45 @@ def test_leg_confirmed_alert_shows_max_bet_on_leg_one():
         other_leg_placed=False,
         orderbook_max_risk=3462.0,
     )
-    assert "Max Bet: $3462.00" in alert
+    assert "4c max size: $3462.00" in alert
     assert "Leg 1 of 2" in alert
+
+
+def test_leg_confirmed_alert_shows_max_size_on_4casters_leg_two():
+    arb = _twins_arb()
+    arb["team_1_bookmaker"] = "sports411"
+    arb["team_2_bookmaker"] = "4casters"
+    alert = _build_leg_confirmed_alert(
+        arb,
+        "4casters",
+        team_no=2,
+        team_name="Minnesota Twins",
+        stake=20.0,
+        moneyline_odd=120,
+        other_book="sports411",
+        other_leg_placed=True,
+        orderbook_max_risk=250.0,
+    )
+    assert "4c max size: $250.00" in alert
+    assert "Leg 2 of 2" in alert
+
+
+def test_leg_confirmed_alert_no_max_size_for_sports411():
+    arb = _twins_arb()
+    arb["team_1_bookmaker"] = "4casters"
+    arb["team_2_bookmaker"] = "sports411"
+    alert = _build_leg_confirmed_alert(
+        arb,
+        "sports411",
+        team_no=2,
+        team_name="Minnesota Twins",
+        stake=20.0,
+        moneyline_odd=120,
+        other_book="4casters",
+        other_leg_placed=False,
+        orderbook_max_risk=250.0,
+    )
+    assert "max size" not in alert
 
 
 def test_arb_complete_shows_leg1_orderbook_max():

@@ -986,9 +986,9 @@ def _build_leg_confirmed_alert(
         f"Bet: {bet_line}",
         f"Stake: {_format_real_money_stake(stake)}",
     ]
-    if orderbook_max_risk is not None and leg_no == 1:
+    if orderbook_max_risk is not None and (bookmaker or "").strip().lower() == "4casters":
         try:
-            lines.append(f"Max Bet: ${float(orderbook_max_risk):.2f}")
+            lines.append(f"4c max size: ${float(orderbook_max_risk):.2f}")
         except (TypeError, ValueError):
             pass
     if ticket_line:
