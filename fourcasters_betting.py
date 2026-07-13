@@ -7,6 +7,7 @@ from utils.config import (
     FOURCASTERS_PASSWORD,
     FOURCASTERS_LABEL,
     BET_STAKE,
+    ARB_SPORT,
 )
 
 db = __get_db1_session__()
@@ -22,7 +23,7 @@ def main():
         label=FOURCASTERS_LABEL,
     )
 
-    controller = FourCastersController(account, FOURCASTERS, sport="baseball")
+    controller = FourCastersController(account, FOURCASTERS, sport=ARB_SPORT)
     controller.betting(stake=BET_STAKE)
 
 

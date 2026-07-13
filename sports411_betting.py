@@ -3,7 +3,7 @@ import multiprocessing
 from controllers.Sports411Controller import Sports411Controller
 from database.models.Accounts import Accounts
 from database.config import __get_db1_session__
-from utils.config import SPORTS411, BET_STAKE
+from utils.config import SPORTS411, BET_STAKE, ARB_SPORT
 
 db = __get_db1_session__()
 
@@ -23,7 +23,7 @@ def run_betting(sport: str):
 
 
 def main():
-    sports = ["baseball"]
+    sports = [ARB_SPORT]
     processes = []
 
     for sport in sports:

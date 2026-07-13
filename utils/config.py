@@ -428,6 +428,11 @@ FOURCASTERS_PASSWORD = os.getenv('FOURCASTERS_PASSWORD')
 FOURCASTERS_LABEL = os.getenv('FOURCASTERS_LABEL', 'Bettor')
 FOURCASTERS_API_BASE = os.getenv('FOURCASTERS_API_BASE', 'https://api.4casters.io')
 FOURCASTERS_MLB_LEAGUE = os.getenv('FOURCASTERS_MLB_LEAGUE', 'MLB')
+FOURCASTERS_NBA_LEAGUE = os.getenv('FOURCASTERS_NBA_LEAGUE', 'NBA')
+FOURCASTERS_WNBA_LEAGUE = os.getenv('FOURCASTERS_WNBA_LEAGUE', 'WNBA')
+# Sport the 4casters + S411 arb bot bets on (baseball|mlb, basketball|nba, wnba).
+# Switch here (env) to move between sports without a code change.
+ARB_SPORT = os.getenv('ARB_SPORT', 'baseball')
 # Fixed tick haircut on gross API orderbook odds → net scanner odds (4cast UI commission).
 FOURCASTERS_SCAN_ODDS_TICK_HAIRCUT = int(os.getenv('FOURCASTERS_SCAN_ODDS_TICK_HAIRCUT', '3'))
 

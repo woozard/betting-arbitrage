@@ -140,12 +140,16 @@ class Sports411Controller:
             self.sport_url = f"https://be.{self.website}/en/sports/basketball/nba/game-lines/"
             self.sport_name = "NBA"
             self.league = "NBA"
+        elif self.sport == "wnba":
+            self.sport_url = f"https://be.{self.website}/en/sports/basketball/wnba/game-lines/"
+            self.sport_name = "WNBA"
+            self.league = "WNBA"
         elif self.sport in ["baseball", "mlb"]:
             self.sport_url = f"https://be.{self.website}/en/sports/baseball/mlb/game-lines/"
             self.sport_name = "MLB"
             self.league = "MLB"
         else:
-            raise ValueError(f"Unsupported sport: {sport}. Use 'basketball'/'nba' or 'baseball'/'mlb'.")
+            raise ValueError(f"Unsupported sport: {sport}. Use 'basketball'/'nba', 'wnba', or 'baseball'/'mlb'.")
 
         # Timezone for game times returned by this book's page.
         # All game_datetimes are normalized to UTC via pytz for consistent matching
@@ -159,6 +163,8 @@ class Sports411Controller:
         self.basketball_url = self.sport_url
         if self.sport in ["basketball", "nba"]:
             self.game_lines_path = "/basketball/nba/game-lines"
+        elif self.sport == "wnba":
+            self.game_lines_path = "/basketball/wnba/game-lines"
         else:
             self.game_lines_path = "/baseball/mlb/game-lines"
 
@@ -1756,6 +1762,11 @@ class Sports411Controller:
             self.sport_name = "NBA"
             self.league = "NBA"
             self.game_lines_path = "/basketball/nba/game-lines"
+        elif self.sport == "wnba":
+            self.sport_url = f"https://be.{self.website}/en/sports/basketball/wnba/game-lines/"
+            self.sport_name = "WNBA"
+            self.league = "WNBA"
+            self.game_lines_path = "/basketball/wnba/game-lines"
         elif self.sport in ["baseball", "mlb"]:
             self.sport_url = f"https://be.{self.website}/en/sports/baseball/mlb/game-lines/"
             self.sport_name = "MLB"
