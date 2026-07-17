@@ -15,6 +15,7 @@ mkdir -p "$LOG_DIR"
     sports411_betting.py \
     betamapola_betting.py \
     fourcasters_betting.py \
+    ps3838_betting.py \
     paradisewager_betting.py \
     betwar_betting.py \
     arbitrage.py
@@ -23,7 +24,7 @@ mkdir -p "$LOG_DIR"
   done
 
   sleep 2
-  pkill -9 -f 'sports411_betting.py|betamapola_betting.py|fourcasters_betting.py|paradisewager_betting.py|betwar_betting.py|arbitrage.py' || true
+  pkill -9 -f 'sports411_betting.py|betamapola_betting.py|fourcasters_betting.py|ps3838_betting.py|paradisewager_betting.py|betwar_betting.py|arbitrage.py' || true
 
   rm -f \
     /tmp/sports411_betting.lock \
@@ -35,6 +36,8 @@ mkdir -p "$LOG_DIR"
     /tmp/fourcasters_betting.lock \
     /tmp/fourcasters_betting_wnba.lock \
     /tmp/fourcasters_betting_mlb.lock \
+    /tmp/ps3838_betting.lock \
+    /tmp/ps3838_betting_mlb.lock \
     /tmp/arbitrage.lock \
     /tmp/arbitrage_wnba.lock \
     /tmp/arbitrage_mlb.lock \

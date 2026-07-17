@@ -108,6 +108,18 @@ BOOK_SPECS = {
         "log": "fourcasters_betting_mlb.log",
         "uses_chrome": False,
     },
+    "ps3838_mlb": {
+        "label": "PS3838",
+        "short": "PS38",
+        "stack": "mlb",
+        "league": "MLB",
+        "odds_book": "ps3838",
+        "job_name": "ps3838_betting_mlb",
+        "script": "ps3838_betting.py",
+        "process_pattern": "run_stack_job.sh mlb ps3838_betting.py",
+        "log": "ps3838_betting_mlb.log",
+        "uses_chrome": False,
+    },
 }
 
 STACKS = (
@@ -129,7 +141,7 @@ STACKS = (
         "arb_pattern": "run_stack_job.sh mlb arbitrage.py",
         "arb_log": "arbitrage_mlb.log",
         "arb_job": "arbitrage_mlb",
-        "books": ("sports411_mlb", "betamapola_mlb", "4casters_mlb"),
+        "books": ("sports411_mlb", "betamapola_mlb", "4casters_mlb", "ps3838_mlb"),
     },
 )
 

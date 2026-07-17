@@ -55,6 +55,12 @@ jobs:
     interval_seconds: 30
     start_offset_seconds: 55
 
+  - name: ps3838_betting_mlb
+    script: scripts/run_stack_job.sh
+    args: [mlb, ps3838_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 65
+
   # ---------------------------------------------------------------------------
   # Shared ops (single Telegram bot — do not run twice)
   # ---------------------------------------------------------------------------

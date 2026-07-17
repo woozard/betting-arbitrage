@@ -507,6 +507,16 @@ SPORTS411_ACCOUNT = os.getenv('SPORTS411_ACCOUNT', '8715')
 SPORTS411_PASSWORD = os.getenv('SPORTS411_PASSWORD')
 SPORTS411_LABEL = os.getenv('SPORTS411_LABEL', 'Bettor')
 
+PS3838 = {
+    'website': 'ps3838.com',
+    'url': os.getenv('PS3838_API_BASE', 'https://api.ps3838.com'),
+    'bookmaker': 'ps3838',
+}
+PS3838_ACCOUNT = os.getenv('PS3838_ACCOUNT')
+PS3838_PASSWORD = os.getenv('PS3838_PASSWORD')
+PS3838_LABEL = os.getenv('PS3838_LABEL', 'Bettor')
+PS3838_API_BASE = os.getenv('PS3838_API_BASE', 'https://api.ps3838.com')
+
 
 def arb_sport_to_league(sport: str | None = None) -> str | None:
     """Map ARB_SPORT env value to DB/odds league label (WNBA/MLB/NBA)."""
