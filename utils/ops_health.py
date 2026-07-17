@@ -30,48 +30,55 @@ from utils.config import (
 BASE_PATH = Path(__file__).resolve().parent.parent
 LOG_DIR = BASE_PATH / "logs"
 
-# Books with active scheduler jobs (lowvig disabled in jobs.yml).
+# Books with active scheduler jobs (dual-stack: wnba + mlb).
+# process_patterns match run_stack_job.sh cmdline so stacks stay distinct.
 BOOK_SPECS = {
-    "sports411": {
-        "label": "S411",
-        "job_name": "sports411_betting",
+    "sports411_wnba": {
+        "label": "S411-WNBA",
+        "job_name": "sports411_betting_wnba",
         "script": "sports411_betting.py",
-        "log": "sports411_betting.log",
+        "process_pattern": "run_stack_job.sh wnba sports411_betting.py",
+        "log": "sports411_betting_wnba.log",
         "uses_chrome": True,
     },
-    "betamapola": {
-        "label": "Betamapola",
-        "job_name": "betamapola_betting",
+    "sports411_mlb": {
+        "label": "S411-MLB",
+        "job_name": "sports411_betting_mlb",
+        "script": "sports411_betting.py",
+        "process_pattern": "run_stack_job.sh mlb sports411_betting.py",
+        "log": "sports411_betting_mlb.log",
+        "uses_chrome": True,
+    },
+    "betamapola_wnba": {
+        "label": "Amapola-WNBA",
+        "job_name": "betamapola_betting_wnba",
         "script": "betamapola_betting.py",
-        "log": "betamapola_betting.log",
+        "process_pattern": "run_stack_job.sh wnba betamapola_betting.py",
+        "log": "betamapola_betting_wnba.log",
         "uses_chrome": True,
     },
-    "paradisewager": {
-        "label": "Paradise",
-        "job_name": "paradisewager_betting",
-        "script": "paradisewager_betting.py",
-        "log": "paradisewager_betting.log",
+    "betamapola_mlb": {
+        "label": "Amapola-MLB",
+        "job_name": "betamapola_betting_mlb",
+        "script": "betamapola_betting.py",
+        "process_pattern": "run_stack_job.sh mlb betamapola_betting.py",
+        "log": "betamapola_betting_mlb.log",
         "uses_chrome": True,
     },
-    "betwar": {
-        "label": "BetWar",
-        "job_name": "betwar_betting",
-        "script": "betwar_betting.py",
-        "log": "betwar_betting.log",
-        "uses_chrome": True,
-    },
-    "3et": {
-        "label": "3et",
-        "job_name": "threeet_betting",
-        "script": "threeet_betting.py",
-        "log": "threeet_betting.log",
-        "uses_chrome": True,
-    },
-    "4casters": {
-        "label": "4casters",
-        "job_name": "fourcasters_betting",
+    "4casters_wnba": {
+        "label": "4c-WNBA",
+        "job_name": "fourcasters_betting_wnba",
         "script": "fourcasters_betting.py",
-        "log": "fourcasters_betting.log",
+        "process_pattern": "run_stack_job.sh wnba fourcasters_betting.py",
+        "log": "fourcasters_betting_wnba.log",
+        "uses_chrome": False,
+    },
+    "4casters_mlb": {
+        "label": "4c-MLB",
+        "job_name": "fourcasters_betting_mlb",
+        "script": "fourcasters_betting.py",
+        "process_pattern": "run_stack_job.sh mlb fourcasters_betting.py",
+        "log": "fourcasters_betting_mlb.log",
         "uses_chrome": False,
     },
 }
@@ -226,8 +233,6 @@ def latest_odds_age_by_book() -> dict[str, int]:
 
 
 def check_book_health(bookmaker: str, odds_ages: dict[str, int]) -> list[HealthIssue]:
-    if bookmaker not in ACTIVE_ARB_BOOKMAKERS:
-        return []
     spec = BOOK_SPECS.get(bookmaker)
     if not spec:
         return []
@@ -235,10 +240,14 @@ def check_book_health(bookmaker: str, odds_ages: dict[str, int]) -> list[HealthI
     issues: list[HealthIssue] = []
     label = spec["label"]
     job_name = spec["job_name"]
-    script = spec["script"]
+    script = spec.get("process_pattern") or spec["script"]
     log_name = spec["log"]
     running = _process_running(script)
-    age = odds_ages.get(bookmaker)
+    # Odds rows are keyed by bare bookmaker (sports411), not stack id.
+    odds_book = bookmaker.split("_")[0] if "_" in bookmaker else bookmaker
+    if odds_book == "4casters":
+        odds_book = "4casters"
+    age = odds_ages.get(odds_book)
     lines = _tail_lines(log_name)
 
     if age is None:
@@ -434,11 +443,30 @@ def run_health_cycle(logger=None) -> dict:
     odds_ages = latest_odds_age_by_book()
     issues: list[HealthIssue] = []
 
+    for book in sorted(BOOK_SPECS):
+        issues.extend(check_book_health(book, odds_ages))
+
+    # Also keep legacy single-name books if still configured elsewhere.
     for book in sorted(ACTIVE_ARB_BOOKMAKERS):
         if book in BOOK_SPECS:
-            issues.extend(check_book_health(book, odds_ages))
+            continue
+        # skip — dual-stack specs cover active books
 
     issues.extend(check_arb_scanner_health())
+    # Dual-stack scanners: either arbitrage_wnba or arbitrage_mlb process is enough signal.
+    if not _process_running("run_stack_job.sh wnba arbitrage.py") and not _process_running(
+        "run_stack_job.sh mlb arbitrage.py"
+    ):
+        if not _process_running("arbitrage.py"):
+            issues.append(
+                HealthIssue(
+                    component="arbitrage",
+                    severity="critical",
+                    code="process_down",
+                    message="Arbitrage scanner: neither WNBA nor MLB stack process running",
+                    auto_fixable=True,
+                )
+            )
 
     remediated: list[str] = []
     alerts: list[str] = []

@@ -198,7 +198,8 @@ class BetamapolaController:
         options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
 
         # Use a unique user data dir to avoid profile conflicts in service restarts
-        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+        from utils.chrome_temp import chrome_temp_prefix
+        self.user_data_dir = tempfile.mkdtemp(prefix=chrome_temp_prefix("chrome_user_data"))
         options.add_argument(f'--user-data-dir={self.user_data_dir}')
 
         # Retry driver creation - Chrome + extension is flaky under systemd
@@ -244,7 +245,8 @@ class BetamapolaController:
     # === helper methods from Sports411Controller / Web5Controller ===
     def _create_proxy_extension(self, host: str, port: int, user: str, password: str) -> str:
         """Dynamically creates a Chrome Proxy Extension with authentication (MV2 for compatibility)"""
-        ext_dir = tempfile.mkdtemp(prefix="brightdata_proxy_")
+        from utils.chrome_temp import chrome_temp_prefix
+        ext_dir = tempfile.mkdtemp(prefix=chrome_temp_prefix("brightdata_proxy"))
         manifest = {
             "manifest_version": 2,
             "name": "BrightData Proxy Auth",

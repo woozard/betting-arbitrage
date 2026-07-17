@@ -276,7 +276,8 @@ class Sports411Controller:
             self.user_data_dir = profile
             os.makedirs(profile, exist_ok=True)
         else:
-            self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+            from utils.chrome_temp import chrome_temp_prefix
+            self.user_data_dir = tempfile.mkdtemp(prefix=chrome_temp_prefix("chrome_user_data"))
 
         if self._wait_for_debug_port(port, timeout=1):
             self.logger.info(f"Reusing existing Chrome on debug port {port}")
@@ -368,7 +369,8 @@ class Sports411Controller:
         else:
             self.proxy_extension_dir = None
 
-        self.user_data_dir = tempfile.mkdtemp(prefix="chrome_user_data_")
+        from utils.chrome_temp import chrome_temp_prefix
+        self.user_data_dir = tempfile.mkdtemp(prefix=chrome_temp_prefix("chrome_user_data"))
 
         driver_label = "undetected-chromedriver" if self.use_stealth else "selenium"
         proxy_label = "proxy" if self.use_proxy else "direct"
@@ -785,7 +787,8 @@ class Sports411Controller:
     # === helper methods from Web5Controller ===
     def _create_proxy_extension(self, host: str, port: int, user: str, password: str) -> str:
         """Dynamically creates a Chrome Proxy Extension with authentication (MV2 for compatibility)"""
-        ext_dir = tempfile.mkdtemp(prefix="brightdata_proxy_")
+        from utils.chrome_temp import chrome_temp_prefix
+        ext_dir = tempfile.mkdtemp(prefix=chrome_temp_prefix("brightdata_proxy"))
         manifest = {
             "manifest_version": 2,
             "name": "BrightData Proxy Auth",

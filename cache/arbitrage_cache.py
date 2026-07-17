@@ -6,7 +6,11 @@ from utils.config import REDIS, ARB_TTL_SECONDS, GAME_PAIR_BET_COOLDOWN_SECONDS,
 
 class ArbitrageCache:
     def __init__(self, ttl=30, arb_ttl=None, lock_ttl=86400):
-        self.redis = RedisCache(REDIS['host'], REDIS['port'])
+        self.redis = RedisCache(
+            REDIS.get('host') or 'localhost',
+            int(REDIS.get('port') or 6379),
+            db=int(REDIS.get('db') or 0),
+        )
         self.ttl = ttl
         self.arb_ttl = ARB_TTL_SECONDS if arb_ttl is None else arb_ttl
         self.lock_ttl = lock_ttl

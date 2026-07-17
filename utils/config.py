@@ -26,13 +26,16 @@ DB2 = {
     'database': os.getenv('DB2_NAME'),
 }
 
-# Redis
+# Redis — use REDIS_DB to isolate stacks (e.g. wnba=0, mlb=1).
 REDIS = {
     'host': os.getenv('REDIS_HOST'),
     'port': os.getenv('REDIS_PORT'),
-    'db': 0,
+    'db': int(os.getenv('REDIS_DB', '0') or '0'),
     'decode_responses': True,
 }
+
+# Stack label for Chrome temp dirs / locks / logs (wnba|mlb|...).
+STACK_NAME = (os.getenv('STACK_NAME') or os.getenv('ARB_STACK') or '').strip().lower()
 
 # Telegram — channel routing:
 #   TELEGRAM_CHAT_HEALTH       → KC Arb Health Status (ops agent, scanner errors, system alerts)
@@ -87,6 +90,40 @@ def arb_opportunity_alert_chat_ids():
 # Betting — base amount per arb leg ($20 default).
 # Minus odds → fill to-win box; plus odds → fill risk box (see utils/stake_sizing.py).
 BET_STAKE = float(os.getenv('BET_STAKE', '20'))
+
+
+def _parse_bet_stake_by_pair(raw: str) -> dict:
+    """Parse BET_STAKE_BY_PAIR=4casters:sports411=100,4casters:betamapola=20,..."""
+    out = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or "=" not in part or ":" not in part:
+            continue
+        pair_s, stake_s = part.rsplit("=", 1)
+        books = [b.strip().lower() for b in pair_s.split(":") if b.strip()]
+        if len(books) != 2:
+            continue
+        try:
+            out[frozenset(books)] = float(stake_s)
+        except ValueError:
+            continue
+    return out
+
+
+BET_STAKE_BY_PAIR = _parse_bet_stake_by_pair(os.getenv("BET_STAKE_BY_PAIR", ""))
+
+
+def bet_stake_for_pair(book_1: str, book_2: str, fallback=None) -> float:
+    """Per-pair base stake; falls back to BET_STAKE (or explicit fallback)."""
+    b1 = (book_1 or "").strip().lower()
+    b2 = (book_2 or "").strip().lower()
+    if b1 and b2 and b1 != b2:
+        stake = BET_STAKE_BY_PAIR.get(frozenset({b1, b2}))
+        if stake is not None:
+            return float(stake)
+    return float(fallback if fallback is not None else BET_STAKE)
+
+
 REAL_MONEY_BETTING_ENABLED = os.getenv('REAL_MONEY_BETTING_ENABLED', 'true').lower() in (
     '1', 'true', 'yes',
 )
@@ -133,6 +170,14 @@ SECOND_LEG_ODDS_TOLERANCE = int(os.getenv('SECOND_LEG_ODDS_TOLERANCE', '2'))
 SPREAD_SECOND_LEG_ODDS_TOLERANCE = int(
     os.getenv('SPREAD_SECOND_LEG_ODDS_TOLERANCE', '5')
 )
+# Completing (hedge) leg: accept ANY line that keeps the arb profitable instead of
+# a fixed ±point tolerance ("worst click" = break-even; anything better is a click).
+# This prevents rejecting still-profitable hedges at extreme odds (e.g. +634 vs +657).
+HEDGE_ODDS_PROFIT_ACCEPTANCE = os.getenv(
+    'HEDGE_ODDS_PROFIT_ACCEPTANCE', 'true'
+).lower() in ('1', 'true', 'yes', 'on')
+# Minimum locked profit % required to accept a hedge line (0 = break-even worst click).
+HEDGE_MIN_PROFIT_PCT = float(os.getenv('HEDGE_MIN_PROFIT_PCT', '0'))
 # BetWar: reuse My Bets rows only when explicitly enabled (scoped match; default off).
 BETWAR_MY_BETS_RECOVERY = os.getenv('BETWAR_MY_BETS_RECOVERY', 'false').lower() in (
     '1', 'true', 'yes',
@@ -213,6 +258,15 @@ OPS_REMEDIATE_COOLDOWN_SECONDS = int(os.getenv("OPS_REMEDIATE_COOLDOWN_SEC", "30
 OPS_HEALTH_CHECK_ENABLED = os.getenv("OPS_HEALTH_CHECK_ENABLED", "true").lower() in (
     "1", "true", "yes",
 )
+# Periodic host heartbeat to TELEGRAM_CHAT_HEALTH (CPU / mem / chrome counts).
+OPS_HOST_STATUS_ENABLED = os.getenv("OPS_HOST_STATUS_ENABLED", "true").lower() in (
+    "1", "true", "yes",
+)
+OPS_HOST_STATUS_INTERVAL_SECONDS = int(
+    os.getenv("OPS_HOST_STATUS_INTERVAL_SEC", "300")  # 5 min default
+)
+# Flag the heartbeat when chrome process count exceeds this (leak signal).
+OPS_CHROME_WARN_COUNT = int(os.getenv("OPS_CHROME_WARN_COUNT", "80"))
 
 # Spread arb sanity gates
 SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "2.0"))
@@ -447,6 +501,22 @@ SPORTS411 = {
     'url': 'https://www.sports411.ag',
     'bookmaker': 'sports411'
 }
+
+SPORTS411_ACCOUNT = os.getenv('SPORTS411_ACCOUNT', '8715')
+SPORTS411_PASSWORD = os.getenv('SPORTS411_PASSWORD')
+SPORTS411_LABEL = os.getenv('SPORTS411_LABEL', 'Bettor')
+
+
+def arb_sport_to_league(sport: str | None = None) -> str | None:
+    """Map ARB_SPORT env value to DB/odds league label (WNBA/MLB/NBA)."""
+    s = (sport if sport is not None else ARB_SPORT or "").strip().lower()
+    if s == "wnba":
+        return "WNBA"
+    if s in ("baseball", "mlb"):
+        return "MLB"
+    if s in ("basketball", "nba"):
+        return "NBA"
+    return None
 
 PINNACLE = {
     'website': 'pinnacle.com',
