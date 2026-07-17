@@ -184,13 +184,20 @@ class ArbitrageController:
         comparing stale historical snapshots (or duplicate S411 game_ids) against each other.
         """
         cutoff = datetime.utcnow() - timedelta(minutes=minutes)
-        rows = (
+        q = (
             self.db.query(ArbitrageOdds)
             .filter(ArbitrageOdds.bet_type == "moneyline")
             .filter(ArbitrageOdds.created_at >= cutoff)
-            .order_by(ArbitrageOdds.created_at.desc())
-            .all()
         )
+        try:
+            from utils.config import arb_sport_to_league
+
+            league = arb_sport_to_league()
+            if league:
+                q = q.filter(ArbitrageOdds.league == league)
+        except Exception:
+            pass
+        rows = q.order_by(ArbitrageOdds.created_at.desc()).all()
 
         # Build list with created_at for deduping (query is newest-first).
         results = []

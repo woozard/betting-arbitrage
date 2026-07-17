@@ -12,6 +12,14 @@ tempfile.tempdir = PROJECT_TMP_DIR
 INIT_FAILURE_STALE_AGE_SECONDS = 60
 
 
+def chrome_temp_prefix(kind: str = "chrome_user_data") -> str:
+    """Stack-scoped tempfile prefix so WNBA/MLB Chrome dirs don't collide in cleanup."""
+    stack = (os.getenv("STACK_NAME") or os.getenv("ARB_STACK") or "").strip().lower()
+    if stack:
+        return f"{kind}_{stack}_"
+    return f"{kind}_"
+
+
 def discard_temp_dirs(*dirs, logger=None):
     """Remove specific Chrome/proxy temp dirs (e.g. from a failed __init__)."""
     removed = []
@@ -28,12 +36,23 @@ def discard_temp_dirs(*dirs, logger=None):
 
 
 def cleanup_stale_temp_dirs(active_dirs=None, max_age_seconds=3600, logger=None):
-    """Remove old brightdata_proxy_* / chrome_user_data_* dirs not in active_dirs."""
+    """Remove old brightdata_proxy_* / chrome_user_data_* dirs not in active_dirs.
+
+    When STACK_NAME is set, only prune dirs for that stack.
+    """
     active = {d for d in (active_dirs or []) if d}
     now = time.time()
     removed = 0
+    stack = (os.getenv("STACK_NAME") or os.getenv("ARB_STACK") or "").strip().lower()
+    if stack:
+        patterns = (
+            f"brightdata_proxy_{stack}_*",
+            f"chrome_user_data_{stack}_*",
+        )
+    else:
+        patterns = ("brightdata_proxy_*", "chrome_user_data_*")
     try:
-        for pat in ("brightdata_proxy_*", "chrome_user_data_*"):
+        for pat in patterns:
             for d in glob.glob(os.path.join(PROJECT_TMP_DIR, pat)):
                 if d in active:
                     continue

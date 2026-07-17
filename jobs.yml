@@ -1,54 +1,98 @@
 jobs:
-  - name: arbitrage
-    script: arbitrage.py
+  # ---------------------------------------------------------------------------
+  # WNBA stack — accounts: 4c carlosmc, S411 8715, amapola PC8396
+  # Isolated via .env.wnba + REDIS_DB=0 + unique flock names
+  # ---------------------------------------------------------------------------
+  - name: arbitrage_wnba
+    script: scripts/run_stack_job.sh
+    args: [wnba, arbitrage.py]
     interval_seconds: 30
     start_offset_seconds: 0
 
-  # S411 odds + betting share one Chrome session in sports411_betting (watch when idle, bet on arb).
-  # sports411_odds.py remains for manual runs only.
-
-  - name: polymarket_odds
-    script: polymarket_odds.py
-    interval_seconds: 20
-    start_offset_seconds: 13
-
-  - name: sports411_betting
-    script: sports411_betting.py
+  - name: sports411_betting_wnba
+    script: scripts/run_stack_job.sh
+    args: [wnba, sports411_betting.py]
     interval_seconds: 30
     start_offset_seconds: 15
 
-  - name: paradisewager_betting
-    script: paradisewager_betting.py
-    interval_seconds: 30
-    start_offset_seconds: 20
-
-  - name: betamapola_betting
-    script: betamapola_betting.py
+  - name: betamapola_betting_wnba
+    script: scripts/run_stack_job.sh
+    args: [wnba, betamapola_betting.py]
     interval_seconds: 30
     start_offset_seconds: 30
 
-  # BetWar disabled — placement bugs under investigation (My Bets recovery, rotation fallback, etc.)
-  # - name: betwar_betting
-  #   script: betwar_betting.py
-  #   interval_seconds: 30
-  #   start_offset_seconds: 35
-
-  # LowVig: Browser API connects + login form loads; password entry blocked until Bright Data KYC approval.
-  # - name: lowvig_betting
-  #   script: lowvig_betting.py
-  #   interval_seconds: 30
-  #   start_offset_seconds: 40
-
-  - name: threeet_betting
-    script: threeet_betting.py
-    interval_seconds: 30
-    start_offset_seconds: 42
-
-  - name: fourcasters_betting
-    script: fourcasters_betting.py
+  - name: fourcasters_betting_wnba
+    script: scripts/run_stack_job.sh
+    args: [wnba, fourcasters_betting.py]
     interval_seconds: 30
     start_offset_seconds: 48
 
+  # ---------------------------------------------------------------------------
+  # MLB stack — accounts: 4c carlos2, S411 8714, amapola pc8261
+  # Isolated via .env.mlb + REDIS_DB=1 + unique flock names / Chrome prefixes
+  # ---------------------------------------------------------------------------
+  - name: arbitrage_mlb
+    script: scripts/run_stack_job.sh
+    args: [mlb, arbitrage.py]
+    interval_seconds: 30
+    start_offset_seconds: 5
+
+  - name: sports411_betting_mlb
+    script: scripts/run_stack_job.sh
+    args: [mlb, sports411_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 20
+
+  - name: betamapola_betting_mlb
+    script: scripts/run_stack_job.sh
+    args: [mlb, betamapola_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 35
+
+  - name: fourcasters_betting_mlb
+    script: scripts/run_stack_job.sh
+    args: [mlb, fourcasters_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 55
+
+  # PS3838 MLB — deactivated (Cloudflare blocks api.ps3838.com from EC2; pairs removed).
+  # - name: ps3838_betting_mlb
+  #   script: scripts/run_stack_job.sh
+  #   args: [mlb, ps3838_betting.py]
+  #   interval_seconds: 30
+  #   start_offset_seconds: 65
+
+  # ---------------------------------------------------------------------------
+  # UFC stack — accounts: 4c carlos3, S411 8755, amapola pc8305
+  # Isolated via .env.ufc + REDIS_DB=2 + unique flock names / Chrome prefixes
+  # ---------------------------------------------------------------------------
+  - name: arbitrage_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, arbitrage.py]
+    interval_seconds: 30
+    start_offset_seconds: 8
+
+  - name: sports411_betting_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, sports411_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 25
+
+  - name: betamapola_betting_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, betamapola_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 40
+
+  - name: fourcasters_betting_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, fourcasters_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 60
+
+  # ---------------------------------------------------------------------------
+  # Shared ops (single Telegram bot — do not run twice)
+  # ---------------------------------------------------------------------------
   - name: ops_health_agent
     script: ops_health_agent.py
     interval_seconds: 120
