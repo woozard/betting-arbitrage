@@ -266,7 +266,8 @@ OPS_HOST_STATUS_INTERVAL_SECONDS = int(
     os.getenv("OPS_HOST_STATUS_INTERVAL_SEC", "300")  # 5 min default
 )
 # Flag the heartbeat when chrome process count exceeds this (leak signal).
-OPS_CHROME_WARN_COUNT = int(os.getenv("OPS_CHROME_WARN_COUNT", "80"))
+# Dual-stack (WNBA+MLB) typically runs ~80–140 chrome procs; warn above that.
+OPS_CHROME_WARN_COUNT = int(os.getenv("OPS_CHROME_WARN_COUNT", "160"))
 
 # Spread arb sanity gates
 SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "2.0"))
