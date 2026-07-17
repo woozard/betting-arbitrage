@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Run a betting/arbitrage script under a named stack env (.env.wnba / .env.mlb).
+# Run a betting/arbitrage script under a named stack env
+# (.env.wnba / .env.mlb / .env.ufc).
 #
 # Usage:
 #   scripts/run_stack_job.sh wnba sports411_betting.py
 #   scripts/run_stack_job.sh mlb  arbitrage.py
+#   scripts/run_stack_job.sh ufc  arbitrage.py
 set -euo pipefail
 
 STACK="${1:-}"

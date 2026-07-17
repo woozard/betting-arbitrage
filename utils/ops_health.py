@@ -33,7 +33,7 @@ from utils.config import (
 BASE_PATH = Path(__file__).resolve().parent.parent
 LOG_DIR = BASE_PATH / "logs"
 
-# Books with active scheduler jobs (dual-stack: wnba + mlb).
+# Books with active scheduler jobs (wnba + mlb + ufc).
 # process_patterns match run_stack_job.sh cmdline so stacks stay distinct.
 BOOK_SPECS = {
     "sports411_wnba": {
@@ -60,6 +60,18 @@ BOOK_SPECS = {
         "log": "sports411_betting_mlb.log",
         "uses_chrome": True,
     },
+    "sports411_ufc": {
+        "label": "S411",
+        "short": "S411",
+        "stack": "ufc",
+        "league": "UFC",
+        "odds_book": "sports411",
+        "job_name": "sports411_betting_ufc",
+        "script": "sports411_betting.py",
+        "process_pattern": "run_stack_job.sh ufc sports411_betting.py",
+        "log": "sports411_betting_ufc.log",
+        "uses_chrome": True,
+    },
     "betamapola_wnba": {
         "label": "Amapola",
         "short": "Amapola",
@@ -84,6 +96,18 @@ BOOK_SPECS = {
         "log": "betamapola_betting_mlb.log",
         "uses_chrome": True,
     },
+    "betamapola_ufc": {
+        "label": "Amapola",
+        "short": "Amapola",
+        "stack": "ufc",
+        "league": "UFC",
+        "odds_book": "betamapola",
+        "job_name": "betamapola_betting_ufc",
+        "script": "betamapola_betting.py",
+        "process_pattern": "run_stack_job.sh ufc betamapola_betting.py",
+        "log": "betamapola_betting_ufc.log",
+        "uses_chrome": True,
+    },
     "4casters_wnba": {
         "label": "4c",
         "short": "4c",
@@ -106,6 +130,18 @@ BOOK_SPECS = {
         "script": "fourcasters_betting.py",
         "process_pattern": "run_stack_job.sh mlb fourcasters_betting.py",
         "log": "fourcasters_betting_mlb.log",
+        "uses_chrome": False,
+    },
+    "4casters_ufc": {
+        "label": "4c",
+        "short": "4c",
+        "stack": "ufc",
+        "league": "UFC",
+        "odds_book": "4casters",
+        "job_name": "fourcasters_betting_ufc",
+        "script": "fourcasters_betting.py",
+        "process_pattern": "run_stack_job.sh ufc fourcasters_betting.py",
+        "log": "fourcasters_betting_ufc.log",
         "uses_chrome": False,
     },
     "ps3838_mlb": {
@@ -143,6 +179,16 @@ STACKS = (
         "arb_job": "arbitrage_mlb",
         # ps3838_mlb deactivated until API access is unblocked
         "books": ("sports411_mlb", "betamapola_mlb", "4casters_mlb"),
+    },
+    {
+        "name": "ufc",
+        "title": "UFC",
+        "league": "UFC",
+        "env_file": ".env.ufc",
+        "arb_pattern": "run_stack_job.sh ufc arbitrage.py",
+        "arb_log": "arbitrage_ufc.log",
+        "arb_job": "arbitrage_ufc",
+        "books": ("sports411_ufc", "betamapola_ufc", "4casters_ufc"),
     },
 )
 

@@ -9,7 +9,7 @@ LOG_FILE="$LOG_DIR/betting_restart.log"
 
 mkdir -p "$LOG_DIR"
 {
-  echo "[$STAMP] === Restarting betting jobs (wnba+mlb) ==="
+  echo "[$STAMP] === Restarting betting jobs (wnba+mlb+ufc) ==="
 
   for pattern in \
     sports411_betting.py \
@@ -30,17 +30,21 @@ mkdir -p "$LOG_DIR"
     /tmp/sports411_betting.lock \
     /tmp/sports411_betting_wnba.lock \
     /tmp/sports411_betting_mlb.lock \
+    /tmp/sports411_betting_ufc.lock \
     /tmp/betamapola_betting.lock \
     /tmp/betamapola_betting_wnba.lock \
     /tmp/betamapola_betting_mlb.lock \
+    /tmp/betamapola_betting_ufc.lock \
     /tmp/fourcasters_betting.lock \
     /tmp/fourcasters_betting_wnba.lock \
     /tmp/fourcasters_betting_mlb.lock \
+    /tmp/fourcasters_betting_ufc.lock \
     /tmp/ps3838_betting.lock \
     /tmp/ps3838_betting_mlb.lock \
     /tmp/arbitrage.lock \
     /tmp/arbitrage_wnba.lock \
     /tmp/arbitrage_mlb.lock \
+    /tmp/arbitrage_ufc.lock \
     /tmp/paradisewager_betting.lock \
     /tmp/betwar_betting.lock
 

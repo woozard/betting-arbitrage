@@ -485,7 +485,8 @@ FOURCASTERS_API_BASE = os.getenv('FOURCASTERS_API_BASE', 'https://api.4casters.i
 FOURCASTERS_MLB_LEAGUE = os.getenv('FOURCASTERS_MLB_LEAGUE', 'MLB')
 FOURCASTERS_NBA_LEAGUE = os.getenv('FOURCASTERS_NBA_LEAGUE', 'NBA')
 FOURCASTERS_WNBA_LEAGUE = os.getenv('FOURCASTERS_WNBA_LEAGUE', 'WNBA')
-# Sport the 4casters + S411 arb bot bets on (baseball|mlb, basketball|nba, wnba).
+FOURCASTERS_UFC_LEAGUE = os.getenv('FOURCASTERS_UFC_LEAGUE', 'UFCMMA')
+# Sport the 4casters + S411 arb bot bets on (baseball|mlb, basketball|nba, wnba, ufc|mma).
 # Switch here (env) to move between sports without a code change.
 ARB_SPORT = os.getenv('ARB_SPORT', 'baseball')
 # Fixed tick haircut on gross API orderbook odds → net scanner odds (4cast UI commission).
@@ -519,7 +520,7 @@ PS3838_API_BASE = os.getenv('PS3838_API_BASE', 'https://api.ps3838.com')
 
 
 def arb_sport_to_league(sport: str | None = None) -> str | None:
-    """Map ARB_SPORT env value to DB/odds league label (WNBA/MLB/NBA)."""
+    """Map ARB_SPORT env value to DB/odds league label (WNBA/MLB/NBA/UFC)."""
     s = (sport if sport is not None else ARB_SPORT or "").strip().lower()
     if s == "wnba":
         return "WNBA"
@@ -527,6 +528,8 @@ def arb_sport_to_league(sport: str | None = None) -> str | None:
         return "MLB"
     if s in ("basketball", "nba"):
         return "NBA"
+    if s in ("ufc", "mma", "fighting"):
+        return "UFC"
     return None
 
 PINNACLE = {

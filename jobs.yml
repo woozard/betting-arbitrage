@@ -63,6 +63,34 @@ jobs:
   #   start_offset_seconds: 65
 
   # ---------------------------------------------------------------------------
+  # UFC stack — accounts: 4c carlos3, S411 8755, amapola pc8305
+  # Isolated via .env.ufc + REDIS_DB=2 + unique flock names / Chrome prefixes
+  # ---------------------------------------------------------------------------
+  - name: arbitrage_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, arbitrage.py]
+    interval_seconds: 30
+    start_offset_seconds: 8
+
+  - name: sports411_betting_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, sports411_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 25
+
+  - name: betamapola_betting_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, betamapola_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 40
+
+  - name: fourcasters_betting_ufc
+    script: scripts/run_stack_job.sh
+    args: [ufc, fourcasters_betting.py]
+    interval_seconds: 30
+    start_offset_seconds: 60
+
+  # ---------------------------------------------------------------------------
   # Shared ops (single Telegram bot — do not run twice)
   # ---------------------------------------------------------------------------
   - name: ops_health_agent

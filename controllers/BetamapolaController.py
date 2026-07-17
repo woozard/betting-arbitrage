@@ -125,9 +125,15 @@ class BetamapolaController:
         if self.sport in ["basketball", "nba"]:
             self.sport_name = "NBA"
             self.league = "NBA"
+        elif self.sport == "wnba":
+            self.sport_name = "WNBA"
+            self.league = "WNBA"
         elif self.sport in ["baseball", "mlb"]:
             self.sport_name = "MLB"
             self.league = "MLB"
+        elif self.sport in ["ufc", "mma", "fighting"]:
+            self.sport_name = "UFC"
+            self.league = "UFC"
         else:
             # Default to MLB (currently primary offering)
             self.sport_name = "MLB"
@@ -527,6 +533,10 @@ class BetamapolaController:
         """Select the active sport/league in the Angular SPA (same UI path users take)."""
         if self.sport_name == "NBA":
             label_for = "gl_Basketball_NBA_G"
+        elif self.sport_name == "WNBA":
+            label_for = "gl_Basketball_WNBA_G"
+        elif self.sport_name == "UFC":
+            label_for = "gl_Fighting_UFC_G"
         else:
             label_for = "gl_Baseball_MLB_G"
 
@@ -861,20 +871,16 @@ class BetamapolaController:
 
     def _get_api_payload(self):
         if self.sport_name == "NBA":
-            return {
-                "sportType": "Basketball",
-                "sportSubType": "NBA",
-                "wagerType": "Straight Bet",
-                "hoursAdjustment": 0,
-                "periodNumber": None,
-                "gameNum": None,
-                "parentGameNum": None,
-                "teaserName": "",
-                "requestMode": None,
-            }
+            sport_type, sport_sub = "Basketball", "NBA"
+        elif self.sport_name == "WNBA":
+            sport_type, sport_sub = "Basketball", "WNBA"
+        elif self.sport_name == "UFC":
+            sport_type, sport_sub = "Fighting", "UFC"
+        else:
+            sport_type, sport_sub = "Baseball", "MLB"
         return {
-            "sportType": "Baseball",
-            "sportSubType": "MLB",
+            "sportType": sport_type,
+            "sportSubType": sport_sub,
             "wagerType": "Straight Bet",
             "hoursAdjustment": 0,
             "periodNumber": None,
@@ -937,7 +943,10 @@ class BetamapolaController:
             try:
                 self.wait.until(
                     EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, "a.sportIcon, a#img_Baseball, a#img_Basketball")
+                        (
+                            By.CSS_SELECTOR,
+                            "a.sportIcon, a#img_Baseball, a#img_Basketball, a#img_Fighting",
+                        )
                     )
                 )
                 sidebar_ready = True
@@ -954,6 +963,23 @@ class BetamapolaController:
                     "#gl_Basketball_NBA_G",
                     "label[for='gl_Basketball_NBA_G']",
                 ]
+                expand_selector = "a#img_Basketball, a[data-target='#sp_Basketball']"
+            elif self.sport_name == "WNBA":
+                sport_selectors = [
+                    "a#img_Basketball",
+                    "a[data-target='#sp_Basketball']",
+                    "#gl_Basketball_WNBA_G",
+                    "label[for='gl_Basketball_WNBA_G']",
+                ]
+                expand_selector = "a#img_Basketball, a[data-target='#sp_Basketball']"
+            elif self.sport_name == "UFC":
+                sport_selectors = [
+                    "a#img_Fighting",
+                    "a[data-target='#sp_Fighting']",
+                    "#gl_Fighting_UFC_G",
+                    "label[for='gl_Fighting_UFC_G']",
+                ]
+                expand_selector = "a#img_Fighting, a[data-target='#sp_Fighting']"
             else:
                 sport_selectors = [
                     "a#img_Baseball",
@@ -961,14 +987,12 @@ class BetamapolaController:
                     "#gl_Baseball_MLB_G",
                     "label[for='gl_Baseball_MLB_G']",
                 ]
+                expand_selector = "a#img_Baseball, a[data-target='#sp_Baseball']"
 
             try:
-                if self.sport_name == "MLB":
-                    baseball_link = self.driver.find_element(
-                        By.CSS_SELECTOR, "a#img_Baseball, a[data-target='#sp_Baseball']"
-                    )
-                    self.driver.execute_script("arguments[0].click();", baseball_link)
-                    time.sleep(1)
+                sport_link = self.driver.find_element(By.CSS_SELECTOR, expand_selector)
+                self.driver.execute_script("arguments[0].click();", sport_link)
+                time.sleep(1)
             except Exception as e:
                 self.logger.warning(f"Could not expand sport section: {e}")
                 continue
@@ -993,8 +1017,10 @@ class BetamapolaController:
                             var el = document.querySelector(selectors[i]);
                             if (el) { el.click(); return selectors[i]; }
                         }
-                        var label = document.querySelector('label[for="gl_Baseball_MLB_G"]')
-                            || document.querySelector('label[for="gl_Basketball_NBA_G"]');
+                        var label = document.querySelector('label[for="gl_Fighting_UFC_G"]')
+                            || document.querySelector('label[for="gl_Baseball_MLB_G"]')
+                            || document.querySelector('label[for="gl_Basketball_NBA_G"]')
+                            || document.querySelector('label[for="gl_Basketball_WNBA_G"]');
                         if (label) { label.click(); return label.getAttribute('for'); }
                         return null;
                     """, sport_selectors[2:])
@@ -1052,8 +1078,10 @@ class BetamapolaController:
 
     def _min_expected_full_game_lines(self) -> int:
         """Minimum full-game lines before we treat the SPA offering as degraded."""
-        if self.sport_name == "NBA":
+        if self.sport_name in ("NBA", "WNBA"):
             return 2
+        if self.sport_name == "UFC":
+            return int(os.getenv("BETAMAPOLA_MIN_EXPECTED_UFC_LINES", "2"))
         return int(os.getenv("BETAMAPOLA_MIN_EXPECTED_MLB_LINES", "3"))
 
     @staticmethod

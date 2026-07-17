@@ -63,8 +63,11 @@ check_one() {
   # use script name + stack-specific lock files.
   check_one "sports411_betting_wnba" "run_stack_job.sh wnba sports411_betting.py" "/tmp/sports411_betting_wnba.lock"
   check_one "sports411_betting_mlb" "run_stack_job.sh mlb sports411_betting.py" "/tmp/sports411_betting_mlb.lock"
+  check_one "sports411_betting_ufc" "run_stack_job.sh ufc sports411_betting.py" "/tmp/sports411_betting_ufc.lock"
   check_one "betamapola_betting_wnba" "run_stack_job.sh wnba betamapola_betting.py" "/tmp/betamapola_betting_wnba.lock"
   check_one "betamapola_betting_mlb" "run_stack_job.sh mlb betamapola_betting.py" "/tmp/betamapola_betting_mlb.lock"
+  check_one "betamapola_betting_ufc" "run_stack_job.sh ufc betamapola_betting.py" "/tmp/betamapola_betting_ufc.lock"
   check_one "fourcasters_betting_wnba" "run_stack_job.sh wnba fourcasters_betting.py" "/tmp/fourcasters_betting_wnba.lock"
   check_one "fourcasters_betting_mlb" "run_stack_job.sh mlb fourcasters_betting.py" "/tmp/fourcasters_betting_mlb.lock"
+  check_one "fourcasters_betting_ufc" "run_stack_job.sh ufc fourcasters_betting.py" "/tmp/fourcasters_betting_ufc.lock"
 } >>"$LOG_FILE" 2>&1

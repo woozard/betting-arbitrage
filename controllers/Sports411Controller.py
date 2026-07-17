@@ -148,8 +148,15 @@ class Sports411Controller:
             self.sport_url = f"https://be.{self.website}/en/sports/baseball/mlb/game-lines/"
             self.sport_name = "MLB"
             self.league = "MLB"
+        elif self.sport in ["ufc", "mma", "fighting"]:
+            self.sport_url = f"https://be.{self.website}/en/sports/martial-arts/mma/ufc/"
+            self.sport_name = "UFC"
+            self.league = "UFC"
         else:
-            raise ValueError(f"Unsupported sport: {sport}. Use 'basketball'/'nba', 'wnba', or 'baseball'/'mlb'.")
+            raise ValueError(
+                f"Unsupported sport: {sport}. Use 'basketball'/'nba', 'wnba', "
+                f"'baseball'/'mlb', or 'ufc'/'mma'."
+            )
 
         # Timezone for game times returned by this book's page.
         # All game_datetimes are normalized to UTC via pytz for consistent matching
@@ -165,6 +172,8 @@ class Sports411Controller:
             self.game_lines_path = "/basketball/nba/game-lines"
         elif self.sport == "wnba":
             self.game_lines_path = "/basketball/wnba/game-lines"
+        elif self.sport in ["ufc", "mma", "fighting"]:
+            self.game_lines_path = "/martial-arts/mma/ufc"
         else:
             self.game_lines_path = "/baseball/mlb/game-lines"
 
