@@ -141,7 +141,8 @@ STACKS = (
         "arb_pattern": "run_stack_job.sh mlb arbitrage.py",
         "arb_log": "arbitrage_mlb.log",
         "arb_job": "arbitrage_mlb",
-        "books": ("sports411_mlb", "betamapola_mlb", "4casters_mlb", "ps3838_mlb"),
+        # ps3838_mlb deactivated until API access is unblocked
+        "books": ("sports411_mlb", "betamapola_mlb", "4casters_mlb"),
     },
 )
 
