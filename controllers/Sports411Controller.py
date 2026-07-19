@@ -27,6 +27,7 @@ from utils.config import (
     is_active_arb_pair,
     required_first_leg_book,
     S411_FAST_PLACE,
+    HEDGE_MIN_PROFIT_PCT,
 )
 from utils.logger import Logger
 from utils.storage import Storage
@@ -41,7 +42,11 @@ from utils.helpers import (
     spread_values_match,
 )
 from utils.bet_screenshot import verify_s411_open_bet_ticket
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
+from utils.moneyline_odds import (
+    arb_moneyline_odds_acceptable,
+    combined_arb_profit_pct,
+    hedge_line_acceptable,
+)
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.odds_watch import persist_moneyline_games
@@ -58,7 +63,7 @@ from utils.bet_placement import (
     mark_arb_execution_pause_on_placement_start,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
 )
@@ -1812,10 +1817,42 @@ class Sports411Controller:
         return int(float(moneyline_odd))
 
     def _arb_odds_match(self, cached_odd, live_odd) -> bool:
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None:
+            return hedge_line_acceptable(
+                hedge_ref, live_odd, HEDGE_MIN_PROFIT_PCT
+            )
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
         return arb_moneyline_odds_acceptable(cached_odd, live_odd, tolerance)
 
     def _reject_if_line_moved(self, cached_odd, live_odd, where: str):
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None:
+            if hedge_line_acceptable(hedge_ref, live_odd, HEDGE_MIN_PROFIT_PCT):
+                profit = combined_arb_profit_pct(hedge_ref, live_odd)
+                try:
+                    from utils.helpers import american_odds_to_int
+                    if american_odds_to_int(cached_odd) != american_odds_to_int(live_odd):
+                        self.logger.info(
+                            f"Accepting hedge line at {where}: live {live_odd} "
+                            f"(arb {cached_odd}) vs other-leg {hedge_ref} "
+                            f"(locked profit {profit:.2f}% >= {HEDGE_MIN_PROFIT_PCT:g}%)"
+                        )
+                except (TypeError, ValueError):
+                    self.logger.info(
+                        f"Accepting hedge line at {where}: live {live_odd} "
+                        f"vs other-leg {hedge_ref} "
+                        f"(locked profit {profit:.2f}% >= {HEDGE_MIN_PROFIT_PCT:g}%)"
+                    )
+                return
+            profit = combined_arb_profit_pct(hedge_ref, live_odd)
+            profit_txt = f"{profit:.2f}" if profit is not None else "n/a"
+            raise Exception(
+                f"Hedge line not profitable ({where}): live {live_odd} "
+                f"vs other-leg {hedge_ref} "
+                f"(locked profit {profit_txt}% < {HEDGE_MIN_PROFIT_PCT:g}%)"
+            )
+
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
         if self._arb_odds_match(cached_odd, live_odd):
             if tolerance > 0:
@@ -2749,8 +2786,16 @@ class Sports411Controller:
                     self._clear_hedge_preposition(pair_key)
             return "deferred", False, None
 
-        self._odds_tolerance = odds_tolerance_for_placement(
-            self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+        self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+            self.cache,
+            arb,
+            book_1,
+            book_2,
+            self.bookmaker,
+            bet_type,
+            logger=self.logger,
+            team_1=team_1,
+            team_2=team_2,
         )
         stake = resolve_arb_leg_stake(
             self.cache,
@@ -3267,13 +3312,17 @@ class Sports411Controller:
                         self.cache.remove_arbitrage_for_bookmaker(arb, self.bookmaker)
                         continue
 
-                    self._odds_tolerance = odds_tolerance_for_placement(
-                        self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                    self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        bet_type,
+                        logger=self.logger,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
-                    if self._odds_tolerance:
-                        self.logger.info(
-                            f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
-                        )
 
                     mark_arb_execution_pause_on_placement_start(
                         self.cache,

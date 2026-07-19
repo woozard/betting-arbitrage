@@ -19,7 +19,7 @@ from utils.bet_placement import (
     should_notify_failed_bet,
     mark_arb_execution_pause_on_placement_start,
     should_pause_first_leg_for_exposure,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
 )
@@ -34,6 +34,7 @@ from utils.config import (
     FOURCASTERS_WNBA_LEAGUE,
     FOURCASTERS_UFC_LEAGUE,
     FOURCASTERS_FAST_PLACE,
+    HEDGE_MIN_PROFIT_PCT,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.fourcasters_client import FourCastersApiError, FourCastersClient
@@ -42,6 +43,11 @@ from utils.fourcasters_odds import (
     fourcasters_gross_to_net_taker_odds,
     fourcasters_taker_odds_acceptable,
 )
+from utils.moneyline_odds import (
+    arb_moneyline_odds_acceptable,
+    combined_arb_profit_pct,
+    hedge_line_acceptable,
+)
 from utils.helpers import (
     is_game_pregame,
     parse_to_mysql_datetime,
@@ -49,7 +55,6 @@ from utils.helpers import (
     teams_same,
     american_odds_to_int,
 )
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
 from utils.storage import Storage
@@ -398,6 +403,11 @@ class FourCastersController:
         return self._format_american_str(net)
 
     def _arb_odds_exact_match(self, live_odds: str, expected_odds: str) -> bool:
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None:
+            return hedge_line_acceptable(
+                hedge_ref, live_odds, HEDGE_MIN_PROFIT_PCT
+            )
         tol = getattr(self, "_odds_tolerance", 0) or 0
         return arb_moneyline_odds_acceptable(expected_odds, live_odds, tol)
 
@@ -698,21 +708,31 @@ class FourCastersController:
             spread_number = None
 
         tol = getattr(self, "_odds_tolerance", 0) or 0
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
         if bet_type == "spread":
             if live_odds is not None and not self._arb_odds_exact_match(live_odds, moneyline_odd):
                 raise FourCastersApiError(
                     f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
                     + (f" (tolerance ±{tol})" if tol > 0 else "")
                 )
-        elif live_gross is not None and not fourcasters_taker_odds_acceptable(
-            moneyline_odd, live_gross, tol
-        ):
-            net_live = fourcasters_gross_to_net_taker_odds(live_gross)
-            raise FourCastersApiError(
-                f"Line moved: live gross {live_gross} (net {net_live:+d}) "
-                f"differ from arb net odds {moneyline_odd}"
-                + (f" (tolerance ±{tol})" if tol > 0 else "")
-            )
+        elif live_gross is not None:
+            if hedge_ref is not None:
+                net_live = fourcasters_gross_to_net_taker_odds(live_gross)
+                if not hedge_line_acceptable(hedge_ref, net_live, HEDGE_MIN_PROFIT_PCT):
+                    profit = combined_arb_profit_pct(hedge_ref, net_live)
+                    profit_txt = f"{profit:.2f}" if profit is not None else "n/a"
+                    raise FourCastersApiError(
+                        f"Hedge line not profitable: live gross {live_gross} "
+                        f"(net {net_live:+d}) vs other-leg {hedge_ref} "
+                        f"(locked profit {profit_txt}% < {HEDGE_MIN_PROFIT_PCT:g}%)"
+                    )
+            elif not fourcasters_taker_odds_acceptable(moneyline_odd, live_gross, tol):
+                net_live = fourcasters_gross_to_net_taker_odds(live_gross)
+                raise FourCastersApiError(
+                    f"Line moved: live gross {live_gross} (net {net_live:+d}) "
+                    f"differ from arb net odds {moneyline_odd}"
+                    + (f" (tolerance ±{tol})" if tol > 0 else "")
+                )
 
         try:
             american_odds = american_odds_to_int(moneyline_odd)
@@ -925,8 +945,16 @@ class FourCastersController:
                     ):
                         continue
 
-                    self._odds_tolerance = odds_tolerance_for_placement(
-                        self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                    self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        bet_type,
+                        logger=self.logger,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
 
                     stake = resolve_arb_leg_stake(

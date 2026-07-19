@@ -21,6 +21,7 @@ from utils.config import (
     ZENROWS_API_KEY,
     is_active_arb_pair,
     BETAMAPOLA_API_PLACEMENT,
+    HEDGE_MIN_PROFIT_PCT,
 )
 from utils.betamapola_offering import parse_get_sport_offering_response
 from utils.betamapola_wager_api import (
@@ -35,7 +36,10 @@ from utils.betamapola_wager_api import (
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, normalize_team, teams_same, resolve_ticosports_spread_lines, spread_values_match
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
+from utils.moneyline_odds import (
+    arb_moneyline_odds_acceptable,
+    hedge_line_acceptable,
+)
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.ticosports_wager import (
@@ -60,7 +64,7 @@ from utils.bet_placement import (
     resolve_arb_leg_stake,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
 )
@@ -446,6 +450,11 @@ class BetamapolaController:
             return text if text.startswith(("+", "-")) else f"+{text}"
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None and hedge_line_acceptable(
+            hedge_ref, displayed, HEDGE_MIN_PROFIT_PCT
+        ):
+            return True
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
         if tolerance > 0 and arb_moneyline_odds_acceptable(expected, displayed, tolerance):
             return True
@@ -3049,13 +3058,17 @@ class BetamapolaController:
                     )
                     continue
 
-                self._odds_tolerance = odds_tolerance_for_placement(
-                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                    self.cache,
+                    arb,
+                    book_1,
+                    book_2,
+                    self.bookmaker,
+                    bet_type,
+                    logger=self.logger,
+                    team_1=team_1,
+                    team_2=team_2,
                 )
-                if self._odds_tolerance:
-                    self.logger.info(
-                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
-                    )
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(

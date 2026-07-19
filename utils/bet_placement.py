@@ -762,6 +762,80 @@ def odds_tolerance_for_placement(
     return 0
 
 
+def hedge_completion_reference_odds(
+    cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
+):
+    """Other-leg effective odds to profit-check the completing (hedge) leg against.
+
+    Returns the other leg's American odds when this placement completes a hedge
+    (second leg, or first-leg book once the other leg is placed / partial exposure),
+    else None so the caller falls back to exact/±tolerance matching.
+
+    Prefers the other leg's *confirmed fill* odds; falls back to the cached arb odds.
+    """
+    from utils.config import HEDGE_ODDS_PROFIT_ACCEPTANCE
+
+    if not HEDGE_ODDS_PROFIT_ACCEPTANCE:
+        return None
+    # Only moneyline for now; spread hedges keep the wider ±point tolerance.
+    if (bet_type or "moneyline").strip().lower() != "moneyline":
+        return None
+
+    bm = (bookmaker or "").strip().lower()
+    b1 = (book_1 or "").strip().lower()
+    other_book = book_2 if bm == b1 else book_1
+    pair_key = cache.arb_pair_key_from_arb(arb)
+
+    is_second_leg = not is_first_leg_bookmaker(book_1, book_2, bm)
+    other_placed = cache.is_arb_leg_placed(arb, other_book)
+    partial = cache.has_partial_exposure_for_pair(pair_key)
+    if not (is_second_leg or other_placed or partial):
+        return None
+
+    first_stake = _confirmed_other_leg_stake(cache, arb, bookmaker)
+    if first_stake is not None:
+        return first_stake.american_odds
+    return arb.get("team_2_odds") if bm == b1 else arb.get("team_1_odds")
+
+
+def configure_leg_odds_policy(
+    cache,
+    arb: dict,
+    book_1: str,
+    book_2: str,
+    bookmaker: str,
+    bet_type: str,
+    *,
+    logger=None,
+    team_1: str | None = None,
+    team_2: str | None = None,
+) -> tuple:
+    """Return (hedge_ref_odds, odds_tolerance) for this placement.
+
+    Prefer profit-floor hedge acceptance (break-even worst click) over ±point bands.
+    """
+    from utils.config import HEDGE_MIN_PROFIT_PCT
+
+    ref = hedge_completion_reference_odds(
+        cache, arb, book_1, book_2, bookmaker, bet_type
+    )
+    matchup = f"{team_1 or arb.get('team_1')} vs {team_2 or arb.get('team_2')}"
+    if ref is not None:
+        if logger:
+            logger.info(
+                f"Hedge profit acceptance | other-leg {ref} | "
+                f"floor {HEDGE_MIN_PROFIT_PCT:g}% (break-even worst click) | {matchup}"
+            )
+        return ref, 0
+
+    tol = odds_tolerance_for_placement(
+        cache, arb, book_1, book_2, bookmaker, bet_type
+    )
+    if tol and logger:
+        logger.info(f"Second-leg odds tolerance ±{tol} | {matchup}")
+    return None, tol
+
+
 def should_defer_for_sequential_first_leg(
     cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
 ) -> bool:
@@ -1133,7 +1207,7 @@ def maybe_notify_partial_arb_exposure(
     if cache.is_arb_leg_placed(arb, failed_bookmaker):
         return
 
-    reason_text = format_bet_failure_reason(reason, failed_book)
+    reason_text = format_bet_failure_reason(reason, failed_bookmaker)
     schedule_failed_summary(
         cache,
         logger,

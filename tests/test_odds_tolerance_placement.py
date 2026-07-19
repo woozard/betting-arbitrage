@@ -110,7 +110,8 @@ def test_moneyline_first_leg_no_tolerance_without_hedge():
     assert tol == 0
 
 
-def test_moneyline_first_leg_gets_tolerance_when_other_leg_placed():
+def test_moneyline_hedge_leg_no_point_tolerance_by_default():
+    """ML hedges use profit acceptance; ±point band defaults to 0."""
     cache = ArbitrageCache()
     cache.redis = MemRedis()
     arb = _rockies_spread_arb()
@@ -121,4 +122,4 @@ def test_moneyline_first_leg_gets_tolerance_when_other_leg_placed():
     tol = odds_tolerance_for_placement(
         cache, arb, "betamapola", "4casters", "4casters", "moneyline"
     )
-    assert tol == 2
+    assert tol == 0
