@@ -8,6 +8,7 @@
 #
 # Usage:
 #   ./cleanup_disk.sh              # normal run (includes orphan chrome cleanup)
+#   CLEANUP_ORPHAN_CHROME_ONLY=1 ./cleanup_disk.sh  # light pass (health timer)
 #   CLEANUP_STOP_SERVICE=1 ./cleanup_disk.sh   # stop scheduler, kill all chrome, restart
 #   CLEANUP_KILL_ORPHAN_CHROME=0 ./cleanup_disk.sh  # skip orphan process kill
 #
@@ -15,7 +16,8 @@
 #   PROJECT_DIR, MIN_AGE_MINUTES, MAX_TMP_PROFILES, LOG_ROTATED_AGE_DAYS,
 #   LOG_DATED_AGE_DAYS, DEBUG_MAX_AGE_HOURS, DEBUG_MAX_MB,
 #   SCHEDULER_LOG_MAX_MB, KEEP_SCHEDULER_LOG_MB, JOURNAL_MAX_MB, DISK_WARN_PCT,
-#   CLEANUP_STOP_SERVICE, CLEANUP_KILL_ORPHAN_CHROME, ORPHAN_CHROME_MIN_AGE_SEC
+#   CLEANUP_STOP_SERVICE, CLEANUP_ORPHAN_CHROME_ONLY, CLEANUP_KILL_ORPHAN_CHROME,
+#   ORPHAN_CHROME_MIN_AGE_SEC
 
 set -euo pipefail
 
@@ -373,6 +375,18 @@ log_health_snapshot() {
 main() {
     cd "$PROJECT_DIR"
     mkdir -p logs/debug tmp
+
+    # Light path used by the healthcheck timer (~every 10 minutes).
+    if [[ "${CLEANUP_ORPHAN_CHROME_ONLY:-0}" == "1" ]]; then
+        log "=== orphan chrome cleanup start ==="
+        log "chrome before: $(count_chrome_procs)"
+        cleanup_orphan_chrome_procs
+        # Drop inactive profiles quickly after orphans are killed.
+        MIN_AGE_MINUTES=2 cleanup_tmp_profiles
+        log "chrome after: $(count_chrome_procs)"
+        log "=== orphan chrome cleanup end ==="
+        return 0
+    fi
 
     log "=== maintenance start (min_age=${MIN_AGE_MINUTES}m, max_profiles=${MAX_TMP_PROFILES}, orphan_chrome=${CLEANUP_KILL_ORPHAN_CHROME}) ==="
     log "disk before: $(df -h / | awk 'NR==2 {print $3 " used / " $2 " total (" $5 " full)"}')"

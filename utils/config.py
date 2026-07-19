@@ -210,6 +210,8 @@ BETAMAPOLA_API_PLACEMENT = os.getenv("BETAMAPOLA_API_PLACEMENT", "true").lower()
 OPS_ODDS_STALE_SECONDS = int(os.getenv("OPS_ODDS_STALE_SEC", "90"))
 OPS_ARB_SCAN_STALE_SECONDS = int(os.getenv("OPS_ARB_SCAN_STALE_SEC", "30"))
 OPS_REMEDIATE_COOLDOWN_SECONDS = int(os.getenv("OPS_REMEDIATE_COOLDOWN_SEC", "300"))
+# Proactive orphan Chrome/chromedriver sweep (ops health agent).
+OPS_CHROME_ORPHAN_CLEANUP_SECONDS = int(os.getenv("OPS_CHROME_ORPHAN_CLEANUP_SEC", "600"))
 OPS_HEALTH_CHECK_ENABLED = os.getenv("OPS_HEALTH_CHECK_ENABLED", "true").lower() in (
     "1", "true", "yes",
 )

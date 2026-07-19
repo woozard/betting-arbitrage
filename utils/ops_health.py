@@ -21,6 +21,7 @@ from utils.chrome_temp import cleanup_stale_temp_dirs
 from utils.config import (
     ACTIVE_ARB_BOOKMAKERS,
     OPS_ARB_SCAN_STALE_SECONDS,
+    OPS_CHROME_ORPHAN_CLEANUP_SECONDS,
     OPS_ODDS_STALE_SECONDS,
     OPS_REMEDIATE_COOLDOWN_SECONDS,
     TELEGRAM,
@@ -140,12 +141,17 @@ def _lock_path(job_name: str) -> str:
     return f"/tmp/{job_name}.lock"
 
 
-def _remediation_cooldown_ok(key: str) -> bool:
+def _remediation_cooldown_ok(key: str, cooldown_seconds: int | None = None) -> bool:
     path = f"/tmp/ops_remediate_{key}.ts"
     if not os.path.exists(path):
         return True
     try:
-        return time.time() - os.path.getmtime(path) >= OPS_REMEDIATE_COOLDOWN_SECONDS
+        limit = (
+            OPS_REMEDIATE_COOLDOWN_SECONDS
+            if cooldown_seconds is None
+            else cooldown_seconds
+        )
+        return time.time() - os.path.getmtime(path) >= limit
     except Exception:
         return True
 
@@ -157,6 +163,24 @@ def _mark_remediation(key: str) -> None:
             f.write(str(time.time()))
     except Exception:
         pass
+
+
+def _maybe_sweep_orphan_chrome(logger=None) -> Optional[str]:
+    """Reap orphan Selenium Chromes about every OPS_CHROME_ORPHAN_CLEANUP_SECONDS."""
+    key = "orphan_chrome_sweep"
+    if not _remediation_cooldown_ok(
+        key, cooldown_seconds=OPS_CHROME_ORPHAN_CLEANUP_SECONDS
+    ):
+        return None
+    actions = [
+        _kill_orphan_chrome_profiles(),
+        _cleanup_chrome_temps(aggressive=False),
+    ]
+    _mark_remediation(key)
+    line = "; ".join(actions)
+    if logger:
+        logger.info(f"Orphan chrome sweep: {line}")
+    return line
 
 
 def _clear_stale_lock(job_name: str) -> str:
@@ -549,6 +573,11 @@ def run_health_cycle(logger=None) -> dict:
 
     remediated: list[str] = []
     alerts: list[str] = []
+
+    # Proactive orphan Chrome cleanup (~every 10 minutes), even with no issues.
+    sweep = _maybe_sweep_orphan_chrome(logger=logger)
+    if sweep:
+        remediated.append(f"REMEDIATED system/orphan_chrome: {sweep}")
 
     for issue in issues:
         msg = f"[{issue.severity}] {issue.message}"

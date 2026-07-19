@@ -1,10 +1,10 @@
 [Unit]
-Description=Run betting-arbitrage health check every 5 minutes
+Description=Run betting-arbitrage health check every 10 minutes
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=5min
-AccuracySec=1min
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
 Persistent=true
 
 [Install]
