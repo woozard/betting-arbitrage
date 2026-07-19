@@ -21,7 +21,12 @@ is_job_running() {
 
 newest_log_for() {
   local prefix="$1"
-  ls -t "$LOG_DIR/${prefix}"-"$TODAY".log "$LOG_DIR/${prefix}"-*.log 2>/dev/null | head -1
+  # Prefer scheduler job logs (sports411_betting_wnba.log) then controller daily logs.
+  ls -t \
+    "$LOG_DIR/${prefix}".log \
+    "$LOG_DIR/${prefix}"-"$TODAY".log \
+    "$LOG_DIR/${prefix}"-*.log \
+    2>/dev/null | head -1
 }
 
 check_one() {
@@ -54,8 +59,15 @@ check_one() {
 
 {
   log "=== Health check (max stale ${MAX_STALE_SEC}s) ==="
-  check_one "sports411-betting-mlb" "sports411_betting.py" "/tmp/sports411_betting.lock"
-  check_one "betamapola-betting" "betamapola_betting.py" "/tmp/betamapola_betting.lock"
-  check_one "paradisewager-betting" "paradisewager_betting.py" "/tmp/paradisewager_betting.lock"
-  check_one "betwar-betting" "betwar_betting.py" "/tmp/betwar_betting.lock"
+  # Match stack runners via unique flock lock names in process table is hard;
+  # use script name + stack-specific lock files.
+  check_one "sports411_betting_wnba" "run_stack_job.sh wnba sports411_betting.py" "/tmp/sports411_betting_wnba.lock"
+  check_one "sports411_betting_mlb" "run_stack_job.sh mlb sports411_betting.py" "/tmp/sports411_betting_mlb.lock"
+  check_one "sports411_betting_ufc" "run_stack_job.sh ufc sports411_betting.py" "/tmp/sports411_betting_ufc.lock"
+  check_one "betamapola_betting_wnba" "run_stack_job.sh wnba betamapola_betting.py" "/tmp/betamapola_betting_wnba.lock"
+  check_one "betamapola_betting_mlb" "run_stack_job.sh mlb betamapola_betting.py" "/tmp/betamapola_betting_mlb.lock"
+  check_one "betamapola_betting_ufc" "run_stack_job.sh ufc betamapola_betting.py" "/tmp/betamapola_betting_ufc.lock"
+  check_one "fourcasters_betting_wnba" "run_stack_job.sh wnba fourcasters_betting.py" "/tmp/fourcasters_betting_wnba.lock"
+  check_one "fourcasters_betting_mlb" "run_stack_job.sh mlb fourcasters_betting.py" "/tmp/fourcasters_betting_mlb.lock"
+  check_one "fourcasters_betting_ufc" "run_stack_job.sh ufc fourcasters_betting.py" "/tmp/fourcasters_betting_ufc.lock"
 } >>"$LOG_FILE" 2>&1

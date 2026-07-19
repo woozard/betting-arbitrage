@@ -18,10 +18,19 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import sqlalchemy.exc
 
-from utils.config import PROXY1, PROXY2, TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, BETWAR_MY_BETS_RECOVERY
+from utils.config import (
+    PROXY1,
+    PROXY2,
+    TELEGRAM,
+    ZENROWS_API_KEY,
+    is_active_arb_pair,
+    BETWAR_MY_BETS_RECOVERY,
+    HEDGE_MIN_PROFIT_PCT,
+)
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import parse_to_mysql_datetime, parse_odds, currency_to_float, send_telegram_alert, send_monitoring_alert, send_testing_alert, is_game_pregame, debug_filepath, prune_debug_files, get_debug_dir, arb_live_odds_acceptable, american_odds_to_int, teams_same, resolve_ticosports_spread_lines, spread_values_match
+from utils.moneyline_odds import hedge_line_acceptable
 from utils.betwar_odds import (
     moneyline_int_odds_acceptable as betwar_moneyline_int_ok,
     moneyline_odds_acceptable as betwar_moneyline_ok,
@@ -49,7 +58,7 @@ from utils.bet_placement import (
     resolve_arb_leg_stake,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
 )
@@ -695,6 +704,11 @@ class BetWarController:
         return standard_team_name(raw, sport=self.sport_name, league=self.league)
 
     def _odds_text_matches(self, displayed: str, expected) -> bool:
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None and hedge_line_acceptable(
+            hedge_ref, displayed, HEDGE_MIN_PROFIT_PCT
+        ):
+            return True
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
         auth = getattr(self, "_getlines_authoritative_odds", None)
         return betwar_odds_text_matches(
@@ -5026,13 +5040,17 @@ class BetWarController:
                     )
                     continue
 
-                self._odds_tolerance = odds_tolerance_for_placement(
-                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                    self.cache,
+                    arb,
+                    book_1,
+                    book_2,
+                    self.bookmaker,
+                    bet_type,
+                    logger=self.logger,
+                    team_1=team_1,
+                    team_2=team_2,
                 )
-                if self._odds_tolerance:
-                    self.logger.info(
-                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
-                    )
 
                 stake_plan = base_amount_stake_from_odds(wager_odds, stake)
                 if BETWAR_MY_BETS_RECOVERY and self._my_bets_has_wager_for_arb(

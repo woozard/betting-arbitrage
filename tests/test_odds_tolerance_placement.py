@@ -1,11 +1,16 @@
-"""Tests for system-wide second-leg / hedge-completion odds tolerance."""
+"""Point tolerances removed — hedges use profit-floor acceptance."""
 import sys
 import types
 
 sys.modules.setdefault("redis", types.ModuleType("redis"))
 
 from cache.arbitrage_cache import ArbitrageCache
-from utils.bet_placement import odds_tolerance_for_placement
+from utils.bet_placement import (
+    configure_leg_odds_policy,
+    hedge_completion_reference_odds,
+    odds_tolerance_for_placement,
+)
+from utils.moneyline_odds import hedge_line_acceptable
 
 
 class MemRedis:
@@ -61,64 +66,58 @@ def _rockies_spread_arb() -> dict:
     }
 
 
-def test_spread_second_leg_book_always_gets_tolerance():
+def test_point_tolerance_always_zero_for_spread_and_ml():
     cache = ArbitrageCache()
     cache.redis = MemRedis()
     arb = _rockies_spread_arb()
+    cache.mark_arb_leg_placed(arb, "4casters")
 
-    tol = odds_tolerance_for_placement(
+    assert (
+        odds_tolerance_for_placement(
+            cache, arb, "betamapola", "4casters", "betamapola", "spread"
+        )
+        == 0
+    )
+    arb_ml = dict(arb)
+    arb_ml["bet_type"] = "moneyline"
+    arb_ml.pop("spread_value", None)
+    assert (
+        odds_tolerance_for_placement(
+            cache, arb_ml, "betamapola", "4casters", "betamapola", "moneyline"
+        )
+        == 0
+    )
+
+
+def test_spread_hedge_uses_profit_acceptance():
+    cache = ArbitrageCache()
+    cache.redis = MemRedis()
+    arb = _rockies_spread_arb()
+    cache.mark_arb_leg_placed(arb, "4casters")
+
+    ref = hedge_completion_reference_odds(
         cache, arb, "betamapola", "4casters", "betamapola", "spread"
     )
-    assert tol == 5
+    assert int(float(ref)) == -117
 
-
-def test_spread_first_leg_gets_tolerance_when_partial_exposure():
-    cache = ArbitrageCache()
-    cache.redis = MemRedis()
-    arb = _rockies_spread_arb()
-    pair_key = cache.arb_pair_key_from_arb(arb)
-    cache.mark_partial_exposure(pair_key)
-
-    tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "4casters", "spread"
-    )
-    assert tol == 5
-
-
-def test_spread_first_leg_gets_tolerance_when_other_leg_placed():
-    cache = ArbitrageCache()
-    cache.redis = MemRedis()
-    arb = _rockies_spread_arb()
-    cache.mark_arb_leg_placed(arb, "betamapola")
-
-    tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "4casters", "spread"
-    )
-    assert tol == 5
-
-
-def test_moneyline_first_leg_no_tolerance_without_hedge():
-    cache = ArbitrageCache()
-    cache.redis = MemRedis()
-    arb = _rockies_spread_arb()
-    arb["bet_type"] = "moneyline"
-    arb.pop("spread_value", None)
-
-    tol = odds_tolerance_for_placement(
-        cache, arb, "betamapola", "4casters", "4casters", "moneyline"
+    ref2, tol = configure_leg_odds_policy(
+        cache, arb, "betamapola", "4casters", "betamapola", "spread"
     )
     assert tol == 0
+    assert int(float(ref2)) == -117
+    # Still-profitable juice move vs other-leg -117
+    assert hedge_line_acceptable(ref2, 110, min_profit_pct=0)
 
 
-def test_moneyline_first_leg_gets_tolerance_when_other_leg_placed():
+def test_moneyline_first_leg_no_hedge_ref():
     cache = ArbitrageCache()
     cache.redis = MemRedis()
     arb = _rockies_spread_arb()
     arb["bet_type"] = "moneyline"
     arb.pop("spread_value", None)
-    cache.mark_arb_leg_placed(arb, "betamapola")
 
-    tol = odds_tolerance_for_placement(
+    ref, tol = configure_leg_odds_policy(
         cache, arb, "betamapola", "4casters", "4casters", "moneyline"
     )
-    assert tol == 2
+    assert ref is None
+    assert tol == 0

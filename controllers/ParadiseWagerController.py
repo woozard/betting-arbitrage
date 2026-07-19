@@ -11,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair
+from utils.config import TELEGRAM, ZENROWS_API_KEY, is_active_arb_pair, HEDGE_MIN_PROFIT_PCT
 from utils.logger import Logger
 from utils.storage import Storage
 from utils.helpers import (
@@ -25,7 +25,7 @@ from utils.helpers import (
     spread_values_match,
     resolve_paradise_team_spread_lines,
 )
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
+from utils.moneyline_odds import arb_moneyline_odds_acceptable, hedge_line_acceptable
 from utils.arb_placement import get_arbitrage_for_placement, arb_leg_for_book
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.bet_placement import (
@@ -39,7 +39,7 @@ from utils.bet_placement import (
     resolve_arb_leg_stake,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
 )
@@ -390,6 +390,11 @@ class ParadiseWagerController:
         return exp in raw or raw == str(expected).strip()
 
     def _arb_odds_exact_match(self, displayed, expected) -> bool:
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None:
+            return hedge_line_acceptable(
+                hedge_ref, displayed, HEDGE_MIN_PROFIT_PCT
+            )
         tolerance = getattr(self, "_odds_tolerance", 0) or 0
         return arb_moneyline_odds_acceptable(expected, displayed, tolerance)
 
@@ -1831,13 +1836,17 @@ class ParadiseWagerController:
                     )
                     continue
 
-                self._odds_tolerance = odds_tolerance_for_placement(
-                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                    self.cache,
+                    arb,
+                    book_1,
+                    book_2,
+                    self.bookmaker,
+                    bet_type,
+                    logger=self.logger,
+                    team_1=team_1,
+                    team_2=team_2,
                 )
-                if self._odds_tolerance:
-                    self.logger.info(
-                        f"Second-leg odds tolerance ±{self._odds_tolerance} | {team_1} vs {team_2}"
-                    )
 
                 if self._has_existing_open_bet(team_name, team_1, team_2):
                     self.logger.warning(

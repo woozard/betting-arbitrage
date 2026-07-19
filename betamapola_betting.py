@@ -7,6 +7,7 @@ from utils.config import (
     BETAMAPOLA_PASSWORD,
     BETAMAPOLA_LABEL,
     BET_STAKE,
+    ARB_SPORT,
 )
 
 db = __get_db1_session__()
@@ -22,7 +23,7 @@ def main():
         label=BETAMAPOLA_LABEL,
     )
 
-    controller = BetamapolaController(account, BETAMAPOLA)
+    controller = BetamapolaController(account, BETAMAPOLA, sport=ARB_SPORT)
     controller.betting(stake=BET_STAKE)
 
 
