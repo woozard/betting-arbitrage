@@ -17,7 +17,7 @@ from utils.bet_placement import (
     resolve_arb_leg_stake,
     should_notify_failed_bet,
     should_pause_first_leg_for_exposure,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     should_skip_spread_arb_for_placement,
     should_skip_arb_leg_in_betting_loop,
 )
@@ -25,7 +25,12 @@ from utils.betting_watchdog import (
     BettingLoopWatchdog,
     OddsScanHealthWatchdog,
 )
-from utils.config import TELEGRAM, is_active_arb_pair, THREEET_MLB_COMPETITION_ID
+from utils.config import (
+    TELEGRAM,
+    is_active_arb_pair,
+    THREEET_MLB_COMPETITION_ID,
+    HEDGE_MIN_PROFIT_PCT,
+)
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.helpers import (
     decimal_to_american,
@@ -34,7 +39,10 @@ from utils.helpers import (
     send_monitoring_alert,
     teams_same,
 )
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
+from utils.moneyline_odds import (
+    arb_moneyline_odds_acceptable,
+    hedge_line_acceptable,
+)
 from utils.logger import Logger
 from utils.odds_watch import persist_moneyline_games
 from utils.storage import Storage
@@ -451,6 +459,11 @@ class ThreeEtController:
         return None, None
 
     def _arb_odds_exact_match(self, live_odds: str, expected_odds: str) -> bool:
+        hedge_ref = getattr(self, "_hedge_ref_odds", None)
+        if hedge_ref is not None:
+            return hedge_line_acceptable(
+                hedge_ref, live_odds, HEDGE_MIN_PROFIT_PCT
+            )
         tol = getattr(self, "_odds_tolerance", 0) or 0
         return arb_moneyline_odds_acceptable(expected_odds, live_odds, tol)
 
@@ -972,8 +985,16 @@ class ThreeEtController:
                 ):
                     continue
 
-                self._odds_tolerance = odds_tolerance_for_placement(
-                    self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                    self.cache,
+                    arb,
+                    book_1,
+                    book_2,
+                    self.bookmaker,
+                    bet_type,
+                    logger=self.logger,
+                    team_1=team_1,
+                    team_2=team_2,
                 )
 
                 stake = resolve_arb_leg_stake(

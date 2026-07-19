@@ -165,16 +165,9 @@ ARB_EXECUTION_PAUSE_SECONDS = int(os.getenv('ARB_EXECUTION_PAUSE_SECONDS', '300'
 TELEGRAM_ALERTS_ASYNC = os.getenv('TELEGRAM_ALERTS_ASYNC', 'true').lower() in (
     '1', 'true', 'yes',
 )
-# Legacy ±point second-leg juice band. Default off — ML hedges use profit acceptance
-# (HEDGE_ODDS_PROFIT_ACCEPTANCE) with break-even as the worst click.
-SECOND_LEG_ODDS_TOLERANCE = int(os.getenv('SECOND_LEG_ODDS_TOLERANCE', '0'))
-# Wider juice tolerance when completing spread hedges (leg 1 already on book).
-SPREAD_SECOND_LEG_ODDS_TOLERANCE = int(
-    os.getenv('SPREAD_SECOND_LEG_ODDS_TOLERANCE', '5')
-)
-# Completing (hedge) leg: accept ANY line that keeps the arb profitable instead of
-# a fixed ±point tolerance ("worst click" = break-even; anything better is a click).
-# This prevents rejecting still-profitable hedges at extreme odds (e.g. +634 vs +657).
+# Completing (hedge) leg for moneyline *and* spread juice: accept ANY American
+# odds that keep the arb at/above the profit floor instead of a fixed ±point
+# band ("worst click" = break-even; anything better is a click).
 HEDGE_ODDS_PROFIT_ACCEPTANCE = os.getenv(
     'HEDGE_ODDS_PROFIT_ACCEPTANCE', 'true'
 ).lower() in ('1', 'true', 'yes', 'on')

@@ -711,9 +711,16 @@ class FourCastersController:
         hedge_ref = getattr(self, "_hedge_ref_odds", None)
         if bet_type == "spread":
             if live_odds is not None and not self._arb_odds_exact_match(live_odds, moneyline_odd):
+                if hedge_ref is not None:
+                    profit = combined_arb_profit_pct(hedge_ref, live_odds)
+                    profit_txt = f"{profit:.2f}" if profit is not None else "n/a"
+                    raise FourCastersApiError(
+                        f"Hedge spread juice not profitable: live {live_odds} "
+                        f"vs other-leg {hedge_ref} "
+                        f"(locked profit {profit_txt}% < {HEDGE_MIN_PROFIT_PCT:g}%)"
+                    )
                 raise FourCastersApiError(
                     f"Line moved: live odds {live_odds} differ from arb odds {moneyline_odd}"
-                    + (f" (tolerance ±{tol})" if tol > 0 else "")
                 )
         elif live_gross is not None:
             if hedge_ref is not None:
@@ -731,7 +738,6 @@ class FourCastersController:
                 raise FourCastersApiError(
                     f"Line moved: live gross {live_gross} (net {net_live:+d}) "
                     f"differ from arb net odds {moneyline_odd}"
-                    + (f" (tolerance ±{tol})" if tol > 0 else "")
                 )
 
         try:

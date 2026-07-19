@@ -12,8 +12,6 @@ from utils.config import (
     SEQUENTIAL_ARB_BETTING,
     PARALLEL_EXCHANGE_ARB_BETTING,
     TELEGRAM_ALERTS_ASYNC,
-    SECOND_LEG_ODDS_TOLERANCE,
-    SPREAD_SECOND_LEG_ODDS_TOLERANCE,
     BET_STAKE,
     arb_pair_legs,
     required_first_leg_book,
@@ -741,24 +739,11 @@ def resolve_arb_leg_stake(
 def odds_tolerance_for_placement(
     cache, arb: dict, book_1: str, book_2: str, bookmaker: str, bet_type: str
 ) -> int:
-    """±tolerance on second-leg books and when completing a hedge (other leg / partial exposure)."""
-    bt = (bet_type or "moneyline").strip().lower()
-    tolerance = (
-        SPREAD_SECOND_LEG_ODDS_TOLERANCE
-        if bt == "spread"
-        else SECOND_LEG_ODDS_TOLERANCE
-    )
-    if tolerance <= 0:
-        return 0
-    bm = (bookmaker or "").strip().lower()
-    if not is_first_leg_bookmaker(book_1, book_2, bm):
-        return tolerance
-    pair_key = cache.arb_pair_key_from_arb(arb)
-    other_book = book_2 if bm == (book_1 or "").strip().lower() else book_1
-    if cache.is_arb_leg_placed(arb, other_book):
-        return tolerance
-    if cache.has_partial_exposure_for_pair(pair_key):
-        return tolerance
+    """Deprecated stub — ±point second-leg bands are removed.
+
+    Hedge juice uses profit-floor acceptance via configure_leg_odds_policy /
+    hedge_line_acceptable. Always returns 0.
+    """
     return 0
 
 
@@ -767,9 +752,9 @@ def hedge_completion_reference_odds(
 ):
     """Other-leg effective odds to profit-check the completing (hedge) leg against.
 
-    Returns the other leg's American odds when this placement completes a hedge
-    (second leg, or first-leg book once the other leg is placed / partial exposure),
-    else None so the caller falls back to exact/±tolerance matching.
+    Returns the other leg's American odds (ML or spread juice) when this placement
+    completes a hedge (second leg, or first-leg book once the other leg is placed /
+    partial exposure), else None so the caller requires an exact odds match.
 
     Prefers the other leg's *confirmed fill* odds; falls back to the cached arb odds.
     """
@@ -777,8 +762,8 @@ def hedge_completion_reference_odds(
 
     if not HEDGE_ODDS_PROFIT_ACCEPTANCE:
         return None
-    # Only moneyline for now; spread hedges keep the wider ±point tolerance.
-    if (bet_type or "moneyline").strip().lower() != "moneyline":
+    bt = (bet_type or "moneyline").strip().lower()
+    if bt not in ("moneyline", "spread"):
         return None
 
     bm = (bookmaker or "").strip().lower()
@@ -812,7 +797,8 @@ def configure_leg_odds_policy(
 ) -> tuple:
     """Return (hedge_ref_odds, odds_tolerance) for this placement.
 
-    Prefer profit-floor hedge acceptance (break-even worst click) over ±point bands.
+    Hedge legs use profit-floor acceptance (break-even worst click). Point
+    tolerances are fully removed — odds_tolerance is always 0.
     """
     from utils.config import HEDGE_MIN_PROFIT_PCT
 
@@ -820,20 +806,15 @@ def configure_leg_odds_policy(
         cache, arb, book_1, book_2, bookmaker, bet_type
     )
     matchup = f"{team_1 or arb.get('team_1')} vs {team_2 or arb.get('team_2')}"
+    bt = (bet_type or "moneyline").strip().lower()
     if ref is not None:
         if logger:
             logger.info(
-                f"Hedge profit acceptance | other-leg {ref} | "
+                f"Hedge profit acceptance ({bt}) | other-leg {ref} | "
                 f"floor {HEDGE_MIN_PROFIT_PCT:g}% (break-even worst click) | {matchup}"
             )
         return ref, 0
-
-    tol = odds_tolerance_for_placement(
-        cache, arb, book_1, book_2, bookmaker, bet_type
-    )
-    if tol and logger:
-        logger.info(f"Second-leg odds tolerance ±{tol} | {matchup}")
-    return None, tol
+    return None, 0
 
 
 def should_defer_for_sequential_first_leg(

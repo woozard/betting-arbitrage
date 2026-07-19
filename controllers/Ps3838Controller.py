@@ -10,7 +10,7 @@ from cache.arbitrage_cache import ArbitrageCache
 from utils.arb_placement import arb_leg_for_book, get_arbitrage_for_placement
 from utils.bet_placement import (
     finalize_confirmed_bet,
-    odds_tolerance_for_placement,
+    configure_leg_odds_policy,
     resolve_arb_leg_stake,
     should_defer_for_sequential_first_leg,
     should_pause_first_leg_for_exposure,
@@ -20,11 +20,11 @@ from utils.bet_placement import (
 )
 from utils.betting_loop import wait_for_arb_or_idle
 from utils.betting_watchdog import BettingLoopWatchdog, OddsScanHealthWatchdog
-from utils.config import TELEGRAM, is_active_arb_pair
+from utils.config import TELEGRAM, is_active_arb_pair, HEDGE_MIN_PROFIT_PCT
 from utils.exposure_cleanup import tick_exposure_cleanup
 from utils.helpers import is_game_pregame, parse_to_mysql_datetime, send_monitoring_alert, teams_same
 from utils.logger import Logger
-from utils.moneyline_odds import arb_moneyline_odds_acceptable
+from utils.moneyline_odds import arb_moneyline_odds_acceptable, hedge_line_acceptable
 from utils.odds_watch import persist_moneyline_games
 from utils.ps3838_client import DEFAULT_BASEBALL_SPORT_ID, Ps3838ApiError, Ps3838Client
 from utils.stake_sizing import BaseAmountStake, base_amount_stake_from_odds
@@ -377,7 +377,13 @@ class Ps3838Controller:
         line_id = line.get("lineId") or meta.get("line_id")
         if price is not None:
             live = int(round(float(price)))
-            if not arb_moneyline_odds_acceptable(
+            hedge_ref = getattr(self, "_hedge_ref_odds", None)
+            if hedge_ref is not None:
+                if not hedge_line_acceptable(hedge_ref, live, HEDGE_MIN_PROFIT_PCT):
+                    raise Ps3838ApiError(
+                        f"Hedge line not profitable: live {live:+d} vs other-leg {hedge_ref}"
+                    )
+            elif not arb_moneyline_odds_acceptable(
                 str(expected_american), str(live), getattr(self, "_odds_tolerance", 0) or 0
             ):
                 raise Ps3838ApiError(
@@ -594,8 +600,16 @@ class Ps3838Controller:
                     ):
                         continue
 
-                    self._odds_tolerance = odds_tolerance_for_placement(
-                        self.cache, arb, book_1, book_2, self.bookmaker, bet_type
+                    self._hedge_ref_odds, self._odds_tolerance = configure_leg_odds_policy(
+                        self.cache,
+                        arb,
+                        book_1,
+                        book_2,
+                        self.bookmaker,
+                        bet_type,
+                        logger=self.logger,
+                        team_1=team_1,
+                        team_2=team_2,
                     )
                     stake_amt = resolve_arb_leg_stake(
                         self.cache,

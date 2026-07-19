@@ -23,3 +23,9 @@ def test_min_profit_floor_enforced():
     # +0.59% should fail a 1% floor.
     assert not hedge_line_acceptable(-415, 431, min_profit_pct=1.0)
     assert hedge_line_acceptable(-415, 448, min_profit_pct=1.0)
+
+
+def test_spread_juice_uses_same_profit_formula():
+    # Spread juice is still American odds — same locked-profit rule.
+    assert hedge_line_acceptable(-110, 105, min_profit_pct=0)
+    assert not hedge_line_acceptable(-120, -110, min_profit_pct=0)
