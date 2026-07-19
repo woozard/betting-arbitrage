@@ -28,12 +28,12 @@ def discard_temp_dirs(*dirs, logger=None):
 
 
 def cleanup_stale_temp_dirs(active_dirs=None, max_age_seconds=3600, logger=None):
-    """Remove old brightdata_proxy_* / chrome_user_data_* dirs not in active_dirs."""
+    """Remove old Chrome/proxy temp dirs not in active_dirs."""
     active = {d for d in (active_dirs or []) if d}
     now = time.time()
     removed = 0
     try:
-        for pat in ("brightdata_proxy_*", "chrome_user_data_*"):
+        for pat in ("brightdata_proxy_*", "chrome_user_data_*", "fourcasters_chrome_*"):
             for d in glob.glob(os.path.join(PROJECT_TMP_DIR, pat)):
                 if d in active:
                     continue

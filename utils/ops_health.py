@@ -173,10 +173,62 @@ def _cleanup_chrome_temps(aggressive: bool = False) -> str:
     return f"pruned chrome temp dirs older than {max_age}s"
 
 
+def _live_book_job_pids() -> set[int]:
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", r"(_betting\.py|_odds\.py)"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return set()
+    if r.returncode != 0 or not r.stdout.strip():
+        return set()
+    out: set[int] = set()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            out.add(int(line))
+    return out
+
+
+def _pid_owned_by_live_job(pid: int, job_pids: set[int]) -> bool:
+    """True if pid descends from a live *_betting.py / *_odds.py process."""
+    if not job_pids or pid <= 1:
+        return False
+    seen: set[int] = set()
+    cur = pid
+    for _ in range(40):
+        if cur in job_pids:
+            return True
+        if cur <= 1 or cur in seen:
+            return False
+        seen.add(cur)
+        try:
+            with open(f"/proc/{cur}/stat", "r", encoding="utf-8") as fh:
+                # pid (comm) state ppid ...
+                body = fh.read()
+            close = body.rfind(")")
+            if close < 0:
+                return False
+            parts = body[close + 2 :].split()
+            cur = int(parts[1])  # ppid
+        except Exception:
+            return False
+    return False
+
+
 def _kill_orphan_chrome_profiles() -> str:
-    """Kill chromedriver/chrome tied to stale tmp profiles with no owning book process."""
-    killed = 0
-    for pat in ("chrome_user_data_*", "brightdata_proxy_*"):
+    """Kill chromedriver/chrome for project tmp profiles not owned by a live book job."""
+    job_pids = _live_book_job_pids()
+    killed_profiles = 0
+    killed_procs = 0
+    tmp_root = str(BASE_PATH / "tmp")
+    profile_pats = ("chrome_user_data_*", "brightdata_proxy_*", "fourcasters_chrome_*")
+
+    # Profile-dir path: kill browsers still attached to stale dirs.
+    for pat in profile_pats:
         for d in glob.glob(str(BASE_PATH / "tmp" / pat)):
             if not os.path.isdir(d):
                 continue
@@ -187,9 +239,14 @@ def _kill_orphan_chrome_profiles() -> str:
                 r = subprocess.run(
                     ["pgrep", "-f", d],
                     capture_output=True,
+                    text=True,
                     timeout=3,
                 )
-                if r.returncode != 0:
+                if r.returncode != 0 or not r.stdout.strip():
+                    continue
+                # Skip if any matching pid is still owned by a live book job.
+                pids = [int(x) for x in r.stdout.split() if x.isdigit()]
+                if any(_pid_owned_by_live_job(p, job_pids) for p in pids):
                     continue
                 subprocess.run(
                     ["pkill", "-f", d],
@@ -197,10 +254,60 @@ def _kill_orphan_chrome_profiles() -> str:
                     stderr=subprocess.DEVNULL,
                     timeout=5,
                 )
-                killed += 1
+                killed_profiles += 1
             except Exception:
                 pass
-    return f"killed orphan chrome for {killed} stale profile(s)"
+
+    # Process walk: chromedriver / project-tmp chrome with no live book ancestor.
+    try:
+        r = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) < 2 or not parts[0].isdigit():
+                    continue
+                pid = int(parts[0])
+                args = parts[1]
+                if "cleanup_disk" in args or "ops_health" in args:
+                    continue
+                low = args.lower()
+                is_driver = "chromedriver" in low
+                is_our = tmp_root in args and any(
+                    marker in args
+                    for marker in (
+                        "chrome_user_data_",
+                        "brightdata_proxy_",
+                        "fourcasters_chrome_",
+                    )
+                )
+                if not is_driver and not is_our:
+                    continue
+                if ".sports411-chrome-profile" in args:
+                    continue
+                if _pid_owned_by_live_job(pid, job_pids):
+                    continue
+                try:
+                    os.kill(pid, 15)
+                    killed_procs += 1
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return (
+        f"killed orphan chrome for {killed_profiles} stale profile(s); "
+        f"signalled {killed_procs} orphan pid(s)"
+    )
 
 
 def latest_odds_age_by_book() -> dict[str, int]:

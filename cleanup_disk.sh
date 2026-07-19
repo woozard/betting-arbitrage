@@ -1,20 +1,21 @@
 #!/bin/bash
 # Periodic server maintenance for betting-arbitrage on EC2.
 #
-# Safe to run while betting-arb is running: only removes temp dirs that are
-# (a) not referenced by any chrome/chromedriver/python process, and (b) older than
-# MIN_AGE_MINUTES (unless over MAX_TMP_PROFILES cap). Does NOT stop the scheduler
-# by default.
+# Safe to run while betting-arb is running:
+#   - kills Chrome/chromedriver orphans not owned by a live *_betting.py / *_odds.py job
+#   - removes tmp profile dirs not used by live jobs (age/cap based)
+# Does NOT stop the scheduler by default.
 #
 # Usage:
-#   ./cleanup_disk.sh              # normal run
-#   CLEANUP_STOP_SERVICE=1 ./cleanup_disk.sh   # stop scheduler first (maintenance only)
+#   ./cleanup_disk.sh              # normal run (includes orphan chrome cleanup)
+#   CLEANUP_STOP_SERVICE=1 ./cleanup_disk.sh   # stop scheduler, kill all chrome, restart
+#   CLEANUP_KILL_ORPHAN_CHROME=0 ./cleanup_disk.sh  # skip orphan process kill
 #
 # Environment overrides (optional):
 #   PROJECT_DIR, MIN_AGE_MINUTES, MAX_TMP_PROFILES, LOG_ROTATED_AGE_DAYS,
 #   LOG_DATED_AGE_DAYS, DEBUG_MAX_AGE_HOURS, DEBUG_MAX_MB,
 #   SCHEDULER_LOG_MAX_MB, KEEP_SCHEDULER_LOG_MB, JOURNAL_MAX_MB, DISK_WARN_PCT,
-#   CLEANUP_STOP_SERVICE
+#   CLEANUP_STOP_SERVICE, CLEANUP_KILL_ORPHAN_CHROME, ORPHAN_CHROME_MIN_AGE_SEC
 
 set -euo pipefail
 
@@ -30,7 +31,12 @@ KEEP_SCHEDULER_LOG_MB="${KEEP_SCHEDULER_LOG_MB:-8}"
 MAINT_LOG_MAX_MB="${MAINT_LOG_MAX_MB:-2}"
 JOURNAL_MAX_MB="${JOURNAL_MAX_MB:-150}"
 DISK_WARN_PCT="${DISK_WARN_PCT:-80}"
+CLEANUP_KILL_ORPHAN_CHROME="${CLEANUP_KILL_ORPHAN_CHROME:-1}"
+ORPHAN_CHROME_MIN_AGE_SEC="${ORPHAN_CHROME_MIN_AGE_SEC:-90}"
 CLEANUP_LOG="${PROJECT_DIR}/logs/cleanup_disk.log"
+
+# Manual VNC / seeded profiles — never kill these.
+PROTECTED_PROFILE_RE='\.sports411-chrome-profile|SPORTS411_CHROME_USER_DATA'
 
 log() {
     local line="[$(date -Iseconds)] $*"
@@ -57,15 +63,77 @@ truncate_file_tail() {
     fi
 }
 
+count_chrome_procs() {
+    # Count chrome + chromedriver processes (exclude this script / grep).
+    ps -eo pid=,args= 2>/dev/null \
+        | grep -E '(chrome|chromedriver|chromium)' \
+        | grep -vE '(cleanup_disk|grep)' \
+        | wc -l \
+        | tr -d ' '
+}
+
+collect_live_job_pids() {
+    # Python book jobs that own Selenium browsers.
+    pgrep -f '(_betting\.py|_odds\.py)' 2>/dev/null || true
+}
+
+pid_owned_by_live_job() {
+    # Walk PPID chain; true if this process descends from a live betting/odds job.
+    local pid="$1"
+    local jobs="$2"
+    local guard=0
+    local ppid
+
+    [[ -z "$pid" || "$pid" -le 1 ]] && return 1
+    [[ -z "$jobs" ]] && return 1
+
+    while [[ "$pid" -gt 1 && "$guard" -lt 40 ]]; do
+        if printf '%s\n' "$jobs" | grep -qxF "$pid"; then
+            return 0
+        fi
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+        [[ -z "$ppid" || "$ppid" == "$pid" ]] && break
+        pid="$ppid"
+        guard=$((guard + 1))
+    done
+    return 1
+}
+
 collect_active_tmp_dirs() {
-    # Paths currently referenced by chrome / chromedriver / betting jobs.
-    local active=()
-    local line path
+    # Profiles owned by live book jobs only (not orphan chrome — that was the leak).
+    local jobs active=()
+    local pid cmdline path
+    jobs="$(collect_live_job_pids)"
+    [[ -z "$jobs" ]] && return 0
+
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        # Job PID itself rarely has the profile path; scan its process group descendants
+        # via all chrome/chromedriver that descend from this job.
+        :
+    done <<< "$jobs"
+
     while IFS= read -r line; do
-        for path in $(echo "$line" | grep -oE "${PROJECT_DIR}/tmp/(chrome_user_data_[^ ]+|brightdata_proxy_[^ ]+)" || true); do
+        pid="$(echo "$line" | awk '{print $1}')"
+        cmdline="$(echo "$line" | cut -d' ' -f2-)"
+        [[ -z "$pid" ]] && continue
+        echo "$cmdline" | grep -qE "$PROTECTED_PROFILE_RE" && continue
+        if ! pid_owned_by_live_job "$pid" "$jobs"; then
+            continue
+        fi
+        for path in $(echo "$cmdline" | grep -oE "${PROJECT_DIR}/tmp/(chrome_user_data_[^ ]+|brightdata_proxy_[^ ]+|fourcasters_chrome_[^ ]+)" || true); do
             active+=("$path")
         done
-    done < <(pgrep -af 'chrome|chromedriver|_betting\.py|_odds\.py' 2>/dev/null || true)
+    done < <(ps -eo pid=,args= 2>/dev/null | grep -E '(chrome|chromedriver|chromium)' | grep -v grep || true)
+
+    # Also catch profile paths that appear on the python job cmdline (rare).
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        for path in $(echo "$cmdline" | grep -oE "${PROJECT_DIR}/tmp/(chrome_user_data_[^ ]+|brightdata_proxy_[^ ]+|fourcasters_chrome_[^ ]+)" || true); do
+            active+=("$path")
+        done
+    done <<< "$jobs"
 
     if ((${#active[@]})); then
         printf '%s\n' "${active[@]}" | sort -u
@@ -79,6 +147,107 @@ dir_is_active() {
     [[ -n "$active" ]] && echo "$active" | grep -qxF "$d"
 }
 
+proc_etime_seconds() {
+    # Parse ps etime ([[dd-]hh:]mm:ss) → seconds.
+    local etime="$1"
+    local days=0 hours=0 mins=0 secs=0
+    if [[ "$etime" == *-* ]]; then
+        days="${etime%%-*}"
+        etime="${etime#*-}"
+    fi
+    local IFS=':'
+    # shellcheck disable=SC2086
+    set -- $etime
+    if [[ $# -eq 3 ]]; then
+        hours=$1; mins=$2; secs=$3
+    elif [[ $# -eq 2 ]]; then
+        mins=$1; secs=$2
+    else
+        secs=$1
+    fi
+    echo $((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))
+}
+
+cleanup_orphan_chrome_procs() {
+    local before after killed=0 skipped_young=0 skipped_live=0 skipped_protected=0
+    local jobs pid etime age cmdline
+
+    before="$(count_chrome_procs)"
+    jobs="$(collect_live_job_pids)"
+    job_count=0
+    if [[ -n "$jobs" ]]; then
+        job_count="$(printf '%s\n' "$jobs" | grep -c . || true)"
+    fi
+
+    log "chrome before orphan cleanup: ${before} (live book jobs: ${job_count})"
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        pid="$(echo "$line" | awk '{print $1}')"
+        etime="$(echo "$line" | awk '{print $2}')"
+        cmdline="$(echo "$line" | cut -d' ' -f3-)"
+        [[ -z "$pid" ]] && continue
+
+        # Only touch browsers tied to this project's Selenium tmp profiles,
+        # or chromedriver binaries (always Selenium). Never touch VNC/manual profiles.
+        if echo "$cmdline" | grep -qE "$PROTECTED_PROFILE_RE"; then
+            skipped_protected=$((skipped_protected + 1))
+            continue
+        fi
+
+        local is_driver=0 is_our_profile=0
+        echo "$cmdline" | grep -qiE 'chromedriver' && is_driver=1
+        echo "$cmdline" | grep -qE "${PROJECT_DIR}/tmp/(chrome_user_data_|brightdata_proxy_|fourcasters_chrome_)" && is_our_profile=1
+
+        if (( is_driver == 0 && is_our_profile == 0 )); then
+            continue
+        fi
+
+        if pid_owned_by_live_job "$pid" "$jobs"; then
+            skipped_live=$((skipped_live + 1))
+            continue
+        fi
+
+        age="$(proc_etime_seconds "$etime")"
+        if (( age < ORPHAN_CHROME_MIN_AGE_SEC )); then
+            skipped_young=$((skipped_young + 1))
+            continue
+        fi
+
+        kill "$pid" 2>/dev/null || true
+        killed=$((killed + 1))
+    done < <(
+        ps -eo pid=,etime=,args= 2>/dev/null \
+            | grep -E '(chrome|chromedriver|chromium)' \
+            | grep -vE '(cleanup_disk|grep)' \
+            || true
+    )
+
+    sleep 1
+    # Escalate leftovers that still match our tmp profiles / chromedriver.
+    while IFS= read -r line; do
+        pid="$(echo "$line" | awk '{print $1}')"
+        cmdline="$(echo "$line" | cut -d' ' -f2-)"
+        [[ -z "$pid" ]] && continue
+        echo "$cmdline" | grep -qE "$PROTECTED_PROFILE_RE" && continue
+        if pid_owned_by_live_job "$pid" "$jobs"; then
+            continue
+        fi
+        if echo "$cmdline" | grep -qiE 'chromedriver' \
+            || echo "$cmdline" | grep -qE "${PROJECT_DIR}/tmp/(chrome_user_data_|brightdata_proxy_|fourcasters_chrome_)"; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done < <(
+        ps -eo pid=,args= 2>/dev/null \
+            | grep -E '(chrome|chromedriver|chromium)' \
+            | grep -vE '(cleanup_disk|grep)' \
+            || true
+    )
+
+    after="$(count_chrome_procs)"
+    log "orphan chrome kill: signalled=${killed}, live_kept=${skipped_live}, young_kept=${skipped_young}, protected_kept=${skipped_protected}; chrome after=${after}"
+}
+
 cleanup_tmp_profiles() {
     local removed=0
     local min_age="$MIN_AGE_MINUTES"
@@ -88,7 +257,7 @@ cleanup_tmp_profiles() {
     mapfile -t active_dirs < <(collect_active_tmp_dirs || true)
 
     shopt -s nullglob
-    for pat in tmp/chrome_user_data_* tmp/brightdata_proxy_*; do
+    for pat in tmp/chrome_user_data_* tmp/brightdata_proxy_* tmp/fourcasters_chrome_*; do
         [[ -d "$pat" ]] || continue
         all_dirs+=("$pat")
     done
@@ -106,12 +275,17 @@ cleanup_tmp_profiles() {
         done | sort -rn | awk '{print $2}'
     )
 
+    local active_set=""
+    if ((${#active_dirs[@]})); then
+        active_set="$(printf '%s\n' "${active_dirs[@]}")"
+    fi
+
     local idx=0
     for d in "${all_dirs[@]}"; do
         idx=$((idx + 1))
         local reason=""
 
-        if dir_is_active "$d"; then
+        if [[ -n "$active_set" ]] && printf '%s\n' "$active_set" | grep -qxF "$d"; then
             continue
         fi
 
@@ -128,7 +302,7 @@ cleanup_tmp_profiles() {
         removed=$((removed + 1))
     done
 
-    log "removed ${removed} tmp profile dir(s); ${#all_dirs[@]} total before cleanup"
+    log "removed ${removed} tmp profile dir(s); ${#all_dirs[@]} total before cleanup; ${#active_dirs[@]} live-owned kept"
 }
 
 prune_debug_artifacts() {
@@ -182,13 +356,17 @@ vacuum_journal_if_needed() {
 
 log_health_snapshot() {
     local use_pct="$1"
-    local svc mem avail
+    local svc mem avail chrome_n
     svc="$(systemctl is-active betting-arb 2>/dev/null || echo unknown)"
     mem="$(free -h | awk '/^Mem:/ {print $3 "/" $2 " used, " $7 " avail"}')"
     avail="$(df -h / | awk 'NR==2 {print $4 " free (" $5 " used)"}')"
-    log "health: betting-arb=${svc} | mem=${mem} | disk=${avail}"
+    chrome_n="$(count_chrome_procs)"
+    log "health: betting-arb=${svc} | chrome=${chrome_n} | mem=${mem} | disk=${avail}"
     if (( use_pct >= DISK_WARN_PCT )); then
         log "WARN: root filesystem at ${use_pct}% — review logs/tmp growth"
+    fi
+    if (( chrome_n > 80 )); then
+        log "WARN: chrome process count high (${chrome_n}) — orphan leak likely"
     fi
 }
 
@@ -196,8 +374,9 @@ main() {
     cd "$PROJECT_DIR"
     mkdir -p logs/debug tmp
 
-    log "=== maintenance start (min_age=${MIN_AGE_MINUTES}m, max_profiles=${MAX_TMP_PROFILES}) ==="
+    log "=== maintenance start (min_age=${MIN_AGE_MINUTES}m, max_profiles=${MAX_TMP_PROFILES}, orphan_chrome=${CLEANUP_KILL_ORPHAN_CHROME}) ==="
     log "disk before: $(df -h / | awk 'NR==2 {print $3 " used / " $2 " total (" $5 " full)"}')"
+    log "chrome before: $(count_chrome_procs)"
 
     local use_pct
     use_pct=$(df / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
@@ -208,7 +387,11 @@ main() {
         sleep 3
         pkill -f 'chromedriver' 2>/dev/null || true
         pkill -f 'google-chrome' 2>/dev/null || true
+        pkill -f 'chromium' 2>/dev/null || true
         sleep 2
+        log "chrome after full kill: $(count_chrome_procs)"
+    elif [[ "$CLEANUP_KILL_ORPHAN_CHROME" == "1" ]]; then
+        cleanup_orphan_chrome_procs
     fi
 
     cleanup_tmp_profiles
