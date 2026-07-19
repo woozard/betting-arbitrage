@@ -200,8 +200,9 @@ else:
 
 # Spread/run-line alert threshold (same min edge as ML by default).
 MIN_ARB_PROFIT_PCT_SPREAD = float(os.getenv('MIN_ARB_PROFIT_PCT_SPREAD', '1.01'))
+# Off by default — ML-only real-money betting (MLB/WNBA/UFC stacks).
 SPREAD_REAL_MONEY_BETTING_ENABLED = os.getenv(
-    'SPREAD_REAL_MONEY_BETTING_ENABLED', 'true'
+    'SPREAD_REAL_MONEY_BETTING_ENABLED', 'false'
 ).lower() in ('1', 'true', 'yes')
 # Spread/run-line arb detection + Telegram alerts (independent of spread betting).
 SPREAD_ARB_SCAN_ENABLED = os.getenv('SPREAD_ARB_SCAN_ENABLED', 'true').lower() in (

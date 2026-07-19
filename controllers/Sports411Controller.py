@@ -1784,8 +1784,16 @@ class Sports411Controller:
             self.sport_name = "MLB"
             self.league = "MLB"
             self.game_lines_path = "/baseball/mlb/game-lines"
+        elif self.sport in ["ufc", "mma", "fighting"]:
+            self.sport_url = f"https://be.{self.website}/en/sports/martial-arts/mma/ufc/"
+            self.sport_name = "UFC"
+            self.league = "UFC"
+            self.game_lines_path = "/martial-arts/mma/ufc"
         else:
-            raise ValueError(f"Unsupported sport: {sport}")
+            raise ValueError(
+                f"Unsupported sport: {sport}. Use 'basketball'/'nba', 'wnba', "
+                f"'baseball'/'mlb', or 'ufc'/'mma'."
+            )
 
     def _ensure_odds_session(self):
         """Login for odds fetch only when the browser session is missing or invalid."""

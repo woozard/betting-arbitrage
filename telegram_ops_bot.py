@@ -11,7 +11,7 @@ from utils.logger import Logger
 
 HELP_TEXT = (
     "Commands:\n"
-    "/scan — current MLB moneylines + arb % for active pairs\n"
+    "/scan — current MLB/WNBA/UFC moneylines + arb % for active pairs\n"
     "/help — this message"
 )
 
