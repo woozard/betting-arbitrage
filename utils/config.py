@@ -274,16 +274,15 @@ OPS_CHROME_WARN_COUNT = int(os.getenv("OPS_CHROME_WARN_COUNT", "160"))
 SPREAD_ARB_MAX_PROFIT_PCT = float(os.getenv("SPREAD_ARB_MAX_PROFIT_PCT", "2.0"))
 SPREAD_ODDS_MAX_AGE_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_AGE_SECONDS", "600"))
 SPREAD_ODDS_MAX_GAP_SECONDS = int(os.getenv("SPREAD_ODDS_MAX_GAP_SECONDS", "300"))
+# Default pairs for the MLB/WNBA/UFC stacks (S411 + Amapola + 4casters).
+_DEFAULT_ACTIVE_ARB_BOOK_PAIRS = (
+    "sports411:betamapola,4casters:betamapola,4casters:sports411"
+)
 ACTIVE_ARB_BOOK_PAIRS = frozenset(
     frozenset(b.strip().lower() for b in part.split(":") if b.strip())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,4casters:betamapola,betamapola:3et,"
-        "sports411:paradisewager,"
-        "sports411:lowvig,paradisewager:lowvig,"
-        "sports411:3et,paradisewager:3et,"
-        "4casters:sports411,4casters:paradisewager,"
-        "4casters:lowvig,4casters:3et",
+        _DEFAULT_ACTIVE_ARB_BOOK_PAIRS,
     ).split(",")
     if part.strip() and ":" in part
 )
@@ -291,12 +290,7 @@ ACTIVE_ARB_BOOK_PAIR_ORDER = tuple(
     (parts[0].strip().lower(), parts[1].strip().lower())
     for part in os.getenv(
         "ACTIVE_ARB_BOOK_PAIRS",
-        "sports411:betamapola,paradisewager:betamapola,4casters:betamapola,betamapola:3et,"
-        "sports411:paradisewager,"
-        "sports411:lowvig,paradisewager:lowvig,"
-        "sports411:3et,paradisewager:3et,"
-        "4casters:sports411,4casters:paradisewager,"
-        "4casters:lowvig,4casters:3et",
+        _DEFAULT_ACTIVE_ARB_BOOK_PAIRS,
     ).split(",")
     if part.strip() and ":" in part
     for parts in [part.strip().split(":", 1)]
