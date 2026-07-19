@@ -177,20 +177,34 @@ class ArbitrageController:
         *,
         keep_created_at: bool = False,
         require_plausible_moneyline: bool = False,
+        league: str | None = None,
+        filter_by_arb_sport: bool = True,
     ):
         """Pull recent moneyline odds from DB (populated by controllers like Sports411 and Betamapola).
 
         Returns only the *latest* row per bookmaker per normalized matchup to avoid
         comparing stale historical snapshots (or duplicate S411 game_ids) against each other.
+
+        Pass ``league`` to force a specific league (e.g. MLB/WNBA/UFC). When omitted and
+        ``filter_by_arb_sport`` is True, filter by the current stack's ``ARB_SPORT``.
         """
         cutoff = datetime.utcnow() - timedelta(minutes=minutes)
-        rows = (
+        q = (
             self.db.query(ArbitrageOdds)
             .filter(ArbitrageOdds.bet_type == "moneyline")
             .filter(ArbitrageOdds.created_at >= cutoff)
-            .order_by(ArbitrageOdds.created_at.desc())
-            .all()
         )
+        try:
+            from utils.config import arb_sport_to_league
+
+            league_filter = (league or "").strip().upper() or None
+            if league_filter is None and filter_by_arb_sport:
+                league_filter = arb_sport_to_league()
+            if league_filter:
+                q = q.filter(ArbitrageOdds.league == league_filter)
+        except Exception:
+            pass
+        rows = q.order_by(ArbitrageOdds.created_at.desc()).all()
 
         # Build list with created_at for deduping (query is newest-first).
         results = []

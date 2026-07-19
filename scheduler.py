@@ -12,17 +12,29 @@ PYTHON_BIN = f"{BASE_PATH}/venv/bin/python3"
 
 print(f"BASE_PATH resolved to: {BASE_PATH}")  # helpful debug line
 
+
 def load_jobs():
-    with open(f"{BASE_PATH}/jobs.yml", "r") as f:
+    jobs_yml = os.getenv("JOBS_YML", "jobs.yml")
+    path = jobs_yml if os.path.isabs(jobs_yml) else f"{BASE_PATH}/{jobs_yml}"
+    with open(path, "r") as f:
         return yaml.safe_load(f)["jobs"]
+
 
 def run_job(job):
     """
     Run a job in a non-blocking subprocess with flock.
+
+    Supports:
+      script: foo.py
+      script: scripts/run_stack_job.sh
+      args: [wnba, sports411_betting.py]
     """
     log_path = f"{BASE_PATH}/logs/{job['name']}.log"
-    script_path = f"{BASE_PATH}/{job['script']}"
+    script_path = job["script"]
+    if not os.path.isabs(script_path):
+        script_path = f"{BASE_PATH}/{script_path}"
     lock_file = f"/tmp/{job['name']}.lock"
+    args = list(job.get("args") or [])
 
     # Remove stale lock if older than 1 hour
     if os.path.exists(lock_file):
@@ -33,14 +45,15 @@ def run_job(job):
         timestamp = datetime.now()
         log.write(f"\n[{timestamp}] START {job['name']}\n")
 
-        # Run job in a separate subprocess (non-blocking)
-        # flock will prevent concurrent runs of the same job
-        process = subprocess.Popen([
-            "flock", lock_file,
-            PYTHON_BIN, script_path
-        ], stdout=log, stderr=log)
+        if script_path.endswith(".sh"):
+            cmd = ["flock", lock_file, "bash", script_path, *args]
+        else:
+            cmd = ["flock", lock_file, PYTHON_BIN, script_path, *args]
 
-    return process  # return process handle if needed
+        process = subprocess.Popen(cmd, stdout=log, stderr=log, cwd=BASE_PATH)
+
+    return process
+
 
 def _initial_last_run(job, now):
     """Phase-offset first run so Chrome jobs do not all start at once."""
@@ -75,6 +88,6 @@ def main():
 
         time.sleep(1)
 
+
 if __name__ == "__main__":
     main()
-    

@@ -652,9 +652,14 @@ def _s411_open_bets_row_valid(
     if re.search(r"my\s+open\s+bets", text, re.I) and len(text) > 350:
         return False
     action_hits = len(re.findall(r"\(\s*ACTION\s*\)", text, re.I))
-    if action_hits != 1:
+    ticket_hits = len(re.findall(r"Ticket\s*#\s*\d+", text, re.I))
+    risk_hits = len(re.findall(r"Risk\s*:", text, re.I))
+    # Markers: legacy ( ACTION ), expanded Ticket #, or collapsed summary
+    # with a single Risk: + ML odds token (Ticket # only appears after expand).
+    if action_hits > 1 or ticket_hits > 1 or risk_hits != 1:
         return False
-    if len(re.findall(r"Risk\s*:", text, re.I)) != 1:
+    has_ml = bool(re.search(r"\bML\s*[+-]?\d+", text, re.I))
+    if action_hits != 1 and ticket_hits != 1 and not has_ml:
         return False
 
     text_l = text.lower()
@@ -670,8 +675,14 @@ def _s411_open_bets_row_valid(
         ):
             return False
 
-    if stake is not None and not _betwar_row_matches_stake(text, stake):
-        return False
+    if stake is not None:
+        if isinstance(stake, BaseAmountStake):
+            from utils.stake_sizing import page_contains_stake_amount
+
+            if not page_contains_stake_amount(text, stake):
+                return False
+        elif not _betwar_row_matches_stake(text, stake):
+            return False
 
     return True
 
@@ -719,9 +730,8 @@ def _s411_list_open_bet_tickets(driver):
     return []
 
 
-def _s411_expand_ticket(driver, ticket_element, logger) -> None:
+def _s411_expand_ticket(driver, ticket_element, logger=None) -> None:
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
     try:
@@ -737,7 +747,8 @@ def _s411_expand_ticket(driver, ticket_element, logger) -> None:
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
             toggle.click()
         except Exception as exc:
-            logger.warning(f"S411 open-bets: could not expand ticket row: {exc}")
+            if logger:
+                logger.warning(f"S411 open-bets: could not expand ticket row: {exc}")
             return
 
     try:
@@ -766,6 +777,7 @@ def _find_s411_open_bets_ticket(
 
     scored: list[tuple[int, int, object, str]] = []
     for idx, ticket in enumerate(tickets):
+        _s411_expand_ticket(driver, ticket)
         text = (ticket.text or "").strip()
         if not text:
             continue
@@ -827,6 +839,7 @@ def verify_s411_open_bet_ticket(
             return False, "No open bet tickets on page"
 
         for ticket in tickets:
+            _s411_expand_ticket(driver, ticket, logger)
             text = (ticket.text or "").strip()
             if not _s411_ticket_matches(
                 text,

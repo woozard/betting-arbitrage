@@ -1,18 +1,31 @@
 import multiprocessing
+import os
 
 from controllers.Sports411Controller import Sports411Controller
 from database.models.Accounts import Accounts
 from database.config import __get_db1_session__
-from utils.config import SPORTS411, BET_STAKE, ARB_SPORT
+from utils.config import (
+    SPORTS411,
+    SPORTS411_ACCOUNT,
+    SPORTS411_PASSWORD,
+    SPORTS411_LABEL,
+    BET_STAKE,
+    ARB_SPORT,
+)
 
 db = __get_db1_session__()
 
 
 def run_betting(sport: str):
+    account_id = SPORTS411_ACCOUNT or os.getenv("SPORTS411_ACCOUNT")
+    password = SPORTS411_PASSWORD or os.getenv("SPORTS411_PASSWORD")
+    if not account_id or not password:
+        raise ValueError("SPORTS411_ACCOUNT and SPORTS411_PASSWORD must be set")
+
     account = Accounts(
-        account='8715',
-        password='eqr0mjx-MXY*rcn1ana',
-        label='Bettor'
+        account=account_id,
+        password=password,
+        label=SPORTS411_LABEL or "Bettor",
     )
     controller = Sports411Controller(
         account,

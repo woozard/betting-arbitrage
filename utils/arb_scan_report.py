@@ -1,4 +1,4 @@
-"""Build MLB cross-book scan reports for CLI and Telegram /scan."""
+"""Build cross-book ML scan reports for CLI and Telegram /scan (MLB/WNBA/UFC)."""
 
 from __future__ import annotations
 
@@ -8,11 +8,18 @@ from decimal import Decimal
 from typing import List, Optional, Tuple
 
 from controllers.ArbitrageController import ArbitrageController
-from utils.config import ACTIVE_ARB_BOOKMAKERS, ACTIVE_ARB_BOOK_PAIRS, ARB_MAX_TOTAL_PROB, MIN_ARB_PROFIT_PCT
+from utils.config import (
+    ACTIVE_ARB_BOOKMAKERS,
+    ACTIVE_ARB_BOOK_PAIRS,
+    ARB_MAX_TOTAL_PROB,
+    MIN_ARB_PROFIT_PCT,
+    arb_sport_to_league,
+)
 from utils.helpers import format_utc_timestamp, is_plausible_moneyline_pair, normalize_team, teams_same
 from utils.game_registry import matchup_group_key
 
 SCAN_ODDS_WINDOW_MINUTES = 10
+SCAN_LEAGUES = ("MLB", "WNBA", "UFC")
 
 BOOK_LABELS = {
     "sports411": "S411",
@@ -21,6 +28,7 @@ BOOK_LABELS = {
     "betwar": "BetWar",
     "lowvig": "LowVig",
     "3et": "3et",
+    "4casters": "4c",
 }
 
 
@@ -177,7 +185,7 @@ def format_pair_section(book_a: str, book_b: str, rows: List[dict]) -> str:
     lines = [f"{label_a} x {label_b}"]
 
     if not rows:
-        lines.append("(no overlapping MLB matchups in window)")
+        lines.append("(no overlapping matchups in window)")
         return "\n".join(lines)
 
     arb_count = sum(1 for r in rows if r["arb"])
@@ -218,20 +226,21 @@ def build_scan_report(minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> str:
         return _build_scan_report_with_db(db, minutes=minutes)
 
 
+def _leagues_for_scan() -> Tuple[str, ...]:
+    """Ops bot (no stack) reports all active sports; stack jobs report their league."""
+    current = arb_sport_to_league()
+    if current and current in SCAN_LEAGUES:
+        # Still show all three when the shared telegram bot has a leftover ARB_SPORT
+        # from base .env — only narrow when an explicit stack name is set.
+        from utils.config import STACK_NAME
+
+        if STACK_NAME:
+            return (current,)
+    return SCAN_LEAGUES
+
+
 def _build_scan_report_with_db(db, minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> str:
     ctrl = ArbitrageController(db=db)
-    odds = ctrl.get_recent_moneyline_odds_from_db(
-        minutes=minutes,
-        keep_created_at=True,
-        require_plausible_moneyline=True,
-    )
-
-    by_matchup = defaultdict(dict)
-    for row in odds:
-        if row["bookmaker"] not in ACTIVE_ARB_BOOKMAKERS:
-            continue
-        _store_matchup_row(by_matchup, row)
-
     now = format_utc_timestamp()
     if MIN_ARB_PROFIT_PCT != 0:
         threshold_line = (
@@ -240,45 +249,72 @@ def _build_scan_report_with_db(db, minutes: int = SCAN_ODDS_WINDOW_MINUTES) -> s
         )
     else:
         threshold_line = f"Execute when total prob < {ARB_MAX_TOTAL_PROB:.4f} (positive profit %)"
-    sections = [
-        "===== MLB Scan =====",
+
+    leagues = _leagues_for_scan()
+    all_sections = [
+        f"===== ML Scan ({', '.join(leagues)}) =====",
         f"Time: {now}",
         f"Odds window: last {minutes} min (latest scrape per book/matchup)",
         threshold_line,
+        "Spreads: betting off (ML only)",
         "",
     ]
-    sections.extend(_book_freshness_lines(odds))
-    sections.append("")
 
-    global_best: Optional[Tuple[float, str, dict]] = None
-    pair_sections = []
+    any_overlap = False
+    for league in leagues:
+        odds = ctrl.get_recent_moneyline_odds_from_db(
+            minutes=minutes,
+            keep_created_at=True,
+            require_plausible_moneyline=True,
+            league=league,
+            filter_by_arb_sport=False,
+        )
 
-    for pair in sorted(ACTIVE_ARB_BOOK_PAIRS, key=lambda p: sorted(p)):
-        books = sorted(pair)
-        book_a, book_b = books[0], books[1]
-        rows = scan_pair_rows(ctrl, by_matchup, book_a, book_b)
-        pair_sections.append(format_pair_section(book_a, book_b, rows))
-        if rows:
-            best = rows[0]
-            if global_best is None or best["total"] < global_best[0]:
-                global_best = (best["total"], f"{BOOK_LABELS.get(book_a, book_a)} x {BOOK_LABELS.get(book_b, book_b)}", best)
+        by_matchup = defaultdict(dict)
+        for row in odds:
+            if row["bookmaker"] not in ACTIVE_ARB_BOOKMAKERS:
+                continue
+            _store_matchup_row(by_matchup, row)
 
-    sections.extend(pair_sections)
+        all_sections.append(f"----- {league} -----")
+        all_sections.extend(_book_freshness_lines(odds))
+        all_sections.append("")
 
-    sections.append("")
-    if global_best:
-        total, pair_label, best = global_best
-        if best["arb"]:
-            sections.append(f"Summary: {pair_label} has EXECUTABLE ARB ({best['profit']:+.2f}%)")
+        global_best: Optional[Tuple[float, str, dict]] = None
+        for pair in sorted(ACTIVE_ARB_BOOK_PAIRS, key=lambda p: sorted(p)):
+            books = sorted(pair)
+            book_a, book_b = books[0], books[1]
+            rows = scan_pair_rows(ctrl, by_matchup, book_a, book_b)
+            all_sections.append(format_pair_section(book_a, book_b, rows))
+            if rows:
+                any_overlap = True
+                best = rows[0]
+                if global_best is None or best["total"] < global_best[0]:
+                    global_best = (
+                        best["total"],
+                        f"{BOOK_LABELS.get(book_a, book_a)} x {BOOK_LABELS.get(book_b, book_b)}",
+                        best,
+                    )
+
+        if global_best:
+            total, pair_label, best = global_best
+            if best["arb"]:
+                all_sections.append(
+                    f"{league} summary: {pair_label} EXECUTABLE ARB ({best['profit']:+.2f}%)"
+                )
+            else:
+                all_sections.append(
+                    f"{league} summary: closest {best['match']} ({pair_label}) "
+                    f"at {total:.4f} ({best['profit']:+.2f}%)"
+                )
         else:
-            sections.append(
-                f"Summary: No executable arbs. Closest overall: {best['match']} "
-                f"({pair_label}) at {total:.4f} ({best['profit']:+.2f}%)"
-            )
-    else:
-        sections.append("Summary: No overlapping odds found for active pairs.")
+            all_sections.append(f"{league} summary: no overlapping odds for active pairs.")
+        all_sections.append("")
 
-    return "\n".join(sections)
+    if not any_overlap:
+        all_sections.append("Overall: no overlapping odds found across scanned leagues.")
+
+    return "\n".join(all_sections)
 
 
 def split_telegram_messages(text: str, limit: int = 4000) -> List[str]:

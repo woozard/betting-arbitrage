@@ -15,7 +15,8 @@ def main():
     summary = run_health_cycle(logger=logger)
     logger.info(
         f"Ops health: {len(summary['issues'])} issue(s), "
-        f"{len(summary['remediated'])} remediation(s)"
+        f"{len(summary['remediated'])} remediation(s), "
+        f"host_status_sent={summary.get('host_status_sent', False)}"
     )
     logger.info("========== Ops Health Check (END) ==========")
 

@@ -32,6 +32,7 @@ from utils.config import (
     is_active_arb_pair,
     FOURCASTERS_MLB_LEAGUE,
     FOURCASTERS_WNBA_LEAGUE,
+    FOURCASTERS_UFC_LEAGUE,
     FOURCASTERS_FAST_PLACE,
 )
 from utils.exposure_cleanup import tick_exposure_cleanup
@@ -97,6 +98,10 @@ class FourCastersController:
             self.sport_name = "MLB"
             self.league = "MLB"
             self._league_code = FOURCASTERS_MLB_LEAGUE
+        elif self.sport in ["ufc", "mma", "fighting"]:
+            self.sport_name = "UFC"
+            self.league = "UFC"
+            self._league_code = FOURCASTERS_UFC_LEAGUE
         else:
             self.sport_name = "MLB"
             self.league = "MLB"
