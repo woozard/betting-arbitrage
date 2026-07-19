@@ -1,5 +1,5 @@
 [Unit]
-Description=Check betting-arbitrage log staleness and restart hung jobs
+Description=Check betting-arbitrage log staleness, restart hung jobs, clean orphan Chrome
 After=network-online.target
 
 [Service]
@@ -8,4 +8,5 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/betting-arbitrage
 Environment=MAX_STALE_SEC=600
+Environment=CLEANUP_ORPHAN_CHROME=1
 ExecStart=/home/ubuntu/betting-arbitrage/check_betting_health.sh
