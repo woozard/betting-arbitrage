@@ -27,7 +27,6 @@ from utils.config import (
     is_active_arb_pair,
     required_first_leg_book,
     S411_FAST_PLACE,
-    SECOND_LEG_ODDS_TOLERANCE,
 )
 from utils.logger import Logger
 from utils.storage import Storage
@@ -2268,10 +2267,6 @@ class Sports411Controller:
             return int(stake.american_odds)
         return None
 
-    def _open_bet_confirm_odds_tolerance(self) -> int:
-        """Allow ticket odds to differ from arb odds (Accept-all / second-leg juice)."""
-        return max(2, int(SECOND_LEG_ODDS_TOLERANCE or 0))
-
     def _verify_open_bet_on_pending(
         self,
         team_name: str,
@@ -2280,16 +2275,22 @@ class Sports411Controller:
         expected_odds=None,
         team_1: str = "",
         team_2: str = "",
-        odds_tolerance: int | None = None,
+        match_odds: bool = False,
     ):
-        odds = self._open_bet_odds_value(stake, expected_odds)
-        if odds is None:
-            return False, "Open bet verification requires expected odds"
-        tol = (
-            self._open_bet_confirm_odds_tolerance()
-            if odds_tolerance is None
-            else max(0, int(odds_tolerance))
-        )
+        """Confirm a placed wager on open-bets by team + stake.
+
+        Odds are optional. Confirmation after Place Bet must not require arb odds
+        (the ticket may show the live filled line). Pass ``match_odds=True`` or an
+        explicit ``expected_odds`` only when identifying a specific ticket line.
+        """
+        odds = None
+        if expected_odds is not None:
+            odds = self._open_bet_odds_value(None, expected_odds)
+        elif match_odds:
+            odds = self._open_bet_odds_value(stake, None)
+            if odds is None:
+                return False, "Open bet verification requires expected odds"
+
         confirmed, message = verify_s411_open_bet_ticket(
             self.driver,
             team_name=team_name,
@@ -2300,7 +2301,7 @@ class Sports411Controller:
             open_bets_url=self._open_bets_url(),
             logger=self.logger,
             return_to_sport=self._return_to_sport_page,
-            odds_tolerance=tol,
+            odds_tolerance=0,
         )
         return confirmed, message
 
@@ -2313,7 +2314,7 @@ class Sports411Controller:
         expected_odds=None,
         team_1: str = "",
         team_2: str = "",
-        odds_tolerance: int | None = None,
+        match_odds: bool = False,
     ):
         """SendBets uses asyncPost — wager may appear on open-bets after WagerResult:false."""
         timeout = timeout or self.OPEN_BETS_POLL_TIMEOUT_SECONDS
@@ -2327,7 +2328,7 @@ class Sports411Controller:
                 expected_odds=expected_odds,
                 team_1=team_1,
                 team_2=team_2,
-                odds_tolerance=odds_tolerance,
+                match_odds=match_odds,
             )
             if confirmed:
                 self.logger.info(
@@ -2348,7 +2349,7 @@ class Sports411Controller:
         expected_odds=None,
         team_1: str = "",
         team_2: str = "",
-        odds_tolerance: int | None = None,
+        match_odds: bool = False,
     ) -> tuple:
         """True when the book accepted the wager even if SendBets/confirm failed."""
         return self._poll_open_bet_on_pending(
@@ -2357,7 +2358,7 @@ class Sports411Controller:
             expected_odds=expected_odds,
             team_1=team_1,
             team_2=team_2,
-            odds_tolerance=odds_tolerance,
+            match_odds=match_odds,
         )
 
     def _confirm_bet_accepted(
@@ -2387,7 +2388,6 @@ class Sports411Controller:
                 confirmed, open_msg = self._recover_bet_from_open_bets(
                     team_name,
                     stake,
-                    expected_odds=stake,
                     team_1=team_1,
                     team_2=team_2,
                 )
@@ -2419,7 +2419,6 @@ class Sports411Controller:
                     confirmed, open_msg = self._recover_bet_from_open_bets(
                         team_name,
                         stake,
-                        expected_odds=stake,
                         team_1=team_1,
                         team_2=team_2,
                     )
@@ -2448,7 +2447,6 @@ class Sports411Controller:
                     confirmed, open_msg = self._recover_bet_from_open_bets(
                         team_name,
                         stake,
-                        expected_odds=stake,
                         team_1=team_1,
                         team_2=team_2,
                     )
@@ -2467,7 +2465,6 @@ class Sports411Controller:
                     confirmed, open_msg = self._recover_bet_from_open_bets(
                         team_name,
                         stake,
-                        expected_odds=stake,
                         team_1=team_1,
                         team_2=team_2,
                     )
@@ -2490,7 +2487,6 @@ class Sports411Controller:
             confirmed, message = self._recover_bet_from_open_bets(
                 team_name,
                 stake,
-                expected_odds=stake,
                 team_1=team_1,
                 team_2=team_2,
             )
@@ -2504,7 +2500,6 @@ class Sports411Controller:
         confirmed, message = self._verify_open_bet_on_pending(
             team_name,
             stake,
-            expected_odds=stake,
             team_1=team_1,
             team_2=team_2,
         )
@@ -2553,7 +2548,6 @@ class Sports411Controller:
                     confirmed, open_msg = self._verify_open_bet_on_pending(
                         team_name,
                         stake_plan,
-                        expected_odds=stake_plan,
                         team_1=team_1,
                         team_2=team_2,
                     )
@@ -2830,7 +2824,6 @@ class Sports411Controller:
         already_open, open_msg = self._verify_open_bet_on_pending(
             team_name,
             stake_plan,
-            expected_odds=stake_plan,
             team_1=team_1,
             team_2=team_2,
         )
