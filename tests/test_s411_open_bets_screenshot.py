@@ -113,3 +113,42 @@ def test_ticket_matches_by_ticket_number():
         odds=120,
         ticket_number="736031775",
     )
+
+
+def test_open_bets_row_accepts_odds_within_tolerance():
+    """Regression: Accept-all can fill at live odds ≠ arb odds (Jul 9 false fail)."""
+    text = (
+        "Tampa Bay Rays ML-120 ( ACTION )\n"
+        "New York Yankees vs Tampa Bay Rays\n"
+        "Risk: $23.40 | Win: $19.50"
+    )
+    assert not _s411_open_bets_row_valid(
+        text,
+        team_name="Tampa Bay Rays",
+        odds=-118,
+        stake=23.40,
+        odds_tolerance=0,
+    )
+    assert _s411_open_bets_row_valid(
+        text,
+        team_name="Tampa Bay Rays",
+        odds=-118,
+        stake=23.40,
+        odds_tolerance=2,
+    )
+
+
+def test_open_bets_row_accepts_collapsed_ml_without_action_marker():
+    text = (
+        "Tampa Bay Rays ML-117\n"
+        "New York Yankees vs Tampa Bay Rays\n"
+        "Risk: $23.40 | Win: $20.00"
+    )
+    assert _s411_open_bets_row_valid(
+        text,
+        team_name="Tampa Bay Rays",
+        team_1="New York Yankees",
+        team_2="Tampa Bay Rays",
+        odds=-117,
+        stake=23.40,
+    )
