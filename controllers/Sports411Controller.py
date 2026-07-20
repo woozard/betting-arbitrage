@@ -2049,11 +2049,18 @@ class Sports411Controller:
             return []
 
     def _scan_rejection_ui(self):
-        reject_markers = (
+        # Soft/ambiguous phrases that appear on healthy betslips (limits, accept-all copy).
+        # Never treat these as hard rejects via full page_source scans.
+        overlay_reject_markers = (
             "rejected", "not accepted", "line changed", "line has changed",
-            "odds changed", "limit exceeded", "maximum bet", "minimum bet",
+            "odds changed", "limit exceeded", "insufficient funds",
+            "insufficient balance", "session expired", "logged out",
+            "please log in", "unable to place", "wager declined",
+        )
+        hard_page_markers = (
             "insufficient funds", "insufficient balance", "session expired",
             "logged out", "please log in", "unable to place", "wager declined",
+            "not accepted", "wager rejected",
         )
         try:
             for overlay in self.driver.find_elements(By.CSS_SELECTOR, ".alert-overlay"):
@@ -2069,7 +2076,10 @@ class Sports411Controller:
                 except Exception:
                     pass
                 msg_l = message.lower()
-                if "confirm-alert" not in classes or any(m in msg_l for m in reject_markers):
+                # confirm-alert without reject language = success path handled elsewhere
+                if "confirm-alert" in classes and not any(m in msg_l for m in overlay_reject_markers):
+                    continue
+                if "confirm-alert" not in classes or any(m in msg_l for m in overlay_reject_markers):
                     try:
                         ok_btn = overlay.find_element(By.CSS_SELECTOR, "button.okBtn")
                         self.driver.execute_script("arguments[0].click();", ok_btn)
@@ -2081,12 +2091,26 @@ class Sports411Controller:
 
         try:
             page_l = (self.driver.page_source or "").lower()
-            for marker in reject_markers:
+            for marker in hard_page_markers:
                 if marker in page_l:
                     return True, f"Rejection marker on page: {marker}"
         except Exception:
             pass
         return False, ""
+
+    @staticmethod
+    def _is_hard_session_reject(message: str) -> bool:
+        msg_l = (message or "").lower()
+        return any(
+            marker in msg_l
+            for marker in (
+                "please log in",
+                "session expired",
+                "logged out",
+                "insufficient funds",
+                "insufficient balance",
+            )
+        )
 
     def _prefer_accept_all_line_changes(self):
         """Select 'Accept all line changes' on the betslip (automation is slower than manual)."""
@@ -2251,10 +2275,22 @@ class Sports411Controller:
         expected_odds=None,
         team_1: str = "",
         team_2: str = "",
+        match_odds: bool = False,
     ):
-        odds = self._open_bet_odds_value(stake, expected_odds)
-        if odds is None:
-            return False, "Open bet verification requires expected odds"
+        """Confirm a placed wager on open-bets by team + stake.
+
+        Odds are optional. Confirmation after Place Bet must not require arb odds
+        (the ticket may show the live filled line). Pass ``match_odds=True`` or an
+        explicit ``expected_odds`` only when identifying a specific ticket line.
+        """
+        odds = None
+        if expected_odds is not None:
+            odds = self._open_bet_odds_value(None, expected_odds)
+        elif match_odds:
+            odds = self._open_bet_odds_value(stake, None)
+            if odds is None:
+                return False, "Open bet verification requires expected odds"
+
         confirmed, message = verify_s411_open_bet_ticket(
             self.driver,
             team_name=team_name,
@@ -2265,6 +2301,7 @@ class Sports411Controller:
             open_bets_url=self._open_bets_url(),
             logger=self.logger,
             return_to_sport=self._return_to_sport_page,
+            odds_tolerance=0,
         )
         return confirmed, message
 
@@ -2277,6 +2314,7 @@ class Sports411Controller:
         expected_odds=None,
         team_1: str = "",
         team_2: str = "",
+        match_odds: bool = False,
     ):
         """SendBets uses asyncPost — wager may appear on open-bets after WagerResult:false."""
         timeout = timeout or self.OPEN_BETS_POLL_TIMEOUT_SECONDS
@@ -2290,6 +2328,7 @@ class Sports411Controller:
                 expected_odds=expected_odds,
                 team_1=team_1,
                 team_2=team_2,
+                match_odds=match_odds,
             )
             if confirmed:
                 self.logger.info(
@@ -2310,6 +2349,7 @@ class Sports411Controller:
         expected_odds=None,
         team_1: str = "",
         team_2: str = "",
+        match_odds: bool = False,
     ) -> tuple:
         """True when the book accepted the wager even if SendBets/confirm failed."""
         return self._poll_open_bet_on_pending(
@@ -2318,6 +2358,7 @@ class Sports411Controller:
             expected_odds=expected_odds,
             team_1=team_1,
             team_2=team_2,
+            match_odds=match_odds,
         )
 
     def _confirm_bet_accepted(
@@ -2337,6 +2378,21 @@ class Sports411Controller:
             if rejected:
                 if self._message_requires_relogin(reject_msg):
                     self._invalidate_wager_session()
+                if self._is_hard_session_reject(reject_msg):
+                    self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
+                    return False, reject_msg or "Bet rejected"
+                # Soft UI markers can appear while SendBets async-accepts the wager.
+                self.logger.warning(
+                    f"Soft reject UI ({reject_msg}); checking open bets before failing"
+                )
+                confirmed, open_msg = self._recover_bet_from_open_bets(
+                    team_name,
+                    stake,
+                    team_1=team_1,
+                    team_2=team_2,
+                )
+                if confirmed:
+                    return True, f"Open bet confirmed after soft UI ({open_msg})"
                 self.logger.error(f"Bet rejected by bookmaker UI: {reject_msg}")
                 return False, reject_msg or "Bet rejected"
 
@@ -2354,6 +2410,20 @@ class Sports411Controller:
                     if "confirm-alert" in alert_classes:
                         self.logger.info(f"Bet confirmed by alert: {alert_message}")
                         return True, alert_message or "Bet confirmed"
+                    if self._is_hard_session_reject(alert_message):
+                        self.logger.error(f"Bet rejected by bookmaker alert: {alert_message}")
+                        return False, alert_message or "Bet rejected"
+                    self.logger.warning(
+                        f"Non-confirm alert ({alert_message}); checking open bets"
+                    )
+                    confirmed, open_msg = self._recover_bet_from_open_bets(
+                        team_name,
+                        stake,
+                        team_1=team_1,
+                        team_2=team_2,
+                    )
+                    if confirmed:
+                        return True, f"Open bet confirmed after alert ({open_msg})"
                     self.logger.error(f"Bet rejected by bookmaker alert: {alert_message}")
                     return False, alert_message or "Bet rejected"
                 except Exception:
@@ -2478,7 +2548,6 @@ class Sports411Controller:
                     confirmed, open_msg = self._verify_open_bet_on_pending(
                         team_name,
                         stake_plan,
-                        expected_odds=stake_plan,
                         team_1=team_1,
                         team_2=team_2,
                     )
@@ -2755,7 +2824,6 @@ class Sports411Controller:
         already_open, open_msg = self._verify_open_bet_on_pending(
             team_name,
             stake_plan,
-            expected_odds=stake_plan,
             team_1=team_1,
             team_2=team_2,
         )
@@ -2841,7 +2909,6 @@ class Sports411Controller:
             already_open, open_msg = self._verify_open_bet_on_pending(
                 team_name,
                 stake_plan,
-                expected_odds=stake_plan,
                 team_1=team_1,
                 team_2=team_2,
             )

@@ -636,6 +636,34 @@ def _s411_odds_needles(odds) -> list[str]:
     return out
 
 
+def _s411_text_ml_odds(text: str) -> list[int]:
+    """Extract ML american odds tokens from an S411 open-bet ticket row."""
+    found: list[int] = []
+    for match in re.finditer(r"\bML\s*([+-]?\d+)\b", text or "", re.I):
+        try:
+            found.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return found
+
+
+def _s411_odds_match_in_text(text: str, odds, *, odds_tolerance: int = 0) -> bool:
+    """True when ticket text contains exact odds, or ML odds within tolerance."""
+    if odds is None or str(odds).strip() == "":
+        return True
+    compact = re.sub(r"\s+", "", text or "")
+    if any(re.sub(r"\s+", "", needle) in compact for needle in _s411_odds_needles(odds)):
+        return True
+    try:
+        expected = int(odds)
+    except (TypeError, ValueError):
+        return False
+    tol = max(0, int(odds_tolerance or 0))
+    if tol <= 0:
+        return False
+    return any(abs(ticket - expected) <= tol for ticket in _s411_text_ml_odds(text))
+
+
 def _s411_open_bets_row_valid(
     text: str,
     *,
@@ -644,6 +672,7 @@ def _s411_open_bets_row_valid(
     team_2: str = "",
     odds=None,
     stake=None,
+    odds_tolerance: int = 0,
 ) -> bool:
     """True for a single S411 open-bet ticket, not the full My Open Bets page."""
     text = (text or "").strip()
@@ -652,9 +681,14 @@ def _s411_open_bets_row_valid(
     if re.search(r"my\s+open\s+bets", text, re.I) and len(text) > 350:
         return False
     action_hits = len(re.findall(r"\(\s*ACTION\s*\)", text, re.I))
-    if action_hits != 1:
+    ticket_hits = len(re.findall(r"Ticket\s*#\s*\d+", text, re.I))
+    risk_hits = len(re.findall(r"Risk\s*:", text, re.I))
+    # Markers: legacy ( ACTION ), expanded Ticket #, or collapsed summary
+    # with a single Risk: + ML odds token (Ticket # only appears after expand).
+    if action_hits > 1 or ticket_hits > 1 or risk_hits != 1:
         return False
-    if len(re.findall(r"Risk\s*:", text, re.I)) != 1:
+    has_ml = bool(re.search(r"\bML\s*[+-]?\d+", text, re.I))
+    if action_hits != 1 and ticket_hits != 1 and not has_ml:
         return False
 
     text_l = text.lower()
@@ -662,16 +696,17 @@ def _s411_open_bets_row_valid(
     if team_needles and not any(needle in text_l for needle in team_needles):
         return False
 
-    if odds is not None and str(odds).strip() != "":
-        compact = re.sub(r"\s+", "", text)
-        if not any(
-            re.sub(r"\s+", "", needle) in compact
-            for needle in _s411_odds_needles(odds)
-        ):
-            return False
-
-    if stake is not None and not _betwar_row_matches_stake(text, stake):
+    if not _s411_odds_match_in_text(text, odds, odds_tolerance=odds_tolerance):
         return False
+
+    if stake is not None:
+        if isinstance(stake, BaseAmountStake):
+            from utils.stake_sizing import page_contains_stake_amount
+
+            if not page_contains_stake_amount(text, stake):
+                return False
+        elif not _betwar_row_matches_stake(text, stake):
+            return False
 
     return True
 
@@ -685,6 +720,7 @@ def _s411_ticket_matches(
     odds=None,
     stake=None,
     ticket_number=None,
+    odds_tolerance: int = 0,
 ) -> bool:
     if ticket_number and str(ticket_number).strip():
         if f"ticket # {ticket_number}".lower() not in text.lower().replace("  ", " "):
@@ -697,6 +733,7 @@ def _s411_ticket_matches(
         team_2=team_2,
         odds=odds,
         stake=stake,
+        odds_tolerance=odds_tolerance,
     )
 
 
@@ -719,9 +756,8 @@ def _s411_list_open_bet_tickets(driver):
     return []
 
 
-def _s411_expand_ticket(driver, ticket_element, logger) -> None:
+def _s411_expand_ticket(driver, ticket_element, logger=None) -> None:
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
     try:
@@ -737,7 +773,8 @@ def _s411_expand_ticket(driver, ticket_element, logger) -> None:
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", toggle)
             toggle.click()
         except Exception as exc:
-            logger.warning(f"S411 open-bets: could not expand ticket row: {exc}")
+            if logger:
+                logger.warning(f"S411 open-bets: could not expand ticket row: {exc}")
             return
 
     try:
@@ -759,6 +796,8 @@ def _find_s411_open_bets_ticket(
     odds=None,
     stake=None,
     ticket_number=None,
+    odds_tolerance: int = 0,
+    logger=None,
 ):
     tickets = _s411_list_open_bet_tickets(driver)
     if not tickets:
@@ -766,6 +805,7 @@ def _find_s411_open_bets_ticket(
 
     scored: list[tuple[int, int, object, str]] = []
     for idx, ticket in enumerate(tickets):
+        _s411_expand_ticket(driver, ticket, logger)
         text = (ticket.text or "").strip()
         if not text:
             continue
@@ -780,6 +820,7 @@ def _find_s411_open_bets_ticket(
             odds=odds,
             stake=stake,
             ticket_number=ticket_number,
+            odds_tolerance=odds_tolerance,
         ):
             score += 50
         elif team_name and team_name.lower() in text.lower():
@@ -807,8 +848,9 @@ def verify_s411_open_bet_ticket(
     open_bets_url: str,
     logger=None,
     return_to_sport=None,
+    odds_tolerance: int = 0,
 ) -> tuple[bool, str]:
-    """Strict open-bets check: one ticket row must match team, odds, and stake."""
+    """Confirm an open bet by matching team + stake + odds (with optional tolerance)."""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
@@ -827,6 +869,7 @@ def verify_s411_open_bet_ticket(
             return False, "No open bet tickets on page"
 
         for ticket in tickets:
+            _s411_expand_ticket(driver, ticket, logger)
             text = (ticket.text or "").strip()
             if not _s411_ticket_matches(
                 text,
@@ -835,16 +878,20 @@ def verify_s411_open_bet_ticket(
                 team_2=team_2,
                 odds=odds,
                 stake=stake,
+                odds_tolerance=odds_tolerance,
             ):
                 continue
             if logger:
                 preview = re.sub(r"\s+", " ", text.splitlines()[0] if text else "")[:72]
-                logger.info(f"S411 open-bet verified | {team_name} | {preview}")
+                logger.info(
+                    f"S411 open-bet verified | {team_name} | odds≈{odds} "
+                    f"tol={odds_tolerance} | {preview}"
+                )
             return True, "Open bet ticket verified on open bets page"
 
         return False, (
             f"No matching open bet ticket for {team_name!r} "
-            f"odds={odds!r} stake={stake!r}"
+            f"odds={odds!r} tol={odds_tolerance} stake={stake!r}"
         )
     except Exception as exc:
         return False, f"Could not verify open bet: {exc}"
