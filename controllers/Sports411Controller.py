@@ -2909,7 +2909,6 @@ class Sports411Controller:
             already_open, open_msg = self._verify_open_bet_on_pending(
                 team_name,
                 stake_plan,
-                expected_odds=stake_plan,
                 team_1=team_1,
                 team_2=team_2,
             )
