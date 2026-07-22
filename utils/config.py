@@ -87,7 +87,8 @@ def arb_opportunity_alert_chat_ids():
 # Betting — base amount per arb leg ($20 default).
 # Minus odds → fill to-win box; plus odds → fill risk box (see utils/stake_sizing.py).
 BET_STAKE = float(os.getenv('BET_STAKE', '20'))
-REAL_MONEY_BETTING_ENABLED = os.getenv('REAL_MONEY_BETTING_ENABLED', 'true').lower() in (
+# Master real-money gate — off pauses ALL book placements (scan/alerts can continue).
+REAL_MONEY_BETTING_ENABLED = os.getenv('REAL_MONEY_BETTING_ENABLED', 'false').lower() in (
     '1', 'true', 'yes',
 )
 # Per-book real-money gate (Betamapola paused while account/placement issues are investigated).
